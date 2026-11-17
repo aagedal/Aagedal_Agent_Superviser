@@ -13,6 +13,7 @@ use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 use crate::state::{App, ServerStatus};
 
@@ -25,6 +26,7 @@ fn main() {
 
     let app = Arc::new(App::new().expect("app state"));
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(app.clone())
         .setup(move |tauri_app| {
             #[cfg(target_os = "macos")]
@@ -79,6 +81,9 @@ fn main() {
             commands::setup_opencode,
             commands::recent_calls,
             commands::open_window,
+            commands::sandbox_info,
+            commands::set_sandbox_network,
+            commands::open_project,
         ]);
 
     builder.build(tauri::generate_context!()).expect("building the app").run(|handle, event| match event {
@@ -135,6 +140,23 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
     let stop = MenuItem::with_id(handle, "stop", "Stop Model", running_id.is_some(), None::<&str>)?;
     let chat = MenuItem::with_id(handle, "chat", "Open Chat…", matches!(status, ServerStatus::Running { .. }), None::<&str>)?;
     let opencode = MenuItem::with_id(handle, "opencode", "Set Up OpenCode", matches!(status, ServerStatus::Running { .. }), None::<&str>)?;
+    let running = matches!(status, ServerStatus::Running { .. });
+    let recent = app.settings.lock().unwrap().recent_projects.clone();
+    let project_items: Vec<MenuItem<tauri::Wry>> = recent
+        .iter()
+        .map(|path| {
+            let name = std::path::Path::new(path).file_name().map_or(path.clone(), |n| n.to_string_lossy().into_owned());
+            MenuItem::with_id(handle, format!("project:{path}"), name, running, None::<&str>)
+        })
+        .collect::<tauri::Result<_>>()?;
+    let choose = MenuItem::with_id(handle, "choose-project", "Choose Folder…", running, Some("CmdOrCtrl+O"))?;
+    let separator = PredefinedMenuItem::separator(handle)?;
+    let mut project_refs: Vec<&dyn IsMenuItem<tauri::Wry>> = project_items.iter().map(|i| i as &dyn IsMenuItem<tauri::Wry>).collect();
+    if !project_refs.is_empty() {
+        project_refs.push(&separator);
+    }
+    project_refs.push(&choose);
+    let code = Submenu::with_id_and_items(handle, "code", "Code in OpenCode (sandboxed)", cfg!(target_os = "macos"), &project_refs)?;
     let settings = MenuItem::with_id(handle, "settings", "Settings…", true, Some("CmdOrCtrl+,"))?;
     let quit = MenuItem::with_id(handle, "quit", "Quit Agent Superviser", true, Some("CmdOrCtrl+Q"))?;
     Menu::with_items(
@@ -146,6 +168,7 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
             &models,
             &stop,
             &PredefinedMenuItem::separator(handle)?,
+            &code,
             &chat,
             &opencode,
             &settings,
@@ -198,6 +221,7 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
                 tracing::warn!("opening {id}: {e}");
             }
         }
+        "choose-project" => choose_project(&handle),
         "stop" => {
             tauri::async_runtime::spawn(async move {
                 app.stop_model().await;
@@ -211,7 +235,9 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
             }
         }
         _ => {
-            if let Some(model) = id.strip_prefix("start:") {
+            if let Some(project) = id.strip_prefix("project:") {
+                open_project(&handle, project.into());
+            } else if let Some(model) = id.strip_prefix("start:") {
                 let model = model.to_string();
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = start_model(handle, app, model).await {
@@ -219,6 +245,39 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
                     }
                 });
             }
+        }
+    }
+}
+
+/// Asks for a project folder, then opens it in sandboxed OpenCode.
+pub fn choose_project(handle: &AppHandle) {
+    let handle_for_pick = handle.clone();
+    let mut dialog = handle.dialog().file().set_title("Choose a project folder for OpenCode");
+    if let Some(home) = std::env::var_os("HOME") {
+        dialog = dialog.set_directory(home);
+    }
+    dialog.pick_folder(move |folder| {
+        if let Some(path) = folder.and_then(|f| f.into_path().ok()) {
+            open_project(&handle_for_pick, path);
+        }
+    });
+}
+
+/// Opens `project` in sandboxed OpenCode, saying why if it can't.
+pub fn open_project(handle: &AppHandle, project: std::path::PathBuf) {
+    let app = handle.state::<Arc<App>>().inner().clone();
+    match app.open_project(&project) {
+        Ok(_) => {
+            let _ = handle.emit("projects", ());
+            refresh_tray(handle);
+        }
+        Err(e) => {
+            handle
+                .dialog()
+                .message(format!("{e:#}"))
+                .title("Couldn't open the project")
+                .kind(MessageDialogKind::Error)
+                .show(|_| {});
         }
     }
 }

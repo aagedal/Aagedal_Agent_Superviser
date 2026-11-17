@@ -261,6 +261,36 @@ pub fn recent_calls(app: State<'_, Arc<App>>) -> Vec<CallEvent> {
     app.events.lock().unwrap().iter().cloned().collect()
 }
 
+#[derive(Serialize)]
+pub struct SandboxInfo {
+    available: bool,
+    network: superviser_core::sandbox::Network,
+    recent_projects: Vec<String>,
+}
+
+#[tauri::command]
+pub fn sandbox_info(app: State<'_, Arc<App>>) -> SandboxInfo {
+    let settings = app.settings.lock().unwrap();
+    SandboxInfo { available: cfg!(target_os = "macos"), network: settings.sandbox_network, recent_projects: settings.recent_projects.clone() }
+}
+
+#[tauri::command]
+pub fn set_sandbox_network(handle: AppHandle, app: State<'_, Arc<App>>, network: superviser_core::sandbox::Network) -> Result<()> {
+    app.settings.lock().unwrap().sandbox_network = network;
+    app.save_settings().map_err(err)?;
+    crate::refresh_tray(&handle);
+    Ok(())
+}
+
+/// Opens a project (or asks for one, with `path` unset) in sandboxed OpenCode.
+#[tauri::command]
+pub fn open_project(handle: AppHandle, path: Option<String>) {
+    match path {
+        Some(path) => crate::open_project(&handle, path.into()),
+        None => crate::choose_project(&handle),
+    }
+}
+
 #[tauri::command]
 pub fn open_window(handle: AppHandle, name: String) -> Result<()> {
     if !matches!(name.as_str(), "settings" | "chat") {
