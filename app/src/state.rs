@@ -13,12 +13,14 @@ use superviser_core::hardware::Hardware;
 use superviser_core::installed::{self, InstalledModel, Source};
 use superviser_core::paths::{PROTECTED_NAMES, Paths};
 use superviser_core::runtime::{self, LlamaServer, ServerConfig};
+use superviser_core::sandbox::{self, Network};
 use superviser_core::{opencode, secrets};
 use superviser_guard::journal::Journal;
 use superviser_guard::selfprotect::SelfProtection;
 use superviser_guard::{CallEvent, GuardServer, ProxyOptions};
 
 pub const DEFAULT_GUARD_PORT: u16 = 8787;
+const MAX_RECENT_PROJECTS: usize = 6;
 const MAX_EVENTS: usize = 200;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// Origins of the app's own webviews (macOS/Linux, Windows).
@@ -35,11 +37,23 @@ pub struct Settings {
     /// Offer models other apps already downloaded (LM Studio, Ollama, Hugging Face cache…).
     pub use_other_apps: bool,
     pub last_model: Option<String>,
+    /// Internet access inside the OpenCode sandbox.
+    pub sandbox_network: Network,
+    /// Projects opened in OpenCode, most recent first.
+    pub recent_projects: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { guard_port: DEFAULT_GUARD_PORT, block: true, configure_opencode: true, use_other_apps: true, last_model: None }
+        Self {
+            guard_port: DEFAULT_GUARD_PORT,
+            block: true,
+            configure_opencode: true,
+            use_other_apps: true,
+            last_model: None,
+            sandbox_network: Network::default(),
+            recent_projects: Vec::new(),
+        }
     }
 }
 
@@ -281,6 +295,26 @@ impl App {
             default_model: Some(model.alias),
         };
         opencode::install(&setup)
+    }
+
+    /// Opens `project` in OpenCode, in a new Terminal window, inside the sandbox. OpenCode's
+    /// config is refreshed first so it talks to the guard about the running model.
+    pub fn open_project(&self, project: &std::path::Path) -> anyhow::Result<sandbox::Launched> {
+        if self.running_model().is_none() {
+            bail!("Start a model first: OpenCode would have nothing to talk to.");
+        }
+        self.setup_opencode()?;
+        let network = self.settings.lock().unwrap().sandbox_network;
+        let launched = sandbox::launch_opencode(&self.paths, project, network)?;
+        {
+            let mut settings = self.settings.lock().unwrap();
+            let path = project.display().to_string();
+            settings.recent_projects.retain(|p| *p != path);
+            settings.recent_projects.insert(0, path);
+            settings.recent_projects.truncate(MAX_RECENT_PROJECTS);
+        }
+        self.save_settings()?;
+        Ok(launched)
     }
 
     pub fn shutdown(&self) {

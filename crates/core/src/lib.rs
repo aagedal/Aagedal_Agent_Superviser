@@ -12,4 +12,5 @@ pub mod opencode;
 pub mod paths;
 pub mod quant;
 pub mod runtime;
+pub mod sandbox;
 pub mod secrets;

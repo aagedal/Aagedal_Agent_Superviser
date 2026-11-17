@@ -51,6 +51,15 @@
       <h1>Connect a coding tool</h1>
       <p class="muted">Tools talk to the guard, which checks every tool call before it runs and forwards the rest to your local model.</p>
 
+      <h2>Code in OpenCode (sandboxed)</h2>
+      <p class="muted small">Opens OpenCode for a project folder in a new Terminal window, inside a macOS sandbox that also covers every command it runs. It can change files only in that folder (plus temporary files and build caches), and can't read your SSH keys, cloud and git credentials, keychains, browser data, shell history or other agents' sessions. API keys in your shell environment stay out too.</p>
+      <div id="sandbox-unavailable" class="banner" hidden>The sandbox is available on macOS only, so far.</div>
+      <div class="row">
+        <button class="primary" id="choose-project">Choose project folder…</button>
+        <label class="check"><input type="checkbox" id="sandbox-internet"> Allow internet (package installs, git push); the guard still checks every call</label>
+      </div>
+      <div id="recent-projects"></div>
+
       <h2>OpenCode</h2>
       <p class="muted small" id="opencode-version"></p>
       <div class="row">

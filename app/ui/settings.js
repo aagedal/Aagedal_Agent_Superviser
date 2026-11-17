@@ -315,6 +315,7 @@ async function renderConnect() {
   $("opencode-version").textContent = overview.opencode_version ? `OpenCode ${overview.opencode_version} found.` : "OpenCode was not found on your PATH. Install it from opencode.ai, then come back.";
   $("setup-opencode").disabled = overview.status.state !== "running";
   $("hf-status").textContent = overview.hf_token_set ? "A token is saved." : "No token saved.";
+  await renderProjects();
 }
 
 for (const button of document.querySelectorAll("[data-copy]")) {
@@ -353,6 +354,34 @@ $("hf-clear").addEventListener("click", async () => {
   await invoke("set_hf_token", { token: null });
   renderConnect();
 });
+
+// --- Sandboxed projects ---
+async function renderProjects() {
+  const info = await invoke("sandbox_info");
+  const running = overview?.status.state === "running";
+  $("sandbox-unavailable").hidden = info.available;
+  $("choose-project").disabled = !info.available || !running;
+  $("choose-project").title = running ? "" : "Start a model first";
+  $("sandbox-internet").checked = info.network === "internet";
+  const list = $("recent-projects");
+  list.replaceChildren();
+  for (const path of info.recent_projects) {
+    const name = path.split("/").filter(Boolean).pop();
+    list.append(
+      el(
+        "div",
+        { class: "card" },
+        el("div", { class: "body" }, el("div", { class: "title" }, name), el("p", { class: "muted small selectable" }, path)),
+        el("div", { class: "actions" }, el("button", { disabled: !info.available || !running, onclick: () => invoke("open_project", { path }) }, "Open")),
+      ),
+    );
+  }
+}
+$("choose-project").addEventListener("click", () => invoke("open_project", { path: null }));
+$("sandbox-internet").addEventListener("change", (event) =>
+  invoke("set_sandbox_network", { network: event.target.checked ? "internet" : "local-only" }),
+);
+listen("projects", renderProjects);
 
 // --- Safety tab ---
 const VERDICT_LABELS = { passed: "PASS", suspicious: "WARN", flagged: "FLAG", blocked: "BLOCK" };
