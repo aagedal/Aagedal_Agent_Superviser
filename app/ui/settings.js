@@ -355,14 +355,20 @@ $("hf-clear").addEventListener("click", async () => {
 });
 
 // --- Safety tab ---
+const VERDICT_LABELS = { passed: "PASS", suspicious: "WARN", flagged: "FLAG", blocked: "BLOCK" };
 function callRow(call) {
   const time = new Date(call.time * 1000).toLocaleTimeString();
   return el(
     "div",
     { class: "call" },
     el("span", { class: "muted small" }, time),
-    el("span", { class: `verdict ${call.verdict}` }, call.verdict.toUpperCase()),
-    el("div", {}, el("code", { class: "selectable" }, `${call.tool}: ${call.summary}`), call.reason ? el("div", { class: "reason" }, call.reason) : null),
+    el("span", { class: `verdict ${call.verdict}` }, VERDICT_LABELS[call.verdict] || call.verdict.toUpperCase()),
+    el(
+      "div",
+      {},
+      el("code", { class: "selectable" }, `${call.tool}: ${call.summary}`),
+      call.reason ? el("div", { class: "reason" }, call.reason) : call.signals?.length ? el("div", { class: "reason" }, call.signals.join(", ")) : null,
+    ),
   );
 }
 

@@ -4,8 +4,8 @@
 //!
 //! Ported from [safeagents](https://github.com/huggingface/safeagents) (Apache-2.0):
 //! the request-only checks (undeclared tools, hosts from nowhere), self-protection, the
-//! journal and the response/stream rewriting. atif-scan's detectors and the judge model are
-//! not ported yet.
+//! journal and the response/stream rewriting. atif-scan's detectors run through
+//! `superviser-scan`; the judge model is not ported yet.
 
 pub mod guard;
 pub mod journal;

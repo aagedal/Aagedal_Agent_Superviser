@@ -77,7 +77,7 @@
 
     <section id="safety" hidden>
       <h1>Safety</h1>
-      <p class="muted">The guard looks at every command and file edit the model asks for. It blocks calls that use tools the agent was never given, reach websites nobody in the conversation mentioned, or try to switch the guard off or redirect your tools. Blocked calls are replaced with a note, so nothing runs.</p>
+      <p class="muted">The guard looks at every command and file edit the model asks for. It blocks calls that use tools the agent was never given, reach websites nobody in the conversation mentioned, try to switch the guard off or redirect your tools, or get around network isolation. Blocked calls are replaced with a note, so nothing runs. Calls that read other agents' sessions, API keys or other processes are marked WARN: they run, and show up here.</p>
       <p class="muted small">Based on Hugging Face’s safeagents (<span class="selectable">github.com/huggingface/safeagents</span>). This checks what the agent tries to do; it is not a sandbox.</p>
       <h2>Recent tool calls</h2>
       <div class="calls" id="calls"><p class="muted">No tool calls yet.</p></div>

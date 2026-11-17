@@ -22,10 +22,11 @@ Early. Working today:
 - **Models other apps already downloaded** are found and used in place: the Hugging Face cache (Unsloth Studio, `hf`, newer llama.cpp), LM Studio, Ollama, older llama.cpp `-hf` downloads and oMLX. Nothing is copied or deleted. They go through the same rules (4-bit or better, chat models only, memory fit). Drafts/MTP heads, vision projectors, embedding and speech models are skipped. MLX models are listed for later. A curated model already on disk in any quant shows **Start** instead of **Download**. Try `cargo run -p superviser-core --example discover`.
 - **llama-server supervision**. The model gets the whole context in one slot. The key is passed via `--api-key-file`, so it never shows in `ps`.
 - **Guard**: undeclared tools, hosts nobody mentioned, self-protection (killing the app, touching its keys or journal, redirecting the harness), streaming and whole responses, and a journal of flagged calls.
+- **Scanner** (`crates/scan`): a Rust port of the 18 local-safety checks of atif-scan (safeagents' detector library) plus safeagents' own namespace check. They cover other agents' session history, API keys read or sent, other processes' environment or memory, network-isolation and egress-proxy bypass, credential-carrying requests and webhooks, calls to other models, delegation to `claude`/`codex`, and Hugging Face account recon. High findings block; the rest run and show as WARN. A parity test requires identical findings to Python safeagents on 1,615 calls, and the Rust shell reader matches Python's on all 1,573 corpus commands. Benchmark-integrity checks aren't ported (see `crates/scan/NOTICE.md`). About 0.3 ms per call.
 - **OpenCode setup**. The app edits the global `opencode.json(c)` in place, keeping your comments, with a `.bak` backup. It adds a `superviser` provider, sets the default and title models, and restarts the 2.x service.
 - **Menu bar app** (Tauri 2): start and stop models, an HF token stored in the keychain, the local API key, a live list of tool calls, and a chat window.
 
-Not yet: atif-scan detectors and the judge model in the guard, MLX, bundling `llama-server` in the `.app`, signing, Windows and Linux testing, and discrete-GPU VRAM detection.
+Not yet: the judge model for WARN calls, MLX, bundling `llama-server` in the `.app`, signing, Windows and Linux testing, and discrete-GPU VRAM detection.
 
 ## Develop
 
@@ -47,6 +48,7 @@ App data lives in `~/Library/Application Support/me.aagedal.AgentSuperviser` on 
 |---|---|
 | `crates/core` | Catalog and memory fit, quant policy, GGUF header parsing, Hub client, installed models, llama-server, OpenCode config, secrets |
 | `crates/guard` | The guard proxy (safeagents port; see `crates/guard/NOTICE.md`) |
+| `crates/scan` | The scanner (atif-scan port; see `crates/scan/NOTICE.md`) and its parity harness |
 | `app` | Tauri 2 menu bar app; `app/ui` is plain HTML/JS with no build step |
 | `catalog` | `sources.json` (hand-edited) → `curated.json` (generated) |
 
