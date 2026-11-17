@@ -36,7 +36,7 @@ fn main() {
             let on_event = Arc::new(move |event: &CallEvent| {
                 event_app.record_event(event);
                 let _ = event_handle.emit("guard-call", event);
-                if event.verdict != Verdict::Passed {
+                if matches!(event.verdict, Verdict::Blocked | Verdict::Flagged) {
                     refresh_tray(&event_handle);
                 }
             });
@@ -104,7 +104,7 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
         ServerStatus::Running { model, .. } | ServerStatus::Loading { model, .. } => Some(model.clone()),
         _ => None,
     };
-    let blocked = app.events.lock().unwrap().iter().filter(|e| e.verdict != Verdict::Passed).count();
+    let blocked = app.events.lock().unwrap().iter().filter(|e| matches!(e.verdict, Verdict::Blocked | Verdict::Flagged)).count();
     let guard_line = match app.guard_url() {
         Some(url) => format!("Guard on at {url} · {blocked} blocked"),
         None => "Guard is not running".into(),

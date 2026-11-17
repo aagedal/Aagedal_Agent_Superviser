@@ -100,7 +100,7 @@ progress { width: 140px; height: 6px; accent-color: var(--accent); }
 .call { display: grid; grid-template-columns: 64px 70px 1fr; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); }
 .verdict { font-weight: 600; font-size: 11px; }
 .verdict.passed { color: var(--good); }
-.verdict.flagged { color: var(--warn); }
+.verdict.flagged, .verdict.suspicious { color: var(--warn); }
 .verdict.blocked { color: var(--bad); }
 .call .reason { color: var(--muted); font-size: 12px; }
 

@@ -2,13 +2,16 @@
 //!
 //! 1. Self-protection: calls against the guard itself are blocked outright.
 //! 2. Undeclared tools and hosts from nowhere are blocked outright.
-//! 3. (Not ported yet: atif-scan findings and the judge model.)
+//! 3. Scanner findings (`superviser-scan`, a port of atif-scan's local-safety checks) at or
+//!    above `block_severity` are blocked too; milder ones make a call suspicious: it runs,
+//!    and is logged. (Not ported: the judge model that decides suspicious calls.)
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
+use superviser_scan::{Scanner, Severity, Signal};
 
 use crate::journal::Journal;
 use crate::policy::{DEFAULT_ALLOWED_HOSTS, Policy};
@@ -27,6 +30,10 @@ pub struct Config {
     pub journal: Option<Journal>,
     /// Told about every reviewed call (the app's activity view).
     pub on_event: Option<EventSink>,
+    /// `None` turns the scanner off.
+    pub scanner: Option<Arc<Scanner>>,
+    /// Scanner findings at or above this block the call.
+    pub block_severity: Severity,
 }
 
 impl Default for Config {
@@ -37,6 +44,8 @@ impl Default for Config {
             allowed_hosts: DEFAULT_ALLOWED_HOSTS.iter().map(|h| h.to_string()).collect(),
             journal: None,
             on_event: None,
+            scanner: Some(Arc::new(Scanner::new())),
+            block_severity: Severity::High,
         }
     }
 }
@@ -45,19 +54,33 @@ impl Default for Config {
 #[serde(rename_all = "lowercase")]
 pub enum Verdict {
     Passed,
+    /// Ran, but the scanner found something below the blocking severity.
+    Suspicious,
     /// Would have been blocked, but the guard is in log-only mode.
     Flagged,
     Blocked,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Review {
     pub reason: Option<String>,
+    pub signals: Vec<Signal>,
 }
 
 impl Review {
+    fn blocked(reason: String) -> Self {
+        Self { reason: Some(reason), signals: Vec::new() }
+    }
+
+    /// `Blocked` with a reason, `Suspicious` with only signals, else `Passed`.
     pub fn verdict(&self) -> Verdict {
-        if self.reason.is_some() { Verdict::Blocked } else { Verdict::Passed }
+        if self.reason.is_some() {
+            Verdict::Blocked
+        } else if !self.signals.is_empty() {
+            Verdict::Suspicious
+        } else {
+            Verdict::Passed
+        }
     }
 }
 
@@ -81,6 +104,8 @@ pub struct CallEvent {
     pub tool: String,
     pub summary: String,
     pub reason: Option<String>,
+    /// Scanner findings, as `id (severity)`.
+    pub signals: Vec<String>,
     pub model: String,
     pub journal_id: Option<u64>,
 }
@@ -90,6 +115,8 @@ pub struct Guard {
     config: Arc<Config>,
     policy: Policy,
     pub flagged: Vec<Blocked>,
+    /// This response's calls so far: the scanner judges the last in their light.
+    calls: Vec<(String, String)>,
 }
 
 const SUMMARY_KEYS: &[&str] = &["command", "cmd", "url", "query", "file_path", "filePath", "path", "pattern", "code"];
@@ -140,20 +167,28 @@ pub fn content_text(content: Option<&Value>) -> String {
 impl Guard {
     pub fn new(request: Value, config: Arc<Config>) -> Self {
         let policy = Policy::new(&request, &config.allowed_hosts);
-        Self { request, config, policy, flagged: Vec::new() }
+        Self { request, config, policy, flagged: Vec::new(), calls: Vec::new() }
     }
 
     pub fn blocking(&self) -> bool {
         self.config.block
     }
 
-    /// Reviews a complete call without recording it.
-    pub fn review(&self, name: &str, args: &str) -> Review {
+    /// Reviews a complete call without logging it.
+    pub fn review(&mut self, name: &str, args: &str) -> Review {
+        self.calls.push((name.to_string(), args.to_string()));
         // Self-protection runs first, so nothing that later excuses findings can lift it.
         if let Some(reason) = self.config.self_protection.as_ref().and_then(|p| p.reason(args)) {
-            return Review { reason: Some(reason) };
+            return Review::blocked(reason);
         }
-        Review { reason: self.policy.check(name, args) }
+        if let Some(reason) = self.policy.check(name, args) {
+            return Review::blocked(reason);
+        }
+        let Some(scanner) = &self.config.scanner else { return Review::default() };
+        let signals = scanner.signals(&self.request, &self.calls);
+        let severe: Vec<String> = signals.iter().filter(|s| s.severity >= self.config.block_severity).map(Signal::to_string).collect();
+        let reason = (!severe.is_empty()).then(|| format!("scan: {}", severe.join(", ")));
+        Review { reason, signals }
     }
 
     /// Reviews and records a complete call; true if it may run (always, in log-only mode).
@@ -179,6 +214,7 @@ impl Guard {
             entry.insert("tool".into(), name.into());
             entry.insert("arguments".into(), args.into());
             entry.insert("reason".into(), review.reason.clone().into());
+            entry.insert("signals".into(), serde_json::to_value(&review.signals).unwrap());
             entry.insert("model".into(), model.clone().into());
             entry.insert("task".into(), task_text(&self.request).into());
             match journal.append(entry) {
@@ -186,11 +222,13 @@ impl Guard {
                 Err(e) => tracing::warn!("guard journal: {e}"),
             }
         }
+        let signals: Vec<String> = review.signals.iter().map(Signal::to_string).collect();
         if verdict != Verdict::Passed {
-            tracing::warn!("guard {verdict:?} call to `{name}`: {}", review.reason.as_deref().unwrap_or(""));
+            let why = review.reason.clone().unwrap_or_else(|| signals.join(", "));
+            tracing::warn!("guard {verdict:?} call to `{name}`: {why}");
         }
         if let Some(sink) = &self.config.on_event {
-            sink(&CallEvent { time, verdict, tool: name.to_string(), summary: summary(args), reason: review.reason.clone(), model, journal_id });
+            sink(&CallEvent { time, verdict, tool: name.to_string(), summary: summary(args), reason: review.reason.clone(), signals, model, journal_id });
         }
         review.reason.is_none() || !self.config.block
     }
@@ -213,7 +251,7 @@ mod tests {
     fn self_protection_runs_before_policy() {
         let protection = SelfProtection::new(&["agent-superviser".into()], &["me.aagedal.AgentSuperviser".into()]);
         let config = Arc::new(Config { self_protection: Some(protection), ..Config::default() });
-        let guard = Guard::new(bash_request("hi"), config);
+        let mut guard = Guard::new(bash_request("hi"), config);
         let review = guard.review("bash", r#"{"command": "pkill agent-superviser"}"#);
         assert!(review.reason.unwrap().starts_with("self-protection:"));
     }
@@ -230,5 +268,19 @@ mod tests {
         assert!(guard.allow("bash", r#"{"command": "ls   -la"}"#));
         assert!(!guard.allow("nope", "{}"));
         assert_eq!(*seen.lock().unwrap(), [(Verdict::Passed, "ls -la".to_string()), (Verdict::Blocked, "{}".to_string())]);
+    }
+
+    #[test]
+    fn scanner_findings_block_or_warn_by_severity() {
+        // The user names the address, so the policy lets the call through to the scanner.
+        let mut guard = Guard::new(bash_request("GitHub is at 140.82.112.3 here"), Arc::new(Config::default()));
+        // network.isolation_bypass is high: blocked.
+        let pinned = guard.review("bash", r#"{"command": "curl --resolve github.com:443:140.82.112.3 https://github.com/x"}"#);
+        assert_eq!(pinned.verdict(), Verdict::Blocked);
+        assert!(pinned.reason.unwrap().contains("network.isolation_bypass"));
+        // side_channel.agent_history_probe is medium: runs, but suspicious.
+        let history = guard.review("bash", r#"{"command": "ls ~/.claude/projects/"}"#);
+        assert_eq!(history.verdict(), Verdict::Suspicious);
+        assert!(guard.allow("bash", r#"{"command": "cat ~/.codex/sessions/x.jsonl"}"#));
     }
 }

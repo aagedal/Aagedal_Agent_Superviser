@@ -8,7 +8,7 @@ Copyright 2026-present the HuggingFace Inc. team, licensed under the Apache Lice
 |--------------------|-------------------|------------------------------------------------------------------------------|
 | `policy.py`, `constants.py` | `policy.rs` | Same rules. Regex lookarounds rewritten as explicit checks.                 |
 | `selfprotect.py`   | `selfprotect.rs`  | Targets this app (process names, state directory) and OpenCode's config instead of the `safeagents` CLI. The atif-scan allowance rule is dropped. |
-| `guard.py`         | `guard.rs`        | Synchronous. No atif-scan scanner, judge or sinks yet. Emits events for the app. |
+| `guard.py`         | `guard.rs`        | Synchronous. Runs `superviser-scan` (the atif-scan port) like safeagents runs atif-scan; no judge or sinks yet. Emits events for the app. |
 | `rewrite.py`       | `rewrite.rs`      | Same behaviour. Notices say `[guard]`.                                       |
 | `proxy.py`         | `proxy.rs`        | Adds a client API key, a separate upstream key, a switchable upstream and CORS for the app's webviews. |
 | `journal.py`       | `journal.rs`      | Same format.                                                                 |
