@@ -13,7 +13,7 @@ use superviser_core::hardware::Hardware;
 use superviser_core::installed::{self, InstalledModel, Source};
 use superviser_core::paths::{PROTECTED_NAMES, Paths};
 use superviser_core::runtime::{self, LlamaServer, ServerConfig};
-use superviser_core::sandbox::{self, Network};
+use superviser_core::sandbox::{self, Isolation, Network};
 use superviser_core::{opencode, secrets};
 use superviser_guard::journal::Journal;
 use superviser_guard::selfprotect::SelfProtection;
@@ -41,6 +41,8 @@ pub struct Settings {
     pub sandbox_network: Network,
     /// Projects opened in OpenCode, most recent first.
     pub recent_projects: Vec<String>,
+    /// How each project is isolated, when not the default macOS sandbox.
+    pub project_isolation: HashMap<String, Isolation>,
 }
 
 impl Default for Settings {
@@ -53,6 +55,7 @@ impl Default for Settings {
             last_model: None,
             sandbox_network: Network::default(),
             recent_projects: Vec::new(),
+            project_isolation: HashMap::new(),
         }
     }
 }
@@ -161,6 +164,11 @@ impl App {
         };
         let server = GuardServer::start(listener, config, options).await?;
         tracing::info!("guard listening on {}", server.addr);
+        // Linux VMs reach the guard through this socket, never over the network.
+        #[cfg(unix)]
+        if let Err(e) = server.listen_unix(&self.paths.guard_socket()) {
+            tracing::warn!("guard socket {}: {e}", self.paths.guard_socket().display());
+        }
         *self.guard.lock().unwrap() = Some(server);
         Ok(())
     }
@@ -297,15 +305,21 @@ impl App {
         opencode::install(&setup)
     }
 
-    /// Opens `project` in OpenCode, in a new Terminal window, inside the sandbox. OpenCode's
-    /// config is refreshed first so it talks to the guard about the running model.
+    /// How `project` is isolated: its saved choice, or the macOS sandbox.
+    pub fn isolation(&self, project: &std::path::Path) -> Isolation {
+        self.settings.lock().unwrap().project_isolation.get(&project.display().to_string()).copied().unwrap_or_default()
+    }
+
+    /// Opens `project` in OpenCode, in a new Terminal window, isolated as chosen for it.
+    /// OpenCode's config is refreshed first so it talks to the guard about the running model.
     pub fn open_project(&self, project: &std::path::Path) -> anyhow::Result<sandbox::Launched> {
         if self.running_model().is_none() {
             bail!("Start a model first: OpenCode would have nothing to talk to.");
         }
         self.setup_opencode()?;
         let network = self.settings.lock().unwrap().sandbox_network;
-        let launched = sandbox::launch_opencode(&self.paths, project, network)?;
+        let model = self.running_model().map(|(m, context)| opencode::SetupModel { alias: m.alias, name: m.model.name, context });
+        let launched = sandbox::launch(&self.paths, project, self.isolation(project), network, model)?;
         {
             let mut settings = self.settings.lock().unwrap();
             let path = project.display().to_string();

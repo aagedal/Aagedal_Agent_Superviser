@@ -1,6 +1,6 @@
 //! Runs an installed model behind the guard until killed, printing every reviewed call.
 //!
-//! cargo run -p superviser-core --example serve -- <data dir> <port> <client key file>
+//! cargo run -p superviser-core --example serve -- <data dir> <port> <client key file> [unix socket]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +36,11 @@ async fn main() -> anyhow::Result<()> {
     let guard = GuardServer::start(tokio::net::TcpListener::bind(("127.0.0.1", port)).await?, config, options).await?;
     guard.set_upstream(Some(server.base_url()));
     println!("ready: {} as {}", guard.addr, model.alias);
+    // An optional Unix socket to serve too (what Linux VMs reach).
+    if let Some(socket) = args.get(3) {
+        guard.listen_unix(socket.as_ref())?;
+        println!("also serving {socket}");
+    }
     tokio::signal::ctrl_c().await?;
     server.stop().await;
     Ok(())

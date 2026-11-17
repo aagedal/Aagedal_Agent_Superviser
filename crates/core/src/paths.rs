@@ -41,6 +41,17 @@ impl Paths {
     pub fn upstream_api_key(&self) -> PathBuf {
         self.data.join("keys").join("upstream-api-key")
     }
+    /// The guard's Unix socket for Linux VMs. Socket paths are short (about 100 bytes), so a
+    /// long home folder falls back to the per-user temporary folder.
+    pub fn guard_socket(&self) -> PathBuf {
+        let preferred = self.data.join("guard.sock");
+        if preferred.as_os_str().len() <= 100 {
+            return preferred;
+        }
+        let user = std::env::var("USER").unwrap_or_default();
+        std::env::temp_dir().join(format!("agent-superviser-{user}.sock"))
+    }
+
     pub fn settings(&self) -> PathBuf {
         self.data.join("settings.json")
     }

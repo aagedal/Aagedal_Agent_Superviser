@@ -84,6 +84,9 @@ fn main() {
             commands::sandbox_info,
             commands::set_sandbox_network,
             commands::open_project,
+            commands::project_isolation,
+            commands::set_project_isolation,
+            commands::get_installer,
         ]);
 
     builder.build(tauri::generate_context!()).expect("building the app").run(|handle, event| match event {
@@ -247,6 +250,15 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
             }
         }
     }
+}
+
+/// Opens an https link in the default browser.
+pub fn open_url(url: &str) -> std::io::Result<()> {
+    if !url.starts_with("https://") {
+        return Err(std::io::Error::other("only https links"));
+    }
+    let opener = if cfg!(target_os = "macos") { "/usr/bin/open" } else if cfg!(windows) { "explorer" } else { "xdg-open" };
+    std::process::Command::new(opener).arg(url).status().map(|_| ())
 }
 
 /// Asks for a project folder, then opens it in sandboxed OpenCode.
