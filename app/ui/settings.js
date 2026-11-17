@@ -363,19 +363,84 @@ async function renderProjects() {
   $("choose-project").disabled = !info.available || !running;
   $("choose-project").title = running ? "" : "Start a model first";
   $("sandbox-internet").checked = info.network === "internet";
+  renderInstallable(info.installable);
   const list = $("recent-projects");
   list.replaceChildren();
   for (const path of info.recent_projects) {
     const name = path.split("/").filter(Boolean).pop();
+    const isolation = await invoke("project_isolation", { path });
     list.append(
       el(
         "div",
         { class: "card" },
-        el("div", { class: "body" }, el("div", { class: "title" }, name), el("p", { class: "muted small selectable" }, path)),
+        el(
+          "div",
+          { class: "body" },
+          el("div", { class: "title" }, name),
+          el("p", { class: "muted small selectable" }, path),
+          isolationPicker(path, isolation),
+        ),
         el("div", { class: "actions" }, el("button", { disabled: !info.available || !running, onclick: () => invoke("open_project", { path }) }, "Open")),
       ),
     );
   }
+}
+
+// `text` with its `backticked` parts as code.
+function withCode(text) {
+  return text.split("`").map((part, i) => (i % 2 ? el("code", { class: "selectable" }, part) : part));
+}
+
+// Isolation options one install away: what they need, a download button and the steps.
+function renderInstallable(choices) {
+  const box = $("sandbox-installable");
+  box.replaceChildren();
+  for (const choice of choices) {
+    const { needs, steps, url } = choice.setup;
+    const status = el("span", { class: "small muted" });
+    const download = el("button", {}, "Download the installer");
+    download.addEventListener("click", async () => {
+      download.disabled = true;
+      status.textContent = "Finding the latest version…";
+      try {
+        const opened = await invoke("get_installer", { isolation: choice.isolation });
+        status.textContent = `Opened ${opened.split("/").pop()} in your browser.`;
+      } catch (e) {
+        status.textContent = String(e);
+      }
+      download.disabled = false;
+    });
+    box.append(
+      el(
+        "div",
+        { class: "banner" },
+        el("p", {}, el("strong", {}, `${choice.label}: `), `available after installing ${needs}.`),
+        el("ol", { class: "small" }, steps.map((step) => el("li", {}, withCode(step)))),
+        el("div", { class: "row" }, download, el("span", { class: "small muted selectable" }, url), status),
+        el("div", { class: "row small" }, el("span", { class: "muted" }, "Already installed it?"), el("button", { onclick: renderProjects }, "Check again")),
+      ),
+    );
+  }
+}
+
+// Every way a project can be isolated; ones that can't be used say why.
+function isolationPicker(path, { current, choices }) {
+  const select = el("select", { class: "small" });
+  for (const choice of choices) {
+    const label = choice.unavailable ? `${choice.label} (${choice.unavailable})` : choice.label;
+    const option = el("option", { value: choice.isolation, disabled: Boolean(choice.unavailable) }, label);
+    option.selected = choice.isolation === current;
+    select.append(option);
+  }
+  select.addEventListener("change", async () => {
+    try {
+      await invoke("set_project_isolation", { path, isolation: select.value });
+    } catch (e) {
+      alert(e);
+      select.value = current;
+    }
+  });
+  return el("div", { class: "row small" }, el("span", { class: "muted" }, "Runs in"), select);
 }
 $("choose-project").addEventListener("click", () => invoke("open_project", { path: null }));
 $("sandbox-internet").addEventListener("change", (event) =>

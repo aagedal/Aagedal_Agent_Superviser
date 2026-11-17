@@ -49,6 +49,27 @@ pub struct GuardServer {
     pub addr: SocketAddr,
     state: Arc<AppState>,
     shutdown: Option<oneshot::Sender<()>>,
+    /// The Unix socket it also serves (for Linux VMs), with its shutdown.
+    unix: std::sync::Mutex<Option<(std::path::PathBuf, oneshot::Sender<()>)>>,
+}
+
+/// Serves the guard on `listener` until the returned sender fires.
+fn serve<L>(listener: L, state: Arc<AppState>) -> oneshot::Sender<()>
+where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+{
+    let app = axum::Router::new().fallback(forward).with_state(state);
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let server = axum::serve(listener, app).with_graceful_shutdown(async {
+            let _ = rx.await;
+        });
+        if let Err(e) = server.await {
+            tracing::error!("guard server: {e}");
+        }
+    });
+    tx
 }
 
 impl GuardServer {
@@ -60,17 +81,29 @@ impl GuardServer {
             .map_err(std::io::Error::other)?;
         let api_key = RwLock::new(options.api_key.clone());
         let state = Arc::new(AppState { config: Arc::new(config), options, api_key, upstream: RwLock::new(None), client });
-        let app = axum::Router::new().fallback(forward).with_state(state.clone());
-        let (tx, rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let server = axum::serve(listener, app).with_graceful_shutdown(async {
-                let _ = rx.await;
-            });
-            if let Err(e) = server.await {
-                tracing::error!("guard server: {e}");
-            }
-        });
-        Ok(Self { addr, state, shutdown: Some(tx) })
+        let shutdown = serve(listener, state.clone());
+        Ok(Self { addr, state, shutdown: Some(shutdown), unix: std::sync::Mutex::new(None) })
+    }
+
+    /// Also serves a Unix socket at `path`, readable by this user only (same keys, upstream
+    /// and checks). Linux VMs reach it through the socket the VM runtime forwards: nothing
+    /// listens on the network, so the firewall never asks.
+    #[cfg(unix)]
+    pub fn listen_unix(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if self.unix.lock().unwrap().as_ref().is_some_and(|(p, _)| p == path) {
+            return Ok(());
+        }
+        // A socket left by an earlier run.
+        if std::fs::symlink_metadata(path).is_ok_and(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type())) {
+            std::fs::remove_file(path)?;
+        }
+        let listener = tokio::net::UnixListener::bind(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let shutdown = serve(listener, self.state.clone());
+        tracing::info!("guard also serving {}", path.display());
+        *self.unix.lock().unwrap() = Some((path.to_path_buf(), shutdown));
+        Ok(())
     }
 
     /// Points the guard at a model server (`http://127.0.0.1:PORT`), or at nothing.
@@ -90,6 +123,10 @@ impl GuardServer {
     pub fn stop(&mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
+        }
+        if let Some((path, tx)) = self.unix.lock().unwrap().take() {
+            let _ = tx.send(());
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -315,6 +352,33 @@ mod tests {
         assert!(text.contains("undeclared tool"), "{text}");
         assert!(text.contains(r#""finish_reason":"stop""#), "{text}");
         assert!(text.ends_with("data: [DONE]\n\n"));
+    }
+
+    /// The Unix socket serves the same guard: keys, upstream and checks.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_shares_keys_and_upstream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let upstream = fake_upstream(r#"{"ok":true}"#, "application/json").await;
+        let mut server = guard_server(Some(upstream)).await;
+        let path = std::env::temp_dir().join(format!("guard-{}.sock", std::process::id()));
+        server.listen_unix(&path).unwrap();
+        server.listen_unix(&path).unwrap(); // already serving: no error
+        let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&path).unwrap().permissions());
+        assert_eq!(mode & 0o777, 0o600);
+        let request = |key: Option<&str>| {
+            let auth = key.map_or(String::new(), |k| format!("Authorization: Bearer {k}\r\n"));
+            format!("GET /v1/models HTTP/1.1\r\nHost: guard\r\n{auth}Connection: close\r\n\r\n")
+        };
+        for (key, status) in [(None, "401"), (Some("client-key"), "200")] {
+            let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+            stream.write_all(request(key).as_bytes()).await.unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).await.unwrap();
+            assert!(reply.starts_with(&format!("HTTP/1.1 {status}")), "{reply}");
+        }
+        server.stop();
+        assert!(!path.exists());
     }
 
     #[tokio::test]

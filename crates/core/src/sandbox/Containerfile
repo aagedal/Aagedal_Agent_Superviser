@@ -1,0 +1,31 @@
+# The Linux environment OpenCode runs in for "Linux VM" projects (Apple `container`).
+# Built once per OpenCode version, on first use; only the project folder is shared in.
+FROM docker.io/library/debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl git openssh-client less procps unzip xz-utils socat \
+      build-essential pkg-config python3 python3-pip python3-venv nodejs npm ripgrep fd-find jq \
+ && rm -rf /var/lib/apt/lists/*
+
+ARG OPENCODE_VERSION=2.3.0
+RUN npm install -g "@opencode/cli@${OPENCODE_VERSION}" && npm cache clean --force
+
+RUN useradd --create-home --uid 1000 --shell /bin/bash agent \
+ && install -d -o agent -g agent /workspace /home/agent/.config /home/agent/.cache \
+      /home/agent/.local /home/agent/.local/share /home/agent/.local/state
+
+# The guard on the Mac arrives as a Unix socket only root can open (the runtime's
+# forwarded agent socket). As root, relay it to 127.0.0.1:8787, then run OpenCode as
+# `agent`, which can reach the guard only through the relay.
+RUN printf '%s\n' '#!/bin/sh' \
+      'socat TCP-LISTEN:8787,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:"${SSH_AUTH_SOCK:?the guard socket is missing}" &' \
+      'exec setpriv --reuid=agent --regid=agent --init-groups env HOME=/home/agent USER=agent LOGNAME=agent SSH_AUTH_SOCK= "$@"' \
+      > /usr/local/bin/superviser-entry \
+ && chmod 755 /usr/local/bin/superviser-entry
+
+ENV HOME=/home/agent
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/superviser-entry"]
+CMD ["opencode", "--standalone"]

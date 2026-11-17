@@ -62,6 +62,7 @@ button {
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
 button.danger { color: var(--bad); }
 button:disabled { opacity: 0.5; cursor: default; }
+select { font: inherit; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); }
 input[type="text"], input[type="password"], input[type="search"] {
   font: inherit;
   padding: 6px 10px;

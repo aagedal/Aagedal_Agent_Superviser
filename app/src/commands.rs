@@ -266,12 +266,28 @@ pub struct SandboxInfo {
     available: bool,
     network: superviser_core::sandbox::Network,
     recent_projects: Vec<String>,
+    /// Isolation options that installing something would make available.
+    installable: Vec<superviser_core::sandbox::Choice>,
 }
 
 #[tauri::command]
 pub fn sandbox_info(app: State<'_, Arc<App>>) -> SandboxInfo {
     let settings = app.settings.lock().unwrap();
-    SandboxInfo { available: cfg!(target_os = "macos"), network: settings.sandbox_network, recent_projects: settings.recent_projects.clone() }
+    // Any folder: whether a backend is installed doesn't depend on the project.
+    let installable = superviser_core::sandbox::choices(std::path::Path::new("/")).into_iter().filter(|c| c.setup.is_some()).collect();
+    SandboxInfo { available: cfg!(target_os = "macos"), network: settings.sandbox_network, recent_projects: settings.recent_projects.clone(), installable }
+}
+
+/// Opens the download of what an isolation option needs (Apple's signed `container`
+/// installer) in the browser, and says which link it opened.
+#[tauri::command]
+pub async fn get_installer(isolation: superviser_core::sandbox::Isolation) -> Result<String> {
+    let url = match isolation {
+        superviser_core::sandbox::Isolation::LinuxVm => superviser_core::sandbox::container::installer_url().await,
+        superviser_core::sandbox::Isolation::MacosSandbox => return Err("the macOS sandbox needs nothing installed".into()),
+    };
+    crate::open_url(&url).map_err(err)?;
+    Ok(url)
 }
 
 #[tauri::command]
@@ -282,7 +298,30 @@ pub fn set_sandbox_network(handle: AppHandle, app: State<'_, Arc<App>>, network:
     Ok(())
 }
 
-/// Opens a project (or asks for one, with `path` unset) in sandboxed OpenCode.
+#[derive(Serialize)]
+pub struct ProjectIsolation {
+    current: superviser_core::sandbox::Isolation,
+    choices: Vec<superviser_core::sandbox::Choice>,
+}
+
+/// How a project is isolated, and the ways it could be.
+#[tauri::command]
+pub fn project_isolation(app: State<'_, Arc<App>>, path: String) -> ProjectIsolation {
+    let project = std::path::Path::new(&path);
+    ProjectIsolation { current: app.isolation(project), choices: superviser_core::sandbox::choices(project) }
+}
+
+#[tauri::command]
+pub fn set_project_isolation(app: State<'_, Arc<App>>, path: String, isolation: superviser_core::sandbox::Isolation) -> Result<()> {
+    let choice = superviser_core::sandbox::choices(std::path::Path::new(&path)).into_iter().find(|c| c.isolation == isolation);
+    if let Some(why) = choice.and_then(|c| c.unavailable) {
+        return Err(why);
+    }
+    app.settings.lock().unwrap().project_isolation.insert(path, isolation);
+    app.save_settings().map_err(err)
+}
+
+/// Opens a project (or asks for one, with `path` unset) in isolated OpenCode.
 #[tauri::command]
 pub fn open_project(handle: AppHandle, path: Option<String>) {
     match path {
