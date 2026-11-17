@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chat</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="chat">
+    <header>
+      <div><strong id="model">No model running</strong> <span class="muted small">· local, through the guard</span></div>
+      <button id="clear">New chat</button>
+    </header>
+    <div class="messages" id="messages"></div>
+    <form class="composer" id="composer">
+      <textarea id="input" placeholder="Ask something… (Enter to send, Shift+Enter for a new line)"></textarea>
+      <button class="primary" id="send" type="submit">Send</button>
+    </form>
+  </div>
+  <script src="chat.js"></script>
+</body>
+</html>
