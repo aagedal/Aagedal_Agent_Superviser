@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "What the settings and chat windows may do",
+  "windows": ["settings", "chat"],
+  "permissions": ["core:default"]
+}

@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Superviser</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <nav>
+    <button data-tab="models" class="active">Models</button>
+    <button data-tab="installed">Installed</button>
+    <button data-tab="connect">Connect</button>
+    <button data-tab="safety">Safety</button>
+  </nav>
+  <main>
+    <section id="models">
+      <h1>Pick a model</h1>
+      <p class="muted" id="machine"></p>
+      <div id="offers"></div>
+      <p class="muted small" id="hidden-note"></p>
+
+      <h2>Search Hugging Face</h2>
+      <p class="muted small">Any GGUF model. We download the 4-bit (Q4_K_M or closest) version and only if it fits this machine.</p>
+      <form class="row" id="search-form">
+        <input type="search" id="search" placeholder="e.g. unsloth coder" autocomplete="off">
+        <button type="submit">Search</button>
+      </form>
+      <div id="results"></div>
+    </section>
+
+    <section id="installed" hidden>
+      <h1>Installed models</h1>
+      <div id="status-banner" class="banner"></div>
+      <div id="installed-list"></div>
+
+      <h2>Models from other apps</h2>
+      <p class="muted small">Models you already downloaded with LM Studio, Ollama, llama.cpp, Unsloth Studio or other Hugging Face tools are used where they are: nothing is copied, and they are never deleted from here. The same rules apply as for downloads: 4-bit or better, and only if it fits this machine.</p>
+      <div class="row">
+        <label class="check"><input type="checkbox" id="use-other-apps"> Use models from other apps</label>
+        <button id="rescan">Look again</button>
+      </div>
+      <p class="small muted" id="other-apps-summary"></p>
+      <details id="other-apps-details" hidden>
+        <summary class="small muted">Details</summary>
+        <div id="other-apps-list" class="calls"></div>
+      </details>
+    </section>
+
+    <section id="connect" hidden>
+      <h1>Connect a coding tool</h1>
+      <p class="muted">Tools talk to the guard, which checks every tool call before it runs and forwards the rest to your local model.</p>
+
+      <h2>OpenCode</h2>
+      <p class="muted small" id="opencode-version"></p>
+      <div class="row">
+        <button class="primary" id="setup-opencode">Set up OpenCode</button>
+        <span class="small muted" id="opencode-result"></span>
+      </div>
+      <p class="muted small">Adds a “superviser” provider to your global OpenCode config and makes the running model the default. Your other settings and comments are kept, and a backup is saved next to the file. This also happens automatically when you start a model.</p>
+
+      <h2>Other tools (OpenAI-compatible)</h2>
+      <div class="row"><span class="muted" style="width:70px">Base URL</span><input type="text" id="base-url" readonly><button data-copy="base-url">Copy</button></div>
+      <div class="row"><span class="muted" style="width:70px">API key</span><input type="password" id="api-key" readonly><button id="reveal-key">Show</button><button data-copy="api-key">Copy</button></div>
+      <div class="row"><span class="muted" style="width:70px">Model</span><input type="text" id="model-name" readonly><button data-copy="model-name">Copy</button></div>
+      <div class="row"><button class="danger" id="regenerate-key">New API key</button><span class="small muted">Tools using the old key stop working until set up again.</span></div>
+
+      <h2>Hugging Face token</h2>
+      <p class="muted small">Only needed for gated or private models. Stored in your system keychain.</p>
+      <form class="row" id="hf-form">
+        <input type="password" id="hf-token" placeholder="hf_…" autocomplete="off">
+        <button type="submit">Save</button>
+        <button type="button" id="hf-clear">Remove</button>
+      </form>
+      <p class="small muted" id="hf-status"></p>
+    </section>
+
+    <section id="safety" hidden>
+      <h1>Safety</h1>
+      <p class="muted">The guard looks at every command and file edit the model asks for. It blocks calls that use tools the agent was never given, reach websites nobody in the conversation mentioned, or try to switch the guard off or redirect your tools. Blocked calls are replaced with a note, so nothing runs.</p>
+      <p class="muted small">Based on Hugging Face’s safeagents (<span class="selectable">github.com/huggingface/safeagents</span>). This checks what the agent tries to do; it is not a sandbox.</p>
+      <h2>Recent tool calls</h2>
+      <div class="calls" id="calls"><p class="muted">No tool calls yet.</p></div>
+    </section>
+  </main>
+  <script src="settings.js"></script>
+</body>
+</html>

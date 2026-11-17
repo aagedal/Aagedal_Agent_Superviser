@@ -1,0 +1,221 @@
+{
+  "version": 1,
+  "generated": "2026-11-17",
+  "models": [
+    {
+      "repo": "unsloth/Qwen3.5-4B-GGUF",
+      "revision": "e87f176479d0855a907a41277aca2f8ee7a09523",
+      "name": "Qwen3.5 4B",
+      "description": "Small and quick. For light edits on machines with little memory.",
+      "arch": "qwen35",
+      "context_length": 262144,
+      "kv_bytes_per_token": 32768,
+      "kv_fixed_bytes": 0,
+      "quant": {
+        "label": "Q4_K_M",
+        "files": [
+          {
+            "path": "Qwen3.5-4B-Q4_K_M.gguf",
+            "size": 2740937888,
+            "sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+          }
+        ],
+        "size": 2740937888
+      }
+    },
+    {
+      "repo": "unsloth/Qwen3.5-9B-GGUF",
+      "revision": "3885219b6810b007914f3a7950a8d1b469d598a5",
+      "name": "Qwen3.5 9B",
+      "description": "Good all-rounder for 16 GB machines.",
+      "arch": "qwen35",
+      "context_length": 262144,
+      "kv_bytes_per_token": 32768,
+      "kv_fixed_bytes": 0,
+      "quant": {
+        "label": "Q4_K_M",
+        "files": [
+          {
+            "path": "Qwen3.5-9B-Q4_K_M.gguf",
+            "size": 5680522464,
+            "sha256": "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8"
+          }
+        ],
+        "size": 5680522464
+      }
+    },
+    {
+      "repo": "unsloth/gpt-oss-20b-GGUF",
+      "revision": "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4",
+      "name": "gpt-oss 20B",
+      "description": "OpenAI's open model. Fast, reliable tool calling.",
+      "arch": "gpt-oss",
+      "context_length": 131072,
+      "kv_bytes_per_token": 24576,
+      "kv_fixed_bytes": 15728640,
+      "quant": {
+        "label": "Q4_K_M",
+        "files": [
+          {
+            "path": "gpt-oss-20b-Q4_K_M.gguf",
+            "size": 11624759488,
+            "sha256": "c27536640e410032865dc68781d80a08b98f8db5e93575919af8ccc0568aeb4f"
+          }
+        ],
+        "size": 11624759488
+      }
+    },
+    {
+      "repo": "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF",
+      "revision": "6e458b8add42681bfd023de5eab93637694aaf82",
+      "name": "Devstral Small 2 24B",
+      "description": "Mistral's model built for coding agents.",
+      "arch": "mistral3",
+      "context_length": 393216,
+      "kv_bytes_per_token": 163840,
+      "kv_fixed_bytes": 0,
+      "quant": {
+        "label": "Q4_K_M",
+        "files": [
+          {
+            "path": "Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+            "size": 14334446752,
+            "sha256": "d14ba9edee1bb4c4996a726deb81e49ae81800a3216f0774634238c380aee496"
+          }
+        ],
+        "size": 14334446752
+      }
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "revision": "4af51b3542f775b0a8e4b310bfb3f17e01c306c9",
+      "name": "Qwen3.8 27B",
+      "description": "Strong dense model for coding and reasoning.",
+      "arch": "qwen35",
+      "context_length": 262144,
+      "kv_bytes_per_token": 65536,
+      "kv_fixed_bytes": 0,
+      "quant": {
+        "label": "UD-Q4_K_M",
+        "files": [
+          {
+            "path": "Qwen3.8-27B-UD-Q4_K_M.gguf",
+            "size": 16564259744,
+            "sha256": "1bce504dfecd84153666928a41d8a66706f0158d3a317bc5196b72819d7dc529"
+          }
+        ],
+        "size": 16564259744
+      }
+    },
+    {
+      "repo": "unsloth/GLM-4.7-Flash-GGUF",
+      "revision": "0d32489ecb9db6d2a4fc93bd27ef01519f95474d",
+      "name": "GLM-4.7 Flash",
+      "description": "Fast mixture-of-experts model with good agentic coding.",
+      "arch": "deepseek2",
+      "context_length": 202752,
+      "kv_bytes_per_token": 102272,
+      "kv_fixed_bytes": 0,
+      "quant": {
+        "label": "Q4_K_M",
+        "files": [
+          {
+            "path": "GLM-4.7-Flash-Q4_K_M.gguf",
+            "size": 18312339808,
+            "sha256": "29837ed2c0fc5f51981adf8ac8083fcf80743c598381f13e9f06cbad0498b174"
+          }
+        ],
+        "size": 18312339808
+      }
+    },
+    {
+      "repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+      "revision": "b17cb02dd882d5b6ab62fc777ad2995f19668350",
+      "name": "Qwen3 Coder 30B-A3B",
+      "description": "Coding specialist, fast because only 3B parameters are active.",
+      "arch": "qwen3moe",
+      "context_length": 262144,
+      "kv_bytes_per_token": 98304,
+      "kv_fixed_bytes": 0,
+      "quant": {
+        "label": "Q4_K_M",
+        "files": [
+          {
+            "path": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+            "size": 18556689568,
+            "sha256": "fadc3e5f8d42bf7e894a785b05082e47daee4df26680389817e2093056f088ad"
+          }
+        ],
+        "size": 18556689568
+      }
+    },
+    {
+      "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
+      "revision": "a483e9e6cbd595906af30beda3187c2663a1118c",
+      "name": "Qwen3.6 35B-A3B",
+      "description": "Newer fast mixture-of-experts model for coding agents.",
+      "arch": "qwen35moe",
+      "context_length": 262144,
+      "kv_bytes_per_token": 20480,
+      "kv_fixed_bytes": 0,
+      "quant": {
+        "label": "UD-Q4_K_M",
+        "files": [
+          {
+            "path": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            "size": 22134528992,
+            "sha256": "ac0e2c1189e055faa36eff361580e79c5bd6f8e76bffb4ce547f167d53e31a61"
+          }
+        ],
+        "size": 22134528992
+      }
+    },
+    {
+      "repo": "unsloth/Qwen3-Coder-Next-GGUF",
+      "revision": "ce09c67b53bc8739eef83fe67b2f5d293c270632",
+      "name": "Qwen3 Coder Next",
+      "description": "Large coding specialist for 64 GB+ machines.",
+      "arch": "qwen3next",
+      "context_length": 262144,
+      "kv_bytes_per_token": 24576,
+      "kv_fixed_bytes": 0,
+      "quant": {
+        "label": "Q4_K_M",
+        "files": [
+          {
+            "path": "Qwen3-Coder-Next-Q4_K_M.gguf",
+            "size": 48528320544,
+            "sha256": "9e6032d2f3b50a60f17ce8bf5a1d85c71af9b53b89c7978020ae7c660f29b090"
+          }
+        ],
+        "size": 48528320544
+      }
+    },
+    {
+      "repo": "unsloth/gpt-oss-120b-GGUF",
+      "revision": "ff1a82da6ad466e32284fa3d2b86694db3204789",
+      "name": "gpt-oss 120B",
+      "description": "OpenAI's large open model, for 96 GB+ machines.",
+      "arch": "gpt-oss",
+      "context_length": 131072,
+      "kv_bytes_per_token": 36864,
+      "kv_fixed_bytes": 23592960,
+      "quant": {
+        "label": "Q4_K_M",
+        "files": [
+          {
+            "path": "Q4_K_M/gpt-oss-120b-Q4_K_M-00001-of-00002.gguf",
+            "size": 49630904192,
+            "sha256": "b1d7474caa92717b8a7f75e3c1d1006eb40f3bd3591522e5a2b095f36b12757d"
+          },
+          {
+            "path": "Q4_K_M/gpt-oss-120b-Q4_K_M-00002-of-00002.gguf",
+            "size": 13137819360,
+            "sha256": "b7cc4f7dd8dfd252900d79ab462abc0ad4bf06e4bcf0e59e491b6625bfee36e6"
+          }
+        ],
+        "size": 62768723552
+      }
+    }
+  ]
+}
