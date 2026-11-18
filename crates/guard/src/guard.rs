@@ -3,8 +3,8 @@
 //! 1. Self-protection: calls against the guard itself are blocked outright.
 //! 2. Undeclared tools and hosts from nowhere are blocked outright.
 //! 3. Scanner findings (`superviser-scan`, a port of atif-scan's local-safety checks) at or
-//!    above `block_severity` are blocked too; milder ones make a call suspicious: it runs,
-//!    and is logged. (Not ported: the judge model that decides suspicious calls.)
+//!    above `block_severity` are blocked too; milder ones make a call suspicious: the judge,
+//!    if there is one, decides. Without one, suspicious calls run and are logged.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,6 +14,7 @@ use serde_json::{Map, Value};
 use superviser_scan::{Scanner, Severity, Signal};
 
 use crate::journal::Journal;
+use crate::judge::{Judge, MAX_TASK};
 use crate::policy::{DEFAULT_ALLOWED_HOSTS, Policy};
 use crate::selfprotect::SelfProtection;
 
@@ -65,11 +66,13 @@ pub enum Verdict {
 pub struct Review {
     pub reason: Option<String>,
     pub signals: Vec<Signal>,
+    /// The judge's answer as `allow: why`, `block: why` or `error: why`.
+    pub judge: Option<String>,
 }
 
 impl Review {
     fn blocked(reason: String) -> Self {
-        Self { reason: Some(reason), signals: Vec::new() }
+        Self { reason: Some(reason), ..Self::default() }
     }
 
     /// `Blocked` with a reason, `Suspicious` with only signals, else `Passed`.
@@ -106,6 +109,8 @@ pub struct CallEvent {
     pub reason: Option<String>,
     /// Scanner findings, as `id (severity)`.
     pub signals: Vec<String>,
+    /// The judge's answer, as in [`Review::judge`].
+    pub judge: Option<String>,
     pub model: String,
     pub journal_id: Option<u64>,
 }
@@ -114,6 +119,7 @@ pub struct Guard {
     request: Value,
     config: Arc<Config>,
     policy: Policy,
+    judge: Option<Judge>,
     pub flagged: Vec<Blocked>,
     /// This response's calls so far: the scanner judges the last in their light.
     calls: Vec<(String, String)>,
@@ -138,16 +144,23 @@ pub fn summary(args: &str) -> String {
     }
 }
 
-/// The user's messages, for the journal.
-fn task_text(request: &Value) -> String {
+/// The text of user turns, for the judge and the journal: no system prompt (long and
+/// generic in most harnesses), tool results or agent turns. Keeps the end when long, as the
+/// latest ask matters most.
+pub(crate) fn task_text(request: &Value) -> String {
     let Some(messages) = request.get("messages").and_then(Value::as_array) else { return String::new() };
-    messages
+    let text = messages
         .iter()
         .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
         .map(|m| content_text(m.get("content")))
         .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n\n");
+    let length = text.chars().count();
+    if length <= MAX_TASK {
+        return text;
+    }
+    format!("[...]\n{}", text.chars().skip(length - MAX_TASK).collect::<String>())
 }
 
 /// Text of a message `content`: a string, or the text parts of a list.
@@ -167,7 +180,13 @@ pub fn content_text(content: Option<&Value>) -> String {
 impl Guard {
     pub fn new(request: Value, config: Arc<Config>) -> Self {
         let policy = Policy::new(&request, &config.allowed_hosts);
-        Self { request, config, policy, flagged: Vec::new(), calls: Vec::new() }
+        Self { request, config, policy, judge: None, flagged: Vec::new(), calls: Vec::new() }
+    }
+
+    /// Asks `judge` about suspicious calls.
+    pub fn with_judge(mut self, judge: Judge) -> Self {
+        self.judge = Some(judge);
+        self
     }
 
     pub fn blocking(&self) -> bool {
@@ -175,7 +194,7 @@ impl Guard {
     }
 
     /// Reviews a complete call without logging it.
-    pub fn review(&mut self, name: &str, args: &str) -> Review {
+    pub async fn review(&mut self, name: &str, args: &str) -> Review {
         self.calls.push((name.to_string(), args.to_string()));
         // Self-protection runs first, so nothing that later excuses findings can lift it.
         if let Some(reason) = self.config.self_protection.as_ref().and_then(|p| p.reason(args)) {
@@ -187,13 +206,31 @@ impl Guard {
         let Some(scanner) = &self.config.scanner else { return Review::default() };
         let signals = scanner.signals(&self.request, &self.calls);
         let severe: Vec<String> = signals.iter().filter(|s| s.severity >= self.config.block_severity).map(Signal::to_string).collect();
-        let reason = (!severe.is_empty()).then(|| format!("scan: {}", severe.join(", ")));
-        Review { reason, signals }
+        if !severe.is_empty() {
+            return Review { reason: Some(format!("scan: {}", severe.join(", "))), signals, judge: None };
+        }
+        if signals.is_empty() {
+            return Review::default();
+        }
+        self.judge(name, args, signals).await
+    }
+
+    async fn judge(&self, name: &str, args: &str, signals: Vec<Signal>) -> Review {
+        let Some(judge) = &self.judge else { return Review { signals, ..Review::default() } };
+        let findings = signals.iter().map(Signal::to_string).collect::<Vec<_>>().join(", ");
+        match judge.review(&self.request, name, args, &signals).await {
+            Ok(d) if d.block => Review { reason: Some(format!("{findings}; judge: {}", d.reason)), signals, judge: Some(format!("block: {}", d.reason)) },
+            Ok(d) => Review { reason: None, signals, judge: Some(format!("allow: {}", d.reason)) },
+            Err(e) => {
+                let reason = judge.options.fail_closed.then(|| format!("{findings}; judge unavailable"));
+                Review { reason, signals, judge: Some(format!("error: {e}")) }
+            }
+        }
     }
 
     /// Reviews and records a complete call; true if it may run (always, in log-only mode).
-    pub fn allow(&mut self, name: &str, args: &str) -> bool {
-        let review = self.review(name, args);
+    pub async fn allow(&mut self, name: &str, args: &str) -> bool {
+        let review = self.review(name, args).await;
         let mut verdict = review.verdict();
         if let Some(reason) = &review.reason {
             self.flagged.push(Blocked { name: name.to_string(), reason: reason.clone() });
@@ -215,6 +252,7 @@ impl Guard {
             entry.insert("arguments".into(), args.into());
             entry.insert("reason".into(), review.reason.clone().into());
             entry.insert("signals".into(), serde_json::to_value(&review.signals).unwrap());
+            entry.insert("judge".into(), review.judge.clone().into());
             entry.insert("model".into(), model.clone().into());
             entry.insert("task".into(), task_text(&self.request).into());
             match journal.append(entry) {
@@ -225,10 +263,22 @@ impl Guard {
         let signals: Vec<String> = review.signals.iter().map(Signal::to_string).collect();
         if verdict != Verdict::Passed {
             let why = review.reason.clone().unwrap_or_else(|| signals.join(", "));
-            tracing::warn!("guard {verdict:?} call to `{name}`: {why}");
+            let judge = review.judge.as_ref().map_or(String::new(), |j| format!(" (judge {j})"));
+            tracing::warn!("guard {verdict:?} call to `{name}`: {why}{judge}");
         }
         if let Some(sink) = &self.config.on_event {
-            sink(&CallEvent { time, verdict, tool: name.to_string(), summary: summary(args), reason: review.reason.clone(), signals, model, journal_id });
+            let event = CallEvent {
+                time,
+                verdict,
+                tool: name.to_string(),
+                summary: summary(args),
+                reason: review.reason.clone(),
+                signals,
+                judge: review.judge.clone(),
+                model,
+                journal_id,
+            };
+            sink(&event);
         }
         review.reason.is_none() || !self.config.block
     }
@@ -237,27 +287,28 @@ impl Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::judge::JudgeOptions;
     use crate::policy::tests::bash_request;
 
-    #[test]
-    fn log_only_flags_but_allows() {
+    #[tokio::test]
+    async fn log_only_flags_but_allows() {
         let config = Arc::new(Config { block: false, ..Config::default() });
         let mut guard = Guard::new(bash_request("hi"), config);
-        assert!(guard.allow("shell", "{}"));
+        assert!(guard.allow("shell", "{}").await);
         assert_eq!(guard.flagged.len(), 1);
     }
 
-    #[test]
-    fn self_protection_runs_before_policy() {
+    #[tokio::test]
+    async fn self_protection_runs_before_policy() {
         let protection = SelfProtection::new(&["agent-superviser".into()], &["me.aagedal.AgentSuperviser".into()]);
         let config = Arc::new(Config { self_protection: Some(protection), ..Config::default() });
         let mut guard = Guard::new(bash_request("hi"), config);
-        let review = guard.review("bash", r#"{"command": "pkill agent-superviser"}"#);
+        let review = guard.review("bash", r#"{"command": "pkill agent-superviser"}"#).await;
         assert!(review.reason.unwrap().starts_with("self-protection:"));
     }
 
-    #[test]
-    fn events_reach_the_sink() {
+    #[tokio::test]
+    async fn events_reach_the_sink() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink_seen = seen.clone();
         let config = Arc::new(Config {
@@ -265,22 +316,89 @@ mod tests {
             ..Config::default()
         });
         let mut guard = Guard::new(bash_request("hi"), config);
-        assert!(guard.allow("bash", r#"{"command": "ls   -la"}"#));
-        assert!(!guard.allow("nope", "{}"));
+        assert!(guard.allow("bash", r#"{"command": "ls   -la"}"#).await);
+        assert!(!guard.allow("nope", "{}").await);
         assert_eq!(*seen.lock().unwrap(), [(Verdict::Passed, "ls -la".to_string()), (Verdict::Blocked, "{}".to_string())]);
     }
 
-    #[test]
-    fn scanner_findings_block_or_warn_by_severity() {
+    #[tokio::test]
+    async fn scanner_findings_block_or_warn_by_severity() {
         // The user names the address, so the policy lets the call through to the scanner.
         let mut guard = Guard::new(bash_request("GitHub is at 140.82.112.3 here"), Arc::new(Config::default()));
         // network.isolation_bypass is high: blocked.
-        let pinned = guard.review("bash", r#"{"command": "curl --resolve github.com:443:140.82.112.3 https://github.com/x"}"#);
+        let pinned = guard.review("bash", r#"{"command": "curl --resolve github.com:443:140.82.112.3 https://github.com/x"}"#).await;
         assert_eq!(pinned.verdict(), Verdict::Blocked);
         assert!(pinned.reason.unwrap().contains("network.isolation_bypass"));
         // side_channel.agent_history_probe is medium: runs, but suspicious.
-        let history = guard.review("bash", r#"{"command": "ls ~/.claude/projects/"}"#);
+        let history = guard.review("bash", r#"{"command": "ls ~/.claude/projects/"}"#).await;
         assert_eq!(history.verdict(), Verdict::Suspicious);
-        assert!(guard.allow("bash", r#"{"command": "cat ~/.codex/sessions/x.jsonl"}"#));
+        assert!(guard.allow("bash", r#"{"command": "cat ~/.codex/sessions/x.jsonl"}"#).await);
+    }
+
+    /// A model server that answers every judge request with `verdict`, or fails.
+    async fn judge_server(verdict: Option<&'static str>) -> Judge {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().fallback(move || async move {
+            match verdict {
+                Some(v) => {
+                    let content = format!(r#"{{"verdict":"{v}","reason":"the task is about the web app"}}"#);
+                    axum::Json(serde_json::json!({"choices": [{"message": {"content": content}}]})).into_response()
+                }
+                None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Judge::new(reqwest::Client::new(), &format!("http://{addr}"), None, "m", JudgeOptions::default())
+    }
+
+    const HISTORY: &str = r#"{"command": "ls ~/.claude/projects/"}"#;
+
+    #[tokio::test]
+    async fn judge_decides_suspicious_calls() {
+        let config = Arc::new(Config::default());
+        let mut blocked = Guard::new(bash_request("fix the CSS"), config.clone()).with_judge(judge_server(Some("block")).await);
+        let review = blocked.review("bash", HISTORY).await;
+        assert_eq!(review.verdict(), Verdict::Blocked);
+        assert_eq!(review.reason.unwrap(), "side_channel.agent_history_probe (medium); judge: the task is about the web app");
+        assert_eq!(review.judge.unwrap(), "block: the task is about the web app");
+
+        let mut allowed = Guard::new(bash_request("fix the CSS"), config).with_judge(judge_server(Some("allow")).await);
+        let review = allowed.review("bash", HISTORY).await;
+        assert_eq!(review.verdict(), Verdict::Suspicious);
+        assert!(review.judge.unwrap().starts_with("allow: "));
+    }
+
+    #[tokio::test]
+    async fn judge_is_not_asked_about_clean_or_blocked_calls() {
+        // A judge that would block everything: clean calls still pass, blocked ones keep their reason.
+        let mut guard = Guard::new(bash_request("hi"), Arc::new(Config::default())).with_judge(judge_server(Some("block")).await);
+        assert_eq!(guard.review("bash", r#"{"command": "ls"}"#).await, Review::default());
+        assert_eq!(guard.review("shell", "{}").await.judge, None);
+    }
+
+    #[tokio::test]
+    async fn unreachable_judge_fails_open_unless_told_otherwise() {
+        let judge = judge_server(None).await;
+        let mut open = Guard::new(bash_request("hi"), Arc::new(Config::default())).with_judge(judge.clone());
+        let review = open.review("bash", HISTORY).await;
+        assert_eq!(review.verdict(), Verdict::Suspicious);
+        assert!(review.judge.unwrap().starts_with("error: "));
+
+        let mut closed = judge;
+        closed.options.fail_closed = true;
+        let mut closed = Guard::new(bash_request("hi"), Arc::new(Config::default())).with_judge(closed);
+        let review = closed.review("bash", HISTORY).await;
+        assert_eq!(review.reason.unwrap(), "side_channel.agent_history_probe (medium); judge unavailable");
+    }
+
+    #[test]
+    fn long_tasks_keep_their_end() {
+        let request = bash_request(&format!("{}END", "a".repeat(MAX_TASK)));
+        let task = task_text(&request);
+        assert!(task.starts_with("[...]\n") && task.ends_with("END"));
+        assert_eq!(task.chars().count(), MAX_TASK + 6);
     }
 }

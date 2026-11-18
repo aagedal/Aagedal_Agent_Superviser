@@ -8,7 +8,7 @@ use std::time::Duration;
 use superviser_core::paths::Paths;
 use superviser_core::runtime::{self, LlamaServer, ServerConfig};
 use superviser_core::{installed, secrets};
-use superviser_guard::{CallEvent, Config, GuardServer, ProxyOptions};
+use superviser_guard::{CallEvent, Config, GuardServer, JudgeOptions, ProxyOptions};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -25,14 +25,20 @@ async fn main() -> anyhow::Result<()> {
         port: runtime::free_port()?,
         api_key_file: paths.upstream_api_key(),
         log_file: paths.logs().join("llama-server.log"),
+        prompt_cache: 2 << 30,
     })
     .await?;
     server.wait_ready(Duration::from_secs(120)).await?;
     let config = Config {
-        on_event: Some(Arc::new(|e: &CallEvent| println!("guard: {:?} {} {} {:?}", e.verdict, e.tool, e.summary, e.reason))),
+        on_event: Some(Arc::new(|e: &CallEvent| println!("guard: {:?} {} {} {:?} {:?}", e.verdict, e.tool, e.summary, e.reason, e.judge))),
         ..Config::default()
     };
-    let options = ProxyOptions { api_key: Some(client_key), upstream_api_key: Some(secrets::upstream_api_key(&paths)?), cors_origins: vec![] };
+    let options = ProxyOptions {
+        api_key: Some(client_key),
+        upstream_api_key: Some(secrets::upstream_api_key(&paths)?),
+        cors_origins: vec![],
+        judge: Some(JudgeOptions::default()),
+    };
     let guard = GuardServer::start(tokio::net::TcpListener::bind(("127.0.0.1", port)).await?, config, options).await?;
     guard.set_upstream(Some(server.base_url()));
     println!("ready: {} as {}", guard.addr, model.alias);

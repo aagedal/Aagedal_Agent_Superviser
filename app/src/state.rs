@@ -17,7 +17,7 @@ use superviser_core::sandbox::{self, Isolation, Network};
 use superviser_core::{opencode, secrets};
 use superviser_guard::journal::Journal;
 use superviser_guard::selfprotect::SelfProtection;
-use superviser_guard::{CallEvent, GuardServer, ProxyOptions};
+use superviser_guard::{CallEvent, GuardServer, JudgeOptions, ProxyOptions};
 
 pub const DEFAULT_GUARD_PORT: u16 = 8787;
 const MAX_RECENT_PROJECTS: usize = 6;
@@ -32,6 +32,10 @@ pub struct Settings {
     pub guard_port: u16,
     /// Block flagged calls (true) or only log them.
     pub block: bool,
+    /// Ask the running model whether WARN calls serve the task, and block those that don't.
+    pub judge: bool,
+    /// Block WARN calls when the model gives no answer in time.
+    pub judge_fail_closed: bool,
     /// Write OpenCode's config whenever a model starts.
     pub configure_opencode: bool,
     /// Offer models other apps already downloaded (LM Studio, Ollama, Hugging Face cache…).
@@ -50,6 +54,8 @@ impl Default for Settings {
         Self {
             guard_port: DEFAULT_GUARD_PORT,
             block: true,
+            judge: true,
+            judge_fail_closed: false,
             configure_opencode: true,
             use_other_apps: true,
             last_model: None,
@@ -120,6 +126,25 @@ impl App {
         *self.discovery.lock().unwrap() = discovery;
     }
 
+    /// The judge's options as the settings have them, `None` when it is off.
+    pub fn judge_options(&self) -> Option<JudgeOptions> {
+        let settings = self.settings.lock().unwrap();
+        settings.judge.then(|| JudgeOptions { fail_closed: settings.judge_fail_closed, ..JudgeOptions::default() })
+    }
+
+    /// Turns the judge on or off, and whether it fails closed, for requests from now on.
+    pub fn set_judge(&self, enabled: bool, fail_closed: bool) -> anyhow::Result<()> {
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.judge = enabled;
+            settings.judge_fail_closed = fail_closed;
+        }
+        if let Some(guard) = self.guard.lock().unwrap().as_ref() {
+            guard.set_judge(self.judge_options());
+        }
+        self.save_settings()
+    }
+
     pub fn save_settings(&self) -> anyhow::Result<()> {
         let text = serde_json::to_string_pretty(&*self.settings.lock().unwrap())?;
         superviser_core::paths::write_private(&self.paths.settings(), text.as_bytes())?;
@@ -161,6 +186,7 @@ impl App {
             api_key: Some(secrets::local_api_key(&self.paths)?),
             upstream_api_key: Some(secrets::upstream_api_key(&self.paths)?),
             cors_origins: WEBVIEW_ORIGINS.iter().map(|s| s.to_string()).collect(),
+            judge: self.judge_options(),
         };
         let server = GuardServer::start(listener, config, options).await?;
         tracing::info!("guard listening on {}", server.addr);
@@ -235,6 +261,8 @@ impl App {
                 old.server.stop().await;
             }
             set_status(ServerStatus::Loading { model: model.id.clone(), name: model.model.name.clone() });
+            let prompt_cache = model.model.prompt_cache(&fit, self.hardware.ram_budget);
+            tracing::info!("{}: {}k context, {} MiB for saved conversations", model.alias, fit.context / 1024, prompt_cache >> 20);
             let config = ServerConfig {
                 binary,
                 model_path: entry,
@@ -243,6 +271,7 @@ impl App {
                 port: runtime::free_port()?,
                 api_key_file: self.paths.upstream_api_key(),
                 log_file: self.paths.logs().join("llama-server.log"),
+                prompt_cache,
             };
             let mut server = LlamaServer::start(config).await?;
             if let Err(e) = server.wait_ready(LOAD_TIMEOUT).await {

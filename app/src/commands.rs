@@ -256,6 +256,23 @@ pub fn setup_opencode(app: State<'_, Arc<App>>) -> Result<opencode::Installed> {
     app.setup_opencode().map_err(|e| format!("{e:#}"))
 }
 
+#[derive(Serialize)]
+pub struct JudgeSettings {
+    enabled: bool,
+    fail_closed: bool,
+}
+
+#[tauri::command]
+pub fn judge_settings(app: State<'_, Arc<App>>) -> JudgeSettings {
+    let settings = app.settings.lock().unwrap();
+    JudgeSettings { enabled: settings.judge, fail_closed: settings.judge_fail_closed }
+}
+
+#[tauri::command]
+pub fn set_judge(app: State<'_, Arc<App>>, enabled: bool, fail_closed: bool) -> Result<()> {
+    app.set_judge(enabled, fail_closed).map_err(err)
+}
+
 #[tauri::command]
 pub fn recent_calls(app: State<'_, Arc<App>>) -> Vec<CallEvent> {
     app.events.lock().unwrap().iter().cloned().collect()

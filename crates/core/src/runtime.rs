@@ -19,6 +19,8 @@ pub struct ServerConfig {
     pub port: u16,
     pub api_key_file: PathBuf,
     pub log_file: PathBuf,
+    /// Bytes of RAM for saved conversations; llama-server's own default is 8 GiB.
+    pub prompt_cache: u64,
 }
 
 pub struct LlamaServer {
@@ -63,6 +65,8 @@ pub fn args(config: &ServerConfig) -> Vec<String> {
         // One slot gets the whole context we sized memory for.
         "--parallel".into(),
         "1".into(),
+        "--cache-ram".into(),
+        (config.prompt_cache >> 20).to_string(),
         "--jinja".into(),
         "--no-webui".into(),
         "--api-key-file".into(),
@@ -135,10 +139,12 @@ mod tests {
             port: 1234,
             api_key_file: "/k/key".into(),
             log_file: "/l/log".into(),
+            prompt_cache: 1536 << 20,
         };
         let args = args(&config);
         assert!(args.windows(2).any(|w| w == ["--api-key-file", "/k/key"]));
         assert!(!args.iter().any(|a| a == "--api-key"));
         assert!(args.windows(2).any(|w| w == ["--host", "127.0.0.1"]));
+        assert!(args.windows(2).any(|w| w == ["--cache-ram", "1536"]));
     }
 }

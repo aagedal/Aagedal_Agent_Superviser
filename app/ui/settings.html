@@ -87,8 +87,12 @@
 
     <section id="safety" hidden>
       <h1>Safety</h1>
-      <p class="muted">The guard looks at every command and file edit the model asks for. It blocks calls that use tools the agent was never given, reach websites nobody in the conversation mentioned, try to switch the guard off or redirect your tools, or get around network isolation. Blocked calls are replaced with a note, so nothing runs. Calls that read other agents' sessions, API keys or other processes are marked WARN: they run, and show up here.</p>
+      <p class="muted">The guard looks at every command and file edit the model asks for. It blocks calls that use tools the agent was never given, reach websites nobody in the conversation mentioned, try to switch the guard off or redirect your tools, or get around network isolation. Blocked calls are replaced with a note, so nothing runs. Calls that read other agents' sessions, API keys or other processes are marked WARN and go to a second check.</p>
       <p class="muted small">Based on Hugging Face’s safeagents (<span class="selectable">github.com/huggingface/safeagents</span>). This checks what the agent tries to do; it is not a sandbox.</p>
+      <h2>Second check for WARN calls</h2>
+      <p class="muted small">The running model is asked, in a separate conversation, whether the call serves what you asked for. It sees your messages, the call and what the guard found, but not the agent's own reasoning, so the agent can't argue its case. It can block a WARN call, never let a blocked one through. The agent waits a few seconds while it answers; WARN calls are rare.</p>
+      <div class="row"><label class="check"><input type="checkbox" id="judge-enabled"> Ask the model about WARN calls (without this, they run and are only listed here)</label></div>
+      <div class="row"><label class="check"><input type="checkbox" id="judge-fail-closed"> Block the call if the model doesn't answer within a minute</label></div>
       <h2>Recent tool calls</h2>
       <div class="calls" id="calls"><p class="muted">No tool calls yet.</p></div>
     </section>

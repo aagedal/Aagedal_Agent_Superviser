@@ -20,6 +20,11 @@ pub const MIN_CONTEXT: u64 = 32_768;
 /// grouped-query sharing, which overestimates most current models.
 const FALLBACK_KV_PER_TOKEN: u64 = 192 * 1024;
 
+/// What a conversation saved to RAM takes per token beyond its KV cells (measured: 7.4 KiB).
+const SAVED_BYTES_PER_TOKEN: u64 = 8 * 1024;
+/// Room for the short conversation saved beside it, the judge's (measured: 150 MiB).
+const SAVED_EXTRA_BYTES: u64 = 256 << 20;
+
 const BUNDLED: &str = include_str!("../../../catalog/curated.json");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +101,15 @@ impl Catalog {
 impl CatalogModel {
     pub fn fit(&self, budget: u64) -> Option<Fit> {
         fit(self.quant.size + self.kv_fixed_bytes, self.kv_bytes_per_token, self.context_length, budget)
+    }
+
+    /// RAM llama-server may keep saved conversations in: enough for one at full context, so
+    /// the agent's survives the judge's question, but never more than the model leaves free
+    /// of `ram_budget`. With less, a long conversation is read again after a question.
+    pub fn prompt_cache(&self, fit: &Fit, ram_budget: u64) -> u64 {
+        let per_token = self.kv_bytes_per_token.unwrap_or(FALLBACK_KV_PER_TOKEN) + SAVED_BYTES_PER_TOKEN;
+        let conversation = per_token * fit.context + self.kv_fixed_bytes + SAVED_EXTRA_BYTES;
+        conversation.min(ram_budget.saturating_sub(fit.required))
     }
 
     /// Resolves a repo into a catalog entry: its default 4-bit quant, pinned to the current
@@ -188,12 +202,24 @@ mod tests {
     #[test]
     fn offers_leave_out_what_does_not_fit() {
         let catalog = Catalog::bundled();
-        let small = Hardware { total_memory: 16 * GIB, model_budget: 10 * GIB, unified_memory: true, os: "macos", arch: "aarch64" };
+        let small = Hardware { total_memory: 16 * GIB, model_budget: 10 * GIB, ram_budget: 12 * GIB, unified_memory: true, os: "macos", arch: "aarch64" };
         let offers = catalog.offers(&small);
         assert!(offers.iter().all(|o| o.fit.required <= small.model_budget));
         assert!(offers.len() < catalog.models.len());
         assert_eq!(offers.iter().filter(|o| o.recommended).count(), usize::from(!offers.is_empty()));
         assert!(offers.first().is_none_or(|o| o.recommended));
+    }
+
+    #[test]
+    fn prompt_cache_holds_one_conversation_and_stays_in_free_memory() {
+        let catalog = Catalog::bundled();
+        let model = catalog.models.iter().find(|m| m.repo == "unsloth/Qwen3.5-4B-GGUF").unwrap();
+        let fit = Fit { context: 32_768, required: 5 * GIB };
+        // 40 KiB per token at 32k context, plus room for the judge's.
+        assert_eq!(model.prompt_cache(&fit, 60 * GIB), (1280 + 256) << 20);
+        assert_eq!(model.prompt_cache(&fit, 5 * GIB + (500 << 20)), 500 << 20);
+        assert_eq!(model.prompt_cache(&fit, 5 * GIB), 0);
+        assert_eq!(model.prompt_cache(&fit, 4 * GIB), 0);
     }
 
     #[test]

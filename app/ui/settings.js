@@ -31,7 +31,10 @@ function showTab(name) {
     invoke("other_apps").then(renderOtherApps);
   }
   if (name === "connect") renderConnect();
-  if (name === "safety") renderCalls();
+  if (name === "safety") {
+    renderJudge();
+    renderCalls();
+  }
 }
 for (const button of document.querySelectorAll("nav button")) button.addEventListener("click", () => showTab(button.dataset.tab));
 
@@ -462,9 +465,33 @@ function callRow(call) {
       {},
       el("code", { class: "selectable" }, `${call.tool}: ${call.summary}`),
       call.reason ? el("div", { class: "reason" }, call.reason) : call.signals?.length ? el("div", { class: "reason" }, call.signals.join(", ")) : null,
+      judgeNote(call),
     ),
   );
 }
+
+// The second check's answer, unless the reason already gives it.
+function judgeNote(call) {
+  if (!call.judge) return null;
+  const [kind, ...rest] = call.judge.split(": ");
+  const why = rest.join(": ");
+  if (kind === "block") return null;
+  const text = kind === "allow" ? `Model allowed it: ${why}` : `Model gave no answer: ${why}`;
+  return el("div", { class: "reason" }, text);
+}
+
+async function renderJudge() {
+  const judge = await invoke("judge_settings");
+  $("judge-enabled").checked = judge.enabled;
+  $("judge-fail-closed").checked = judge.fail_closed;
+  $("judge-fail-closed").disabled = !judge.enabled;
+}
+async function saveJudge() {
+  await invoke("set_judge", { enabled: $("judge-enabled").checked, failClosed: $("judge-fail-closed").checked });
+  await renderJudge();
+}
+$("judge-enabled").addEventListener("change", saveJudge);
+$("judge-fail-closed").addEventListener("change", saveJudge);
 
 async function renderCalls() {
   const calls = await invoke("recent_calls");
