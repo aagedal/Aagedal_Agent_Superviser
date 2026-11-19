@@ -1,7 +1,8 @@
 //! Reviews the tool calls of one response to one request. Port of safeagents' `guard.py`.
 //!
 //! 1. Self-protection: calls against the guard itself are blocked outright.
-//! 2. Undeclared tools and hosts from nowhere are blocked outright.
+//! 2. Undeclared tools and hosts from nowhere are blocked outright, and so are tools and
+//!    programs the request's project turned off (its allowed sites count as mentioned).
 //! 3. Scanner findings (`superviser-scan`, a port of atif-scan's local-safety checks) at or
 //!    above `block_severity` are blocked too; milder ones make a call suspicious: the judge,
 //!    if there is one, decides. Without one, suspicious calls run and are logged.
@@ -16,6 +17,7 @@ use superviser_scan::{Scanner, Severity, Signal};
 use crate::journal::Journal;
 use crate::judge::Judge;
 use crate::policy::{DEFAULT_ALLOWED_HOSTS, Policy};
+use crate::project::ProjectRules;
 use crate::selfprotect::SelfProtection;
 
 pub type EventSink = Arc<dyn Fn(&CallEvent) + Send + Sync>;
@@ -113,12 +115,15 @@ pub struct CallEvent {
     pub judge: Option<String>,
     pub model: String,
     pub journal_id: Option<u64>,
+    /// The project the request came from, if it came through a project's path.
+    pub project: Option<String>,
 }
 
 pub struct Guard {
     request: Value,
     config: Arc<Config>,
     policy: Policy,
+    project: Option<Arc<ProjectRules>>,
     judge: Option<Judge>,
     pub flagged: Vec<Blocked>,
     /// This response's calls so far: the scanner judges the last in their light.
@@ -183,7 +188,15 @@ pub fn content_text(content: Option<&Value>) -> String {
 impl Guard {
     pub fn new(request: Value, config: Arc<Config>) -> Self {
         let policy = Policy::new(&request, &config.allowed_hosts);
-        Self { request, config, policy, judge: None, flagged: Vec::new(), calls: Vec::new() }
+        Self { request, config, policy, project: None, judge: None, flagged: Vec::new(), calls: Vec::new() }
+    }
+
+    /// Applies `project`'s rules: its sites are allowed, its turned-off tools and programs blocked.
+    pub fn with_project(mut self, project: Arc<ProjectRules>) -> Self {
+        let hosts: Vec<String> = self.config.allowed_hosts.iter().chain(&project.allowed_hosts).cloned().collect();
+        self.policy = Policy::new(&self.request, &hosts);
+        self.project = Some(project);
+        self
     }
 
     /// Asks `judge` about suspicious calls.
@@ -204,6 +217,9 @@ impl Guard {
             return Review::blocked(reason);
         }
         if let Some(reason) = self.policy.check(name, args) {
+            return Review::blocked(reason);
+        }
+        if let Some(reason) = self.project.as_ref().and_then(|p| p.check(name, args)) {
             return Review::blocked(reason);
         }
         let Some(scanner) = &self.config.scanner else { return Review::default() };
@@ -258,6 +274,9 @@ impl Guard {
             entry.insert("judge".into(), review.judge.clone().into());
             entry.insert("model".into(), model.clone().into());
             entry.insert("task".into(), task_text(&self.request).into());
+            if let Some(project) = &self.project {
+                entry.insert("project".into(), project.name.clone().into());
+            }
             match journal.append(entry) {
                 Ok(id) => journal_id = Some(id),
                 Err(e) => tracing::warn!("guard journal: {e}"),
@@ -280,6 +299,7 @@ impl Guard {
                 judge: review.judge.clone(),
                 model,
                 journal_id,
+                project: self.project.as_ref().map(|p| p.name.clone()),
             };
             sink(&event);
         }

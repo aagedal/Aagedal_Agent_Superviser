@@ -4,6 +4,7 @@
 //! change while running, CORS for the app's own chat window, and a decision model as the
 //! judge of suspicious calls.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
@@ -18,6 +19,7 @@ use tokio::sync::oneshot;
 
 use crate::guard::{Config, Guard};
 use crate::judge::Judge;
+use crate::project::{ProjectRules, split_path};
 use crate::rewrite::{SseRewriter, guard_response};
 
 /// Request headers not forwarded upstream; `accept-encoding` becomes `identity` so
@@ -46,6 +48,8 @@ struct AppState {
     api_key: RwLock<Option<String>>,
     upstream: RwLock<Option<String>>,
     judge: RwLock<Option<Judge>>,
+    /// Rules of the projects served at `/projects/<id>/`, by id.
+    projects: RwLock<HashMap<String, Arc<ProjectRules>>>,
     client: reqwest::Client,
 }
 
@@ -86,7 +90,7 @@ impl GuardServer {
             .map_err(std::io::Error::other)?;
         let api_key = RwLock::new(options.api_key.clone());
         let judge = RwLock::new(options.judge.clone());
-        let state = Arc::new(AppState { config: Arc::new(config), options, api_key, upstream: RwLock::new(None), judge, client });
+        let state = Arc::new(AppState { config: Arc::new(config), options, api_key, upstream: RwLock::new(None), judge, projects: RwLock::new(HashMap::new()), client });
         let shutdown = serve(listener, state.clone());
         Ok(Self { addr, state, shutdown: Some(shutdown), unix: std::sync::Mutex::new(None) })
     }
@@ -120,6 +124,12 @@ impl GuardServer {
     /// Replaces the key clients must send.
     pub fn set_api_key(&self, key: Option<String>) {
         *self.state.api_key.write().unwrap() = key;
+    }
+
+    /// Replaces the projects served at `/projects/<id>/`, by id. Requests to an id not
+    /// listed are turned away.
+    pub fn set_projects(&self, projects: HashMap<String, ProjectRules>) {
+        *self.state.projects.write().unwrap() = projects.into_iter().map(|(id, rules)| (id, Arc::new(rules))).collect();
     }
 
     /// Sets the judge (or none), for requests from now on.
@@ -187,6 +197,15 @@ async fn forward_inner(state: &Arc<AppState>, request: Request) -> Response {
     {
         return error(StatusCode::UNAUTHORIZED, "missing or wrong API key (see Agent Superviser → Settings → API)");
     }
+    // A project's requests come to `/projects/<id>/…` and go upstream without the prefix.
+    let path_and_query = parts.uri.path_and_query().map_or("/", |p| p.as_str());
+    let (project, path_and_query) = match split_path(path_and_query) {
+        Some((id, rest)) => match state.projects.read().unwrap().get(id) {
+            Some(rules) => (Some(rules.clone()), rest),
+            None => return error(StatusCode::NOT_FOUND, "unknown project; open it again from Agent Superviser"),
+        },
+        None => (None, path_and_query.to_string()),
+    };
     let Some(upstream) = state.upstream.read().unwrap().clone() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "no model is running; start one from the Agent Superviser menu");
     };
@@ -199,14 +218,16 @@ async fn forward_inner(state: &Arc<AppState>, request: Request) -> Response {
     let request_json = serde_json::from_slice::<Value>(&body).ok().filter(Value::is_object);
     let judge = state.judge.read().unwrap().clone();
     let guard = request_json.map(|r| {
-        let guard = Guard::new(r, state.config.clone());
+        let mut guard = Guard::new(r, state.config.clone());
+        if let Some(project) = &project {
+            guard = guard.with_project(project.clone());
+        }
         match judge {
             Some(judge) => guard.with_judge(judge),
             None => guard,
         }
     });
 
-    let path_and_query = parts.uri.path_and_query().map_or("/", |p| p.as_str());
     let url = format!("{upstream}{path_and_query}");
     let mut upstream_request = state.client.request(parts.method.clone(), &url).body(body);
     for (name, value) in &parts.headers {
@@ -298,9 +319,17 @@ mod tests {
     use crate::judge::JudgeOptions;
 
     async fn fake_upstream(reply: &'static str, content_type: &'static str) -> String {
-        let app = axum::Router::new().fallback(move |headers: HeaderMap| async move {
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri, headers: HeaderMap| async move {
             let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-            ([(header::CONTENT_TYPE, content_type), (axum::http::HeaderName::from_static("x-seen-auth"), Box::leak(auth.into_boxed_str()) as &str)], reply)
+            let seen = |name: &'static str| axum::http::HeaderName::from_static(name);
+            (
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (seen("x-seen-auth"), Box::leak(auth.into_boxed_str()) as &str),
+                    (seen("x-seen-path"), Box::leak(uri.path().to_string().into_boxed_str()) as &str),
+                ],
+                reply,
+            )
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -353,6 +382,27 @@ mod tests {
             .unwrap();
         assert_eq!(response["choices"][0]["finish_reason"], "stop");
         assert!(response["choices"][0]["message"]["content"].as_str().unwrap().contains("appears nowhere"));
+    }
+
+    #[tokio::test]
+    async fn applies_the_rules_of_the_project_in_the_path() {
+        let reply = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ssh build-box make\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+        let server = guard_server(Some(fake_upstream(reply, "application/json").await)).await;
+        let rules = ProjectRules { name: "site".into(), blocked_programs: vec!["ssh".into()], ..ProjectRules::default() };
+        server.set_projects(HashMap::from([("ab12".to_string(), rules)]));
+        let send = |path: &'static str| {
+            let url = format!("http://{}{path}", server.addr);
+            async move { reqwest::Client::new().post(url).bearer_auth("client-key").body(REQUEST).send().await.unwrap() }
+        };
+        let unknown = send("/projects/zz99/v1/chat/completions").await;
+        assert_eq!(unknown.status(), 404);
+        let project = send("/projects/ab12/v1/chat/completions").await;
+        assert_eq!(project.headers()["x-seen-path"], "/v1/chat/completions");
+        let text = project.text().await.unwrap();
+        assert!(text.contains("`ssh` is blocked for project site"), "{text}");
+        // Without the project's path, its rules don't apply.
+        let plain = send("/v1/chat/completions").await.text().await.unwrap();
+        assert!(plain.contains("ssh build-box make"), "{plain}");
     }
 
     #[tokio::test]

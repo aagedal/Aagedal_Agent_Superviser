@@ -11,12 +11,14 @@ pub mod guard;
 pub mod journal;
 pub mod judge;
 pub mod policy;
+pub mod project;
 pub mod proxy;
 pub mod rewrite;
 pub mod selfprotect;
 
 pub use guard::{CallEvent, Config, Guard, Review, Verdict};
 pub use judge::{Judge, JudgeOptions};
+pub use project::ProjectRules;
 pub use proxy::{GuardServer, ProxyOptions};
 
 /// `value` as JSON without whitespace, non-ASCII kept as is.
