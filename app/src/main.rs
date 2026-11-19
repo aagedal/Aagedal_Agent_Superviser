@@ -3,11 +3,14 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod acp;
+mod agent;
 mod commands;
 mod state;
 
 use std::sync::Arc;
 
+use superviser_core::sandbox::Isolation;
 use superviser_guard::{CallEvent, Verdict};
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
@@ -15,9 +18,11 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
-use crate::state::{App, ServerStatus};
+use crate::state::{App, LoadState, ServerStatus};
 
 const TRAY_ID: &str = "main";
+/// Projects listed in the menu bar menu; the rest are in Settings.
+const MAX_TRAY_PROJECTS: usize = 8;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -28,6 +33,16 @@ fn main() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(app.clone())
+        // In the Dock and Command-Tab only while one of its windows is open.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                let label = window.label().to_string();
+                let handle = window.app_handle();
+                if handle.webview_windows().keys().all(|l| *l == label) {
+                    set_in_dock(handle, false);
+                }
+            }
+        })
         .setup(move |tauri_app| {
             #[cfg(target_os = "macos")]
             tauri_app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -43,6 +58,21 @@ fn main() {
                 }
             });
             tauri::async_runtime::block_on(app.start_guard(on_event))?;
+
+            // Killed (Activity Monitor, `kill`, a logout): quit properly, stopping the model servers.
+            #[cfg(unix)]
+            {
+                let quit = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    let (Ok(mut term), Ok(mut interrupt)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else { return };
+                    tokio::select! {
+                        _ = term.recv() => {}
+                        _ = interrupt.recv() => {}
+                    }
+                    quit.exit(0);
+                });
+            }
             app.rescan();
 
             TrayIconBuilder::with_id(TRAY_ID)
@@ -54,9 +84,8 @@ fn main() {
                 .on_menu_event(on_menu_event)
                 .build(tauri_app)?;
 
-            // First run (no model ever started): open the model picker, which also shows
-            // models found from other apps.
-            if app.settings.lock().unwrap().last_model.is_none() {
+            // Until the first-run guide is finished or skipped, open it.
+            if !app.settings.lock().unwrap().setup_done {
                 open_window(&handle, "settings")?;
             }
             Ok(())
@@ -73,8 +102,9 @@ fn main() {
             commands::rescan_models,
             commands::set_use_other_apps,
             commands::delete_model,
-            commands::start_model,
-            commands::stop_model,
+            commands::load_model,
+            commands::unload_model,
+            commands::room_for,
             commands::api_info,
             commands::regenerate_api_key,
             commands::set_hf_token,
@@ -84,11 +114,33 @@ fn main() {
             commands::set_judge,
             commands::download_judge,
             commands::open_window,
-            commands::sandbox_info,
-            commands::set_sandbox_network,
+            commands::projects_info,
+            commands::choose_folder,
+            commands::new_project,
+            commands::save_project,
+            commands::delete_project,
             commands::open_project,
-            commands::project_isolation,
-            commands::set_project_isolation,
+            commands::project_file,
+            commands::editors,
+            commands::open_file,
+            commands::chat_engine,
+            commands::chat_model,
+            commands::set_chat_model,
+            commands::acp_sessions,
+            commands::acp_open,
+            commands::acp_prompt,
+            commands::acp_cancel,
+            commands::acp_permission,
+            commands::acp_delete,
+            commands::chat_list,
+            commands::chat_load,
+            commands::chat_send,
+            commands::chat_stop,
+            commands::chat_answer,
+            commands::chat_delete,
+            commands::open_chat,
+            commands::setup_done,
+            commands::set_setup_done,
             commands::get_installer,
         ]);
 
@@ -110,18 +162,17 @@ fn status_line(status: &ServerStatus) -> String {
 }
 
 fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
-    let status = app.status.lock().unwrap().clone();
-    let running_id = match &status {
-        ServerStatus::Running { model, .. } | ServerStatus::Loading { model, .. } => Some(model.clone()),
-        _ => None,
-    };
+    let status = app.status();
+    let loaded = app.models();
+    let running = loaded.iter().filter(|m| matches!(m.state, LoadState::Running { .. })).count();
     let blocked = app.events.lock().unwrap().iter().filter(|e| matches!(e.verdict, Verdict::Blocked | Verdict::Flagged)).count();
     let guard_line = match app.guard_url() {
         Some(url) => format!("Guard on at {url} · {blocked} blocked"),
         None => "Guard is not running".into(),
     };
 
-    let status_item = MenuItem::with_id(handle, "status", status_line(&status), false, None::<&str>)?;
+    let line = if running > 1 { format!("● {running} models loaded") } else { status_line(&status) };
+    let status_item = MenuItem::with_id(handle, "status", line, false, None::<&str>)?;
     let guard_item = MenuItem::with_id(handle, "guard", guard_line, false, None::<&str>)?;
 
     let installed = app.installed();
@@ -133,7 +184,8 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
                 other => format!("{} · {} ({})", m.model.name, m.model.quant.label, other.label()),
             };
             let fits = app.fit(&m.model).is_some();
-            CheckMenuItem::with_id(handle, format!("start:{}", m.id), label, fits, running_id.as_deref() == Some(&m.id), None::<&str>)
+            let on = loaded.iter().any(|l| l.id == m.id && !matches!(l.state, LoadState::Failed { .. }));
+            CheckMenuItem::with_id(handle, format!("load:{}", m.id), label, fits, on, None::<&str>)
         })
         .collect::<tauri::Result<_>>()?;
     let none = MenuItem::with_id(handle, "none", "No models yet. Open Settings to download one.", false, None::<&str>)?;
@@ -142,27 +194,36 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
     } else {
         model_items.iter().map(|i| i as &dyn IsMenuItem<tauri::Wry>).collect()
     };
-    let models = Submenu::with_id_and_items(handle, "models", "Start Model", true, &model_refs)?;
-    let stop = MenuItem::with_id(handle, "stop", "Stop Model", running_id.is_some(), None::<&str>)?;
-    let chat = MenuItem::with_id(handle, "chat", "Open Chat…", matches!(status, ServerStatus::Running { .. }), None::<&str>)?;
+    let models = Submenu::with_id_and_items(handle, "models", "Load Model", true, &model_refs)?;
+    let stop = MenuItem::with_id(handle, "stop", if running > 1 { "Unload All Models" } else { "Unload Model" }, running > 0, None::<&str>)?;
+    let chat = MenuItem::with_id(handle, "chat", "Open Chat…", true, None::<&str>)?;
     let opencode = MenuItem::with_id(handle, "opencode", "Set Up OpenCode", matches!(status, ServerStatus::Running { .. }), None::<&str>)?;
     let running = matches!(status, ServerStatus::Running { .. });
-    let recent = app.settings.lock().unwrap().recent_projects.clone();
-    let project_items: Vec<MenuItem<tauri::Wry>> = recent
+    let projects = app.settings.lock().unwrap().projects.clone();
+    // The built-in agent for projects in the macOS sandbox; OpenCode for the Linux VM.
+    let chat_items: Vec<MenuItem<tauri::Wry>> = projects
         .iter()
-        .map(|path| {
-            let name = std::path::Path::new(path).file_name().map_or(path.clone(), |n| n.to_string_lossy().into_owned());
-            MenuItem::with_id(handle, format!("project:{path}"), name, running, None::<&str>)
+        .take(MAX_TRAY_PROJECTS)
+        .map(|p| match p.isolation {
+            Isolation::MacosSandbox => MenuItem::with_id(handle, format!("chat:{}", p.id), &p.name, true, None::<&str>),
+            Isolation::LinuxVm => MenuItem::with_id(handle, format!("project:{}", p.id), format!("{} (OpenCode, Linux VM)", p.name), running, None::<&str>),
         })
         .collect::<tauri::Result<_>>()?;
-    let choose = MenuItem::with_id(handle, "choose-project", "Choose Folder…", running, Some("CmdOrCtrl+O"))?;
+    let opencode_items: Vec<MenuItem<tauri::Wry>> = projects
+        .iter()
+        .take(MAX_TRAY_PROJECTS)
+        .map(|p| MenuItem::with_id(handle, format!("project:{}", p.id), &p.name, running, None::<&str>))
+        .collect::<tauri::Result<_>>()?;
+    let choose = MenuItem::with_id(handle, "choose-project", "New Project from Folder…", true, Some("CmdOrCtrl+O"))?;
     let separator = PredefinedMenuItem::separator(handle)?;
-    let mut project_refs: Vec<&dyn IsMenuItem<tauri::Wry>> = project_items.iter().map(|i| i as &dyn IsMenuItem<tauri::Wry>).collect();
-    if !project_refs.is_empty() {
-        project_refs.push(&separator);
+    let mut chat_refs: Vec<&dyn IsMenuItem<tauri::Wry>> = chat_items.iter().map(|i| i as &dyn IsMenuItem<tauri::Wry>).collect();
+    if !chat_refs.is_empty() {
+        chat_refs.push(&separator);
     }
-    project_refs.push(&choose);
-    let code = Submenu::with_id_and_items(handle, "code", "Code in OpenCode (sandboxed)", cfg!(target_os = "macos"), &project_refs)?;
+    chat_refs.push(&choose);
+    let code = Submenu::with_id_and_items(handle, "code", "Code in a Project", cfg!(target_os = "macos"), &chat_refs)?;
+    let opencode_refs: Vec<&dyn IsMenuItem<tauri::Wry>> = opencode_items.iter().map(|i| i as &dyn IsMenuItem<tauri::Wry>).collect();
+    let in_opencode = Submenu::with_id_and_items(handle, "in-opencode", "Open in OpenCode", cfg!(target_os = "macos") && !opencode_refs.is_empty(), &opencode_refs)?;
     let settings = MenuItem::with_id(handle, "settings", "Settings…", true, Some("CmdOrCtrl+,"))?;
     let quit = MenuItem::with_id(handle, "quit", "Quit Agent Superviser", true, Some("CmdOrCtrl+Q"))?;
     Menu::with_items(
@@ -176,6 +237,7 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
             &PredefinedMenuItem::separator(handle)?,
             &code,
             &chat,
+            &in_opencode,
             &opencode,
             &settings,
             &PredefinedMenuItem::separator(handle)?,
@@ -199,19 +261,14 @@ pub fn refresh_tray(handle: &AppHandle) {
 
 /// Tells windows and the tray that the server status changed.
 pub fn status_changed(handle: &AppHandle) {
-    let status = handle.state::<Arc<App>>().status.lock().unwrap().clone();
+    let status = handle.state::<Arc<App>>().status();
     let _ = handle.emit("status", &status);
     refresh_tray(handle);
 }
 
-pub async fn start_model(handle: AppHandle, app: Arc<App>, id: String) -> Result<(), String> {
+pub async fn load_model(handle: AppHandle, app: Arc<App>, id: String) -> Result<(), String> {
     let status_handle = handle.clone();
-    let result = app
-        .start_model(&id, |status| {
-            let _ = status_handle.emit("status", status);
-            refresh_tray(&status_handle);
-        })
-        .await;
+    let result = app.load_model(&id, || status_changed(&status_handle)).await;
     status_changed(&handle);
     result.map_err(|e| format!("{e:#}"))
 }
@@ -222,7 +279,12 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
     let handle = handle.clone();
     match id.as_str() {
         "quit" => handle.exit(0),
-        "settings" | "chat" => {
+        "chat" => {
+            if let Err(e) = open_chat(&handle, None) {
+                tracing::warn!("opening chat: {e}");
+            }
+        }
+        "settings" => {
             if let Err(e) = open_window(&handle, &id) {
                 tracing::warn!("opening {id}: {e}");
             }
@@ -230,7 +292,7 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
         "choose-project" => choose_project(&handle),
         "stop" => {
             tauri::async_runtime::spawn(async move {
-                app.stop_model().await;
+                app.unload_model(None).await;
                 status_changed(&handle);
             });
         }
@@ -241,13 +303,22 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
             }
         }
         _ => {
-            if let Some(project) = id.strip_prefix("project:") {
-                open_project(&handle, project.into());
-            } else if let Some(model) = id.strip_prefix("start:") {
+            if let Some(project) = id.strip_prefix("chat:") {
+                if let Err(e) = open_chat(&handle, Some(project)) {
+                    tracing::warn!("opening chat: {e}");
+                }
+            } else if let Some(project) = id.strip_prefix("project:") {
+                open_project(&handle, project);
+            } else if let Some(model) = id.strip_prefix("load:") {
+                // A loaded model's item unloads it.
                 let model = model.to_string();
+                let loaded = app.models().iter().any(|m| m.id == model && !matches!(m.state, LoadState::Failed { .. }));
                 tauri::async_runtime::spawn(async move {
-                    if let Err(e) = start_model(handle, app, model).await {
-                        tracing::warn!("starting model: {e}");
+                    if loaded {
+                        app.unload_model(Some(&model)).await;
+                        status_changed(&handle);
+                    } else if let Err(e) = load_model(handle.clone(), app, model).await {
+                        show_error(&handle, "Couldn't load the model", &e);
                     }
                 });
             }
@@ -264,7 +335,7 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
     std::process::Command::new(opener).arg(url).status().map(|_| ())
 }
 
-/// Asks for a project folder, then opens it in sandboxed OpenCode.
+/// Asks for a folder, then opens its project (made if needed) in the chat window.
 pub fn choose_project(handle: &AppHandle) {
     let handle_for_pick = handle.clone();
     let mut dialog = handle.dialog().file().set_title("Choose a project folder for OpenCode");
@@ -273,28 +344,34 @@ pub fn choose_project(handle: &AppHandle) {
     }
     dialog.pick_folder(move |folder| {
         if let Some(path) = folder.and_then(|f| f.into_path().ok()) {
-            open_project(&handle_for_pick, path);
+            let app = handle_for_pick.state::<Arc<App>>().inner().clone();
+            match app.project_for_folder(&path) {
+                Ok(project) => {
+                    refresh_tray(&handle_for_pick);
+                    if let Err(e) = open_chat(&handle_for_pick, Some(&project.id)) {
+                        tracing::warn!("opening chat: {e}");
+                    }
+                }
+                Err(e) => show_error(&handle_for_pick, "Couldn't make a project", &format!("{e:#}")),
+            }
         }
     });
 }
 
-/// Opens `project` in sandboxed OpenCode, saying why if it can't.
-pub fn open_project(handle: &AppHandle, project: std::path::PathBuf) {
+/// Opens a project in sandboxed OpenCode, saying why if it can't.
+pub fn open_project(handle: &AppHandle, id: &str) {
     let app = handle.state::<Arc<App>>().inner().clone();
-    match app.open_project(&project) {
+    match app.open_project(id) {
         Ok(_) => {
             let _ = handle.emit("projects", ());
             refresh_tray(handle);
         }
-        Err(e) => {
-            handle
-                .dialog()
-                .message(format!("{e:#}"))
-                .title("Couldn't open the project")
-                .kind(MessageDialogKind::Error)
-                .show(|_| {});
-        }
+        Err(e) => show_error(handle, "Couldn't open the project", &format!("{e:#}")),
     }
+}
+
+fn show_error(handle: &AppHandle, title: &str, message: &str) {
+    handle.dialog().message(message).title(title).kind(MessageDialogKind::Error).show(|_| {});
 }
 
 /// Shows the `settings` or `chat` window, creating it if needed.
@@ -302,17 +379,38 @@ pub fn open_window(handle: &AppHandle, name: &str) -> tauri::Result<()> {
     open_window_at(handle, name, "")
 }
 
-/// Like [`open_window`], on a tab of the settings window.
+/// Shows the chat window, on `project` when given (else on the most recent project).
+pub fn open_chat(handle: &AppHandle, project: Option<&str>) -> tauri::Result<()> {
+    open_window_at(handle, "chat", project.unwrap_or(""))
+}
+
+/// Shows the app in the Dock and Command-Tab (while it has a window open), or hides it to
+/// the menu bar.
+fn set_in_dock(handle: &AppHandle, shown: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        let policy = if shown { tauri::ActivationPolicy::Regular } else { tauri::ActivationPolicy::Accessory };
+        if let Err(e) = handle.set_activation_policy(policy) {
+            tracing::warn!("activation policy: {e}");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (handle, shown);
+}
+
+/// Like [`open_window`], on a tab of the settings window or a project in the chat window.
 pub fn open_window_at(handle: &AppHandle, name: &str, tab: &str) -> tauri::Result<()> {
+    set_in_dock(handle, true);
     if let Some(window) = handle.get_webview_window(name) {
         if !tab.is_empty() {
-            window.eval(format!("showTab({tab:?})"))?;
+            let call = if name == "chat" { "openProject" } else { "showTab" };
+            window.eval(format!("{call}({tab:?})"))?;
         }
         window.show()?;
         return window.set_focus();
     }
     let (title, size) = match name {
-        "chat" => ("Chat", (720.0, 640.0)),
+        "chat" => ("Agent Superviser Chat", (1000.0, 720.0)),
         _ => ("Agent Superviser", (880.0, 640.0)),
     };
     let page = if tab.is_empty() { format!("{name}.html") } else { format!("{name}.html#{tab}") };

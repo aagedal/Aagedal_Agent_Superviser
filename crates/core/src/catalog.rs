@@ -53,6 +53,12 @@ pub struct CatalogModel {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// How well it does agentic coding, 1 to 10: our judgment, set in `sources.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<u8>,
+    /// Billions of parameters read per token. Generating is memory-bound, so this sets speed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_params: Option<f32>,
     pub arch: String,
     pub context_length: Option<u64>,
     pub kv_bytes_per_token: Option<u64>,
@@ -77,7 +83,38 @@ pub struct Offer {
     pub fit: Fit,
     /// The model we'd suggest first: the largest one that fits with the full context.
     pub recommended: bool,
+    /// Few enough active parameters to answer quickly; see [`CatalogModel::fast`].
+    pub fast: bool,
 }
+
+/// What a model in the short list is for.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// The most capable model that fits.
+    MostCapable,
+    /// The most capable fast one, when the most capable is slow.
+    Fast,
+    /// The most capable one that leaves most of the memory to other apps.
+    Light,
+    /// The smallest, for basic tasks.
+    Basic,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Pick {
+    pub role: Role,
+    #[serde(flatten)]
+    pub offer: Offer,
+}
+
+/// Models using at most this share of total memory count as leaving most of it to other apps.
+const LIGHT_SHARE: u64 = 3;
+/// ...and never more than this, so a lighter pick stays a 12-20B model on big machines too
+/// (gpt-oss 20B needs 13.2 GiB at 64k context).
+const LIGHT_MAX: u64 = 16 << 30;
+/// Models reading at most this many billion parameters per token count as fast.
+const FAST_ACTIVE_PARAMS: f32 = 12.0;
 
 impl Catalog {
     pub fn bundled() -> Self {
@@ -92,7 +129,7 @@ impl Catalog {
             .iter()
             .filter_map(|model| {
                 let fit = model.fit(hardware.model_budget)?;
-                Some(Offer { model: model.clone(), fit, recommended: false })
+                Some(Offer { model: model.clone(), fit, recommended: false, fast: model.fast() })
             })
             .collect();
         offers.sort_by_key(|offer| std::cmp::Reverse(offer.model.quant.size));
@@ -107,9 +144,49 @@ impl Catalog {
         }
         offers
     }
+
+    /// Up to four of `offers` for people who'd rather not compare models, in the order of
+    /// [`Role`]. Each model appears once, and a role with nothing distinct to offer is left
+    /// out, so small machines get fewer choices.
+    pub fn picks(offers: &[Offer], total_memory: u64) -> Vec<Pick> {
+        // Most capable first; on a tie, the faster, then the smaller one.
+        let best = |candidates: &mut dyn Iterator<Item = &Offer>| {
+            candidates
+                .max_by(|a, b| {
+                    let rank = |o: &Offer| (o.model.capability.unwrap_or(0), o.fast, std::cmp::Reverse(o.fit.required));
+                    rank(a).cmp(&rank(b))
+                })
+                .cloned()
+        };
+        let mut picks: Vec<Pick> = Vec::new();
+        let unpicked = |picks: &[Pick], o: &Offer| picks.iter().all(|p| p.offer.model.repo != o.model.repo);
+
+        let Some(top) = best(&mut offers.iter()) else { return picks };
+        let top_fast = top.fast;
+        let top_required = top.fit.required;
+        picks.push(Pick { role: Role::MostCapable, offer: top });
+        if !top_fast
+            && let Some(offer) = best(&mut offers.iter().filter(|o| o.fast && unpicked(&picks, o)))
+        {
+            picks.push(Pick { role: Role::Fast, offer });
+        }
+        let light = |o: &&Offer| o.fit.required <= (total_memory / LIGHT_SHARE).min(LIGHT_MAX) && o.fit.required < top_required;
+        if let Some(offer) = best(&mut offers.iter().filter(light).filter(|o| unpicked(&picks, o))) {
+            picks.push(Pick { role: Role::Light, offer });
+        }
+        let smallest_picked = picks.iter().map(|p| p.offer.fit.required).min().unwrap_or(u64::MAX);
+        if let Some(offer) = offers.iter().filter(|o| unpicked(&picks, o) && o.fit.required < smallest_picked).min_by_key(|o| o.fit.required) {
+            picks.push(Pick { role: Role::Basic, offer: offer.clone() });
+        }
+        picks
+    }
 }
 
 impl CatalogModel {
+    pub fn fast(&self) -> bool {
+        self.active_params.is_some_and(|b| b <= FAST_ACTIVE_PARAMS)
+    }
+
     pub fn fit(&self, budget: u64) -> Option<Fit> {
         fit(self.quant.size + self.kv_fixed_bytes, self.kv_bytes_per_token, self.context_length, budget)
     }
@@ -151,6 +228,8 @@ impl CatalogModel {
             revision: info.sha,
             name: name.map(str::to_string).unwrap_or_else(|| display_name(repo)),
             description: description.to_string(),
+            capability: None,
+            active_params: None,
             arch,
             context_length,
             kv_bytes_per_token: kv.map(|kv| kv.per_token),
@@ -186,6 +265,7 @@ pub fn display_name(repo: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hardware;
 
     const GIB: u64 = 1 << 30;
 
@@ -224,6 +304,30 @@ mod tests {
         assert!(offers.len() < catalog.models.len());
         assert_eq!(offers.iter().filter(|o| o.recommended).count(), usize::from(!offers.is_empty()));
         assert!(offers.first().is_none_or(|o| o.recommended));
+    }
+
+    #[test]
+    fn picks_span_capability_speed_and_memory() {
+        let catalog = Catalog::bundled();
+        let names = |total: u64| {
+            let hardware = Hardware { total_memory: total, model_budget: hardware::model_budget(total, true, None), ram_budget: hardware::ram_budget(total, true), unified_memory: true, os: "macos", arch: "aarch64" };
+            Catalog::picks(&catalog.offers(&hardware), total).into_iter().map(|p| (p.role, p.offer.model.name)).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(64 * GIB),
+            [(Role::MostCapable, "Qwen3.8 27B".into()), (Role::Fast, "Qwen3.6 35B-A3B".into()), (Role::Light, "Gemma 4 12B".into()), (Role::Basic, "Qwen3.5 4B".into())]
+        );
+        // Few models fit, and the most capable is already fast.
+        assert_eq!(names(16 * GIB), [(Role::MostCapable, "Gemma 4 12B".into()), (Role::Light, "Qwen3.5 4B".into())]);
+        assert!(names(4 * GIB).is_empty());
+    }
+
+    #[test]
+    fn every_curated_model_is_rated() {
+        for model in &Catalog::bundled().models {
+            assert!(model.capability.is_some_and(|c| (1..=10).contains(&c)), "{} has no capability", model.repo);
+            assert!(model.active_params.is_some(), "{} has no active_params", model.repo);
+        }
     }
 
     #[test]

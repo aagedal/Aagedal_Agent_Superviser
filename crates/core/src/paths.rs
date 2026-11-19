@@ -56,9 +56,31 @@ impl Paths {
         std::env::temp_dir().join(format!("agent-superviser-{user}.sock"))
     }
 
+    /// Process ids of the model servers running, so a later run can stop them if this one dies.
+    pub fn run(&self) -> PathBuf {
+        self.data.join("run")
+    }
+
+    /// Which model each chat uses.
+    pub fn chat_models(&self) -> PathBuf {
+        self.data.join("chat-models.json")
+    }
+
     pub fn settings(&self) -> PathBuf {
         self.data.join("settings.json")
     }
+}
+
+/// A program bundled with the app (Tauri puts them beside its executable, in the `.app`'s
+/// `Contents/MacOS` and in `target/<profile>` when developing).
+pub fn bundled(name: &str) -> Option<PathBuf> {
+    let program = bundled_dir()?.join(name);
+    program.is_file().then_some(program)
+}
+
+/// The folder the app's executable and its bundled programs are in.
+pub fn bundled_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok()?.parent().map(Path::to_path_buf)
 }
 
 /// Creates `dir` (and parents) readable by the owner only.

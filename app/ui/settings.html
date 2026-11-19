@@ -9,57 +9,99 @@
 <body>
   <nav>
     <button data-tab="models" class="active">Models</button>
-    <button data-tab="installed">Installed</button>
-    <button data-tab="connect">Connect</button>
+    <button data-tab="projects">Projects</button>
     <button data-tab="safety">Safety</button>
+    <button data-tab="connect">Connect</button>
+    <button data-tab="guide" class="nav-guide">Setup guide</button>
   </nav>
   <main>
-    <section id="models">
-      <h1>Pick a model</h1>
-      <p class="muted" id="machine"></p>
-      <div id="offers"></div>
-      <p class="muted small" id="hidden-note"></p>
-
-      <h2>Search Hugging Face</h2>
-      <p class="muted small">Any GGUF model. We download the 4-bit (Q4_K_M or closest) version and only if it fits this machine.</p>
-      <form class="row" id="search-form">
-        <input type="search" id="search" placeholder="e.g. unsloth coder" autocomplete="off">
-        <button type="submit">Search</button>
-      </form>
-      <div id="results"></div>
+    <section id="guide" hidden>
+      <div class="guide-head">
+        <h1>Get started</h1>
+        <button class="link" id="guide-skip">Skip the guide</button>
+      </div>
+      <ol class="steps" id="guide-steps"></ol>
+      <div id="guide-body"></div>
+      <div class="row guide-nav">
+        <button id="guide-back">Back</button>
+        <span class="spacer"></span>
+        <button class="primary" id="guide-next">Next</button>
+      </div>
     </section>
 
-    <section id="installed" hidden>
-      <h1>Installed models</h1>
-      <div id="status-banner" class="banner"></div>
-      <div id="installed-list"></div>
-
-      <h2>Models from other apps</h2>
-      <p class="muted small">Models you already downloaded with LM Studio, Ollama, llama.cpp, Unsloth Studio or other Hugging Face tools are used where they are: nothing is copied, and they are never deleted from here. The same rules apply as for downloads: 4-bit or better, and only if it fits this machine.</p>
-      <div class="row">
-        <label class="check"><input type="checkbox" id="use-other-apps"> Use models from other apps</label>
-        <button id="rescan">Look again</button>
+    <section id="models">
+      <div id="status-banner" class="banner" hidden></div>
+      <div class="segmented" id="model-filter">
+        <button data-filter="suggested" class="active">Suggested</button>
+        <button data-filter="local">On this Mac</button>
       </div>
-      <p class="small muted" id="other-apps-summary"></p>
-      <details id="other-apps-details" hidden>
-        <summary class="small muted">Details</summary>
-        <div id="other-apps-list" class="calls"></div>
-      </details>
+
+      <div id="models-suggested">
+        <h1>Pick a model</h1>
+        <p class="muted" id="machine"></p>
+        <div id="picks"></div>
+
+        <details id="more-models">
+          <summary>All models and search</summary>
+          <p class="muted small" id="budget"></p>
+          <div id="offers"></div>
+          <p class="muted small" id="hidden-note"></p>
+
+          <h2>Search Hugging Face</h2>
+          <p class="muted small">Any GGUF model. We download the 4-bit (Q4_K_M or closest) version and only if it fits this machine.</p>
+          <form class="row" id="search-form">
+            <input type="search" id="search" placeholder="e.g. unsloth coder" autocomplete="off">
+            <button type="submit">Search</button>
+          </form>
+          <div id="results"></div>
+        </details>
+      </div>
+
+      <div id="models-local" hidden>
+        <h1>On this Mac</h1>
+        <div id="installed-list"></div>
+
+        <h2>Models from other apps</h2>
+        <p class="muted small">Models you already downloaded with LM Studio, Ollama, llama.cpp, Unsloth Studio or other Hugging Face tools are used where they are: nothing is copied, and they are never deleted from here. The same rules apply as for downloads: 4-bit or better, and only if it fits this machine.</p>
+        <div class="row">
+          <label class="check"><input type="checkbox" id="use-other-apps"> Use models from other apps</label>
+          <button id="rescan">Look again</button>
+        </div>
+        <p class="small muted" id="other-apps-summary"></p>
+        <details id="other-apps-details" hidden>
+          <summary class="small muted">Details</summary>
+          <div id="other-apps-list" class="calls"></div>
+        </details>
+      </div>
+    </section>
+
+    <section id="projects" hidden>
+      <h1>Projects</h1>
+      <p class="muted">A project is what you code on: a main folder, any related folders, and what the agent may do there. Chat with the built-in agent about it, or open it in OpenCode. Either way the agent is isolated from the rest of your Mac: in the macOS sandbox (works with Xcode, Swift and Homebrew), or, in OpenCode, optionally in a Linux VM that sees only the project's folders. The agent can't read your SSH keys, cloud and git credentials, keychains, browser data, shell history or other agents' sessions.</p>
+      <div id="sandbox-unavailable" class="banner" hidden>Projects open isolated on macOS only, so far.</div>
+      <div id="sandbox-installable"></div>
+      <div class="row"><button class="primary" id="new-project">New project…</button><span class="small muted" id="projects-note"></span></div>
+      <div id="project-list"></div>
+    </section>
+
+    <section id="safety" hidden>
+      <h1>Safety</h1>
+      <p class="muted">The guard looks at every command and file edit the model asks for. It blocks calls that use tools the agent was never given, reach websites nobody in the conversation mentioned, try to switch the guard off or redirect your tools, or get around network isolation. Blocked calls are replaced with a note, so nothing runs. Calls that read other agents' sessions, API keys or other processes are marked WARN and go to a second check. Each project can add sites, turn tools off and block programs (see Projects).</p>
+      <p class="muted small">Based on Hugging Face’s safeagents (<span class="selectable">github.com/huggingface/safeagents</span>). This checks what the agent tries to do; it is not a sandbox.</p>
+      <h2>Second check for WARN calls</h2>
+      <p class="muted small">A small decision model runs beside your model and scores whether each WARN call serves what you asked for. It sees your messages, the call and what the guard found, but not the agent's own reasoning, so the agent can't argue its case. It can block a WARN call, never let a blocked one through, and answers in under a second. Without it, WARN calls run and are only listed here.</p>
+      <p class="muted small" id="judge-about"></p>
+      <div class="row"><label class="check"><input type="checkbox" id="judge-enabled"> Check WARN calls with <span id="judge-name">the judge</span></label></div>
+      <div class="row" id="judge-download"></div>
+      <p class="small" id="judge-status"></p>
+      <div class="row"><label class="check"><input type="checkbox" id="judge-fail-closed"> Block the call if the judge doesn't answer within 30 seconds</label></div>
+      <h2>Recent tool calls</h2>
+      <div class="calls" id="calls"><p class="muted">No tool calls yet.</p></div>
     </section>
 
     <section id="connect" hidden>
       <h1>Connect a coding tool</h1>
-      <p class="muted">Tools talk to the guard, which checks every tool call before it runs and forwards the rest to your local model.</p>
-
-      <h2>Code in OpenCode (sandboxed)</h2>
-      <p class="muted small">Opens OpenCode for a project folder in a new Terminal window, isolated from the rest of your Mac. By default that's the macOS sandbox, which covers every command it runs and works with the Mac's own tools (Xcode, Swift, Homebrew); or, per project, a Linux VM that sees only the project folder (Apple's container tool; not for projects that need macOS tools). The first Linux VM start builds its environment once, which takes a few minutes. It can change files only in that folder (plus temporary files and build caches), and can't read your SSH keys, cloud and git credentials, keychains, browser data, shell history or other agents' sessions. API keys in your shell environment stay out too.</p>
-      <div id="sandbox-unavailable" class="banner" hidden>The sandbox is available on macOS only, so far.</div>
-      <div id="sandbox-installable"></div>
-      <div class="row">
-        <button class="primary" id="choose-project">Choose project folder…</button>
-        <label class="check"><input type="checkbox" id="sandbox-internet"> Allow internet (package installs, git push); the guard still checks every call</label>
-      </div>
-      <div id="recent-projects"></div>
+      <p class="muted">The built-in chat needs nothing set up. Other tools talk to the guard, which checks every tool call before it runs and forwards the rest to your local model. Opening a project in OpenCode from Projects or the menu bar sets OpenCode up for you.</p>
 
       <h2>OpenCode</h2>
       <p class="muted small" id="opencode-version"></p>
@@ -67,7 +109,7 @@
         <button class="primary" id="setup-opencode">Set up OpenCode</button>
         <span class="small muted" id="opencode-result"></span>
       </div>
-      <p class="muted small">Adds a “superviser” provider to your global OpenCode config and makes the running model the default. Your other settings and comments are kept, and a backup is saved next to the file. This also happens automatically when you start a model.</p>
+      <p class="muted small">Adds a “superviser” provider to your global OpenCode config and adds the loaded models, the most recently used as the default. Your other settings and comments are kept, and a backup is saved next to the file. This also happens automatically when you load a model.</p>
 
       <h2>Other tools (OpenAI-compatible)</h2>
       <div class="row"><span class="muted" style="width:70px">Base URL</span><input type="text" id="base-url" readonly><button data-copy="base-url">Copy</button></div>
@@ -83,21 +125,6 @@
         <button type="button" id="hf-clear">Remove</button>
       </form>
       <p class="small muted" id="hf-status"></p>
-    </section>
-
-    <section id="safety" hidden>
-      <h1>Safety</h1>
-      <p class="muted">The guard looks at every command and file edit the model asks for. It blocks calls that use tools the agent was never given, reach websites nobody in the conversation mentioned, try to switch the guard off or redirect your tools, or get around network isolation. Blocked calls are replaced with a note, so nothing runs. Calls that read other agents' sessions, API keys or other processes are marked WARN and go to a second check.</p>
-      <p class="muted small">Based on Hugging Face’s safeagents (<span class="selectable">github.com/huggingface/safeagents</span>). This checks what the agent tries to do; it is not a sandbox.</p>
-      <h2>Second check for WARN calls</h2>
-      <p class="muted small">A small decision model runs beside your model and scores whether each WARN call serves what you asked for. It sees your messages, the call and what the guard found, but not the agent's own reasoning, so the agent can't argue its case. It can block a WARN call, never let a blocked one through, and answers in under a second. Without it, WARN calls run and are only listed here.</p>
-      <p class="muted small" id="judge-about"></p>
-      <div class="row"><label class="check"><input type="checkbox" id="judge-enabled"> Check WARN calls with <span id="judge-name">the judge</span></label></div>
-      <div class="row" id="judge-download"></div>
-      <p class="small" id="judge-status"></p>
-      <div class="row"><label class="check"><input type="checkbox" id="judge-fail-closed"> Block the call if the judge doesn't answer within 30 seconds</label></div>
-      <h2>Recent tool calls</h2>
-      <div class="calls" id="calls"><p class="muted">No tool calls yet.</p></div>
     </section>
   </main>
   <script src="settings.js"></script>
