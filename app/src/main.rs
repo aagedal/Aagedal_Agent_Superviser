@@ -18,7 +18,7 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
-use crate::state::{App, ServerStatus};
+use crate::state::{App, LoadState, ServerStatus};
 
 const TRAY_ID: &str = "main";
 /// Projects listed in the menu bar menu; the rest are in Settings.
@@ -58,7 +58,7 @@ fn main() {
                 }
             });
             tauri::async_runtime::block_on(app.start_guard(on_event))?;
-            app.rescan();
+
 
             TrayIconBuilder::with_id(TRAY_ID)
                 .icon(Image::from_bytes(include_bytes!("../icons/tray.png"))?)
@@ -87,8 +87,9 @@ fn main() {
             commands::rescan_models,
             commands::set_use_other_apps,
             commands::delete_model,
-            commands::start_model,
-            commands::stop_model,
+            commands::load_model,
+            commands::unload_model,
+            commands::room_for,
             commands::api_info,
             commands::regenerate_api_key,
             commands::set_hf_token,
@@ -108,6 +109,8 @@ fn main() {
             commands::editors,
             commands::open_file,
             commands::chat_engine,
+            commands::chat_model,
+            commands::set_chat_model,
             commands::acp_sessions,
             commands::acp_open,
             commands::acp_prompt,
@@ -144,18 +147,17 @@ fn status_line(status: &ServerStatus) -> String {
 }
 
 fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
-    let status = app.status.lock().unwrap().clone();
-    let running_id = match &status {
-        ServerStatus::Running { model, .. } | ServerStatus::Loading { model, .. } => Some(model.clone()),
-        _ => None,
-    };
+    let status = app.status();
+    let loaded = app.models();
+    let running = loaded.iter().filter(|m| matches!(m.state, LoadState::Running { .. })).count();
     let blocked = app.events.lock().unwrap().iter().filter(|e| matches!(e.verdict, Verdict::Blocked | Verdict::Flagged)).count();
     let guard_line = match app.guard_url() {
         Some(url) => format!("Guard on at {url} · {blocked} blocked"),
         None => "Guard is not running".into(),
     };
 
-    let status_item = MenuItem::with_id(handle, "status", status_line(&status), false, None::<&str>)?;
+    let line = if running > 1 { format!("● {running} models loaded") } else { status_line(&status) };
+    let status_item = MenuItem::with_id(handle, "status", line, false, None::<&str>)?;
     let guard_item = MenuItem::with_id(handle, "guard", guard_line, false, None::<&str>)?;
 
     let installed = app.installed();
@@ -167,7 +169,8 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
                 other => format!("{} · {} ({})", m.model.name, m.model.quant.label, other.label()),
             };
             let fits = app.fit(&m.model).is_some();
-            CheckMenuItem::with_id(handle, format!("start:{}", m.id), label, fits, running_id.as_deref() == Some(&m.id), None::<&str>)
+            let on = loaded.iter().any(|l| l.id == m.id && !matches!(l.state, LoadState::Failed { .. }));
+            CheckMenuItem::with_id(handle, format!("load:{}", m.id), label, fits, on, None::<&str>)
         })
         .collect::<tauri::Result<_>>()?;
     let none = MenuItem::with_id(handle, "none", "No models yet. Open Settings to download one.", false, None::<&str>)?;
@@ -176,8 +179,8 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
     } else {
         model_items.iter().map(|i| i as &dyn IsMenuItem<tauri::Wry>).collect()
     };
-    let models = Submenu::with_id_and_items(handle, "models", "Start Model", true, &model_refs)?;
-    let stop = MenuItem::with_id(handle, "stop", "Stop Model", running_id.is_some(), None::<&str>)?;
+    let models = Submenu::with_id_and_items(handle, "models", "Load Model", true, &model_refs)?;
+    let stop = MenuItem::with_id(handle, "stop", if running > 1 { "Unload All Models" } else { "Unload Model" }, running > 0, None::<&str>)?;
     let chat = MenuItem::with_id(handle, "chat", "Open Chat…", true, None::<&str>)?;
     let opencode = MenuItem::with_id(handle, "opencode", "Set Up OpenCode", matches!(status, ServerStatus::Running { .. }), None::<&str>)?;
     let running = matches!(status, ServerStatus::Running { .. });
@@ -243,19 +246,14 @@ pub fn refresh_tray(handle: &AppHandle) {
 
 /// Tells windows and the tray that the server status changed.
 pub fn status_changed(handle: &AppHandle) {
-    let status = handle.state::<Arc<App>>().status.lock().unwrap().clone();
+    let status = handle.state::<Arc<App>>().status();
     let _ = handle.emit("status", &status);
     refresh_tray(handle);
 }
 
-pub async fn start_model(handle: AppHandle, app: Arc<App>, id: String) -> Result<(), String> {
+pub async fn load_model(handle: AppHandle, app: Arc<App>, id: String) -> Result<(), String> {
     let status_handle = handle.clone();
-    let result = app
-        .start_model(&id, |status| {
-            let _ = status_handle.emit("status", status);
-            refresh_tray(&status_handle);
-        })
-        .await;
+    let result = app.load_model(&id, || status_changed(&status_handle)).await;
     status_changed(&handle);
     result.map_err(|e| format!("{e:#}"))
 }
@@ -279,7 +277,7 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
         "choose-project" => choose_project(&handle),
         "stop" => {
             tauri::async_runtime::spawn(async move {
-                app.stop_model().await;
+                app.unload_model(None).await;
                 status_changed(&handle);
             });
         }
@@ -296,11 +294,16 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
                 }
             } else if let Some(project) = id.strip_prefix("project:") {
                 open_project(&handle, project);
-            } else if let Some(model) = id.strip_prefix("start:") {
+            } else if let Some(model) = id.strip_prefix("load:") {
+                // A loaded model's item unloads it.
                 let model = model.to_string();
+                let loaded = app.models().iter().any(|m| m.id == model && !matches!(m.state, LoadState::Failed { .. }));
                 tauri::async_runtime::spawn(async move {
-                    if let Err(e) = start_model(handle, app, model).await {
-                        tracing::warn!("starting model: {e}");
+                    if loaded {
+                        app.unload_model(Some(&model)).await;
+                        status_changed(&handle);
+                    } else if let Err(e) = load_model(handle.clone(), app, model).await {
+                        show_error(&handle, "Couldn't load the model", &e);
                     }
                 });
             }

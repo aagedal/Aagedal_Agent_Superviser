@@ -100,6 +100,37 @@ pub enum ServerStatus {
     Failed { model: String, error: String },
 }
 
+/// A model loaded (or loading, or failed to load), for Settings, the chat and the menu.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadedModel {
+    pub id: String,
+    pub name: String,
+    pub alias: String,
+    #[serde(flatten)]
+    pub state: LoadState,
+    /// Of the memory a model may take (weights, context, buffers).
+    pub memory: u64,
+    /// Of system memory, with the conversations it keeps.
+    #[serde(skip)]
+    ram: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum LoadState {
+    Loading,
+    Running { context: u64 },
+    Failed { error: String },
+}
+
+/// What loading a model takes: whether it fits now, else which loaded models to unload
+/// (least recently used first) to make room.
+#[derive(Debug, Clone, Serialize)]
+pub struct Room {
+    pub fits: bool,
+    pub unload: Vec<String>,
+}
+
 struct Running {
     server: LlamaServer,
 }
@@ -122,8 +153,10 @@ pub struct App {
     pub catalog: Catalog,
     pub settings: Mutex<Settings>,
     pub guard: Mutex<Option<GuardServer>>,
-    running: tokio::sync::Mutex<Option<Running>>,
-    pub status: Mutex<ServerStatus>,
+    /// The model servers, by installed model id.
+    running: tokio::sync::Mutex<HashMap<String, Running>>,
+    /// Loaded, loading and failed models, most recently used first.
+    models: Mutex<Vec<LoadedModel>>,
     judge_server: tokio::sync::Mutex<Option<LlamaServer>>,
     pub judge_status: Mutex<JudgeStatus>,
     pub downloads: Mutex<HashMap<String, Arc<AtomicBool>>>,
@@ -134,6 +167,9 @@ pub struct App {
     pub chats: crate::agent::Chats,
     /// OpenCode, run headless for the chat window, by project.
     pub engines: crate::acp::Engines,
+    /// The model each chat uses, by `project/chat`: switching a chat's model makes the next
+    /// reply read the whole chat again, so each keeps its own.
+    chat_models: Mutex<HashMap<String, String>>,
 }
 
 impl App {
@@ -150,8 +186,8 @@ impl App {
             catalog: Catalog::bundled(),
             settings: Mutex::new(settings),
             guard: Mutex::new(None),
-            running: tokio::sync::Mutex::new(None),
-            status: Mutex::new(ServerStatus::Stopped),
+            running: tokio::sync::Mutex::new(HashMap::new()),
+            models: Mutex::new(Vec::new()),
             judge_server: tokio::sync::Mutex::new(None),
             judge_status: Mutex::new(JudgeStatus::Idle),
             downloads: Mutex::new(HashMap::new()),
@@ -159,6 +195,7 @@ impl App {
             discovery: Mutex::new(Discovery::default()),
             chats: crate::agent::Chats::default(),
             engines: crate::acp::Engines::default(),
+            chat_models: Mutex::new(std::fs::read_to_string(paths.chat_models()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()),
             paths,
         })
     }
@@ -196,18 +233,13 @@ impl App {
     /// runs starts it now, if it fits beside that model at the context it has.
     pub async fn set_judge(&self, enabled: bool, fail_closed: bool) -> anyhow::Result<()> {
         let judge = self.catalog.judge.as_ref().context("this version has no judge model")?;
-        if enabled
-            && !self.settings.lock().unwrap().judge
-            && let Some((model, context)) = self.running_model()
-        {
-            let left = self.hardware.less(judge.judge_required());
-            if model.model.fit(left.model_budget).is_none_or(|fit| fit.context < context) {
+        if enabled && !self.settings.lock().unwrap().judge {
+            let (used, _) = Self::used(&self.models.lock().unwrap(), "");
+            if used + judge.judge_required() > self.hardware.model_budget {
                 bail!(
-                    "{} needs {:.1} GB beside {}, which doesn't fit at {}k context. Stop the model, turn the judge on, and start it again: it will get the context that fits.",
+                    "{} needs {:.1} GB beside the loaded models, which isn't free. Unload a model, turn the judge on, and load it again: it will get the context that fits.",
                     judge.name,
                     judge.judge_required() as f64 / 1e9,
-                    model.model.name,
-                    context / 1024
                 );
             }
         }
@@ -228,7 +260,7 @@ impl App {
             let settings = self.settings.lock().unwrap();
             (settings.judge, settings.judge_fail_closed)
         };
-        let wanted = if enabled && self.running_model().is_some() { self.judge_installed() } else { None };
+        let wanted = if enabled && self.latest_model().is_some() { self.judge_installed() } else { None };
         let mut server = self.judge_server.lock().await;
         let Some(model) = wanted else {
             if let Some(mut old) = server.take() {
@@ -403,27 +435,128 @@ impl App {
         model.fit(self.model_hardware().model_budget)
     }
 
-    /// Loads `id` in llama-server and points the guard (and OpenCode) at it.
-    pub async fn start_model(&self, id: &str, mut on_status: impl FnMut(&ServerStatus)) -> anyhow::Result<()> {
-        let model = self.find_installed(id).with_context(|| format!("{id} is not installed"))?;
-        let mut set_status = |status: ServerStatus| {
-            *self.status.lock().unwrap() = status.clone();
-            on_status(&status);
-        };
-        let result = async {
-            let fit = self.fit(&model.model).context("this model no longer fits in this machine's memory")?;
-            let binary = runtime::find_llama_server()
-                .context("llama-server was not found (install llama.cpp, or set SUPERVISER_LLAMA_SERVER)")?;
-            let entry = model.entry_path().context("model has no entry file")?;
-            secrets::upstream_api_key(&self.paths)?;
+    /// Every loaded, loading or failed model, most recently used first.
+    pub fn models(&self) -> Vec<LoadedModel> {
+        self.models.lock().unwrap().clone()
+    }
 
-            let mut running = self.running.lock().await;
-            if let Some(mut old) = running.take() {
-                old.server.stop().await;
+    /// One line for the menu and simple checks: a running model if any (the most recently
+    /// used), else one loading, else one that failed.
+    pub fn status(&self) -> ServerStatus {
+        let models = self.models.lock().unwrap();
+        let pick = |want: fn(&LoadState) -> bool| models.iter().find(|m| want(&m.state));
+        if let Some(m) = pick(|s| matches!(s, LoadState::Running { .. })) {
+            let LoadState::Running { context } = m.state else { unreachable!() };
+            return ServerStatus::Running { model: m.id.clone(), name: m.name.clone(), context };
+        }
+        if let Some(m) = pick(|s| *s == LoadState::Loading) {
+            return ServerStatus::Loading { model: m.id.clone(), name: m.name.clone() };
+        }
+        if let Some(m) = pick(|s| matches!(s, LoadState::Failed { .. })) {
+            let LoadState::Failed { error } = &m.state else { unreachable!() };
+            return ServerStatus::Failed { model: m.id.clone(), error: error.clone() };
+        }
+        ServerStatus::Stopped
+    }
+
+    /// A loaded model and its context.
+    pub fn loaded(&self, id: &str) -> Option<(InstalledModel, u64)> {
+        let context = self.models.lock().unwrap().iter().find_map(|m| match m.state {
+            LoadState::Running { context } if m.id == id => Some(context),
+            _ => None,
+        })?;
+        self.find_installed(id).map(|m| (m, context))
+    }
+
+    /// The most recently used loaded model.
+    pub fn latest_model(&self) -> Option<(InstalledModel, u64)> {
+        let id = self.models.lock().unwrap().iter().find(|m| matches!(m.state, LoadState::Running { .. }))?.id.clone();
+        self.loaded(&id)
+    }
+
+    /// Every loaded model, most recently used first.
+    pub fn loaded_models(&self) -> Vec<(InstalledModel, u64)> {
+        let ids: Vec<String> = self.models.lock().unwrap().iter().filter(|m| matches!(m.state, LoadState::Running { .. })).map(|m| m.id.clone()).collect();
+        ids.iter().filter_map(|id| self.loaded(id)).collect()
+    }
+
+    /// Marks a model as just used, so it's the last one suggested for unloading.
+    pub fn touch(&self, id: &str) {
+        let mut models = self.models.lock().unwrap();
+        if let Some(index) = models.iter().position(|m| m.id == id) {
+            let model = models.remove(index);
+            models.insert(0, model);
+        }
+    }
+
+    /// Memory the loaded and loading models take besides `except`: (model budget, RAM).
+    fn used(models: &[LoadedModel], except: &str) -> (u64, u64) {
+        models.iter().filter(|m| m.id != except && !matches!(m.state, LoadState::Failed { .. })).fold((0, 0), |(gpu, ram), m| (gpu + m.memory, ram + m.ram))
+    }
+
+    /// How `model` fits beside the loaded models.
+    fn fit_beside(&self, models: &[LoadedModel], model: &CatalogModel, id: &str) -> Option<Fit> {
+        let (used, _) = Self::used(models, id);
+        model.fit(self.model_hardware().model_budget.checked_sub(used)?)
+    }
+
+    /// Whether `id` can load now, else what to unload first.
+    pub fn room_for(&self, id: &str) -> anyhow::Result<Room> {
+        let model = self.find_installed(id).with_context(|| format!("{id} is not installed"))?;
+        let mut models = self.models.lock().unwrap().clone();
+        if models.iter().any(|m| m.id == id && m.state != LoadState::Loading && !matches!(m.state, LoadState::Failed { .. })) || self.fit_beside(&models, &model.model, id).is_some() {
+            return Ok(Room { fits: true, unload: Vec::new() });
+        }
+        // Unload the least recently used until it fits.
+        let mut unload = Vec::new();
+        while let Some(index) = models.iter().rposition(|m| matches!(m.state, LoadState::Running { .. })) {
+            unload.push(models.remove(index).id);
+            if self.fit_beside(&models, &model.model, id).is_some() {
+                return Ok(Room { fits: false, unload });
             }
-            set_status(ServerStatus::Loading { model: model.id.clone(), name: model.model.name.clone() });
-            let prompt_cache = model.model.prompt_cache(&fit, self.model_hardware().ram_budget);
-            tracing::info!("{}: {}k context, {} MiB for saved conversations", model.alias, fit.context / 1024, prompt_cache >> 20);
+        }
+        bail!("{} doesn't fit in this machine's memory", model.model.name)
+    }
+
+    /// Loads `id` in its own llama-server beside the loaded models, if it fits, and points the
+    /// guard (and OpenCode) at it. `changed` is told when its state changes.
+    pub async fn load_model(&self, id: &str, mut changed: impl FnMut()) -> anyhow::Result<()> {
+        let model = self.find_installed(id).with_context(|| format!("{id} is not installed"))?;
+        let binary = runtime::find_llama_server().context("llama-server was not found (install llama.cpp, or set SUPERVISER_LLAMA_SERVER)")?;
+        let entry = model.entry_path().context("model has no entry file")?;
+        secrets::upstream_api_key(&self.paths)?;
+        // Check the room and claim it in one go, so two loads can't both take it.
+        let (fit, prompt_cache) = {
+            let mut models = self.models.lock().unwrap();
+            if let Some(existing) = models.iter().find(|m| m.id == id) {
+                match existing.state {
+                    LoadState::Running { .. } => {
+                        drop(models);
+                        self.touch(id);
+                        return Ok(());
+                    }
+                    LoadState::Loading => bail!("{} is already loading", model.model.name),
+                    LoadState::Failed { .. } => {}
+                }
+            }
+            let fit = match self.fit_beside(&models, &model.model, id) {
+                Some(fit) => fit,
+                None => {
+                    let others: Vec<&str> = models.iter().filter(|m| m.id != id && matches!(m.state, LoadState::Running { .. })).map(|m| m.name.as_str()).collect();
+                    bail!("{} doesn't fit beside {}; unload one first", model.model.name, others.join(" and "));
+                }
+            };
+            let (_, ram_used) = Self::used(&models, id);
+            let prompt_cache = model.model.prompt_cache(&fit, self.model_hardware().ram_budget.saturating_sub(ram_used));
+            models.retain(|m| m.id != id);
+            let state = LoadState::Loading;
+            models.insert(0, LoadedModel { id: id.to_string(), name: model.model.name.clone(), alias: model.alias.clone(), state, memory: fit.required, ram: fit.required + prompt_cache });
+            (fit, prompt_cache)
+        };
+        changed();
+        tracing::info!("{}: {}k context, {} MiB for saved conversations", model.alias, fit.context / 1024, prompt_cache >> 20);
+        let log_file = self.paths.logs().join(format!("llama-server-{}.log", model.alias));
+        let started = async {
             let config = ServerConfig {
                 binary,
                 model_path: entry,
@@ -431,26 +564,36 @@ impl App {
                 context: fit.context,
                 port: runtime::free_port()?,
                 api_key_file: self.paths.upstream_api_key(),
-                log_file: self.paths.logs().join("llama-server.log"),
+                log_file: log_file.clone(),
                 prompt_cache,
                 decision: false,
             };
             let mut server = LlamaServer::start(config).await?;
             if let Err(e) = server.wait_ready(LOAD_TIMEOUT).await {
                 server.stop().await;
-                return Err(e.context(format!("see {}", self.paths.logs().join("llama-server.log").display())));
+                return Err(e.context(format!("see {}", log_file.display())));
             }
-            if let Some(guard) = self.guard.lock().unwrap().as_ref() {
-                guard.set_upstream(Some(server.base_url()));
-            }
-            *running = Some(Running { server });
-            anyhow::Ok(fit)
+            anyhow::Ok(server)
         }
         .await;
-        match result {
-            Ok(fit) => {
-                set_status(ServerStatus::Running { model: model.id.clone(), name: model.model.name.clone(), context: fit.context });
-                self.settings.lock().unwrap().last_model = Some(model.id.clone());
+        let set_state = |state: LoadState| {
+            if let Some(m) = self.models.lock().unwrap().iter_mut().find(|m| m.id == id) {
+                m.state = state;
+            }
+        };
+        match started {
+            Ok(server) => {
+                // Unloaded while it loaded: don't keep it.
+                if !self.models.lock().unwrap().iter().any(|m| m.id == id) {
+                    let mut server = server;
+                    server.stop().await;
+                    bail!("{} was unloaded while it loaded", model.model.name);
+                }
+                self.running.lock().await.insert(id.to_string(), Running { server });
+                set_state(LoadState::Running { context: fit.context });
+                self.sync_upstreams().await;
+                changed();
+                self.settings.lock().unwrap().last_model = Some(id.to_string());
                 self.save_settings()?;
                 self.sync_judge().await;
                 if self.settings.lock().unwrap().configure_opencode
@@ -461,42 +604,70 @@ impl App {
                 Ok(())
             }
             Err(e) => {
-                set_status(ServerStatus::Failed { model: model.id.clone(), error: format!("{e:#}") });
-                self.sync_judge().await;
+                set_state(LoadState::Failed { error: format!("{e:#}") });
+                changed();
                 Err(e)
             }
         }
     }
 
-    pub async fn stop_model(&self) {
-        if let Some(mut running) = self.running.lock().await.take() {
+    /// Unloads `id` (or, with `None`, every model), freeing its memory.
+    pub async fn unload_model(&self, id: Option<&str>) {
+        let stopping: Vec<Running> = {
+            let mut running = self.running.lock().await;
+            let ids: Vec<String> = running.keys().filter(|k| id.is_none_or(|id| id == k.as_str())).cloned().collect();
+            ids.iter().filter_map(|k| running.remove(k)).collect()
+        };
+        self.models.lock().unwrap().retain(|m| id.is_some_and(|id| id != m.id));
+        for mut running in stopping {
             running.server.stop().await;
         }
-        if let Some(guard) = self.guard.lock().unwrap().as_ref() {
-            guard.set_upstream(None);
-        }
-        *self.status.lock().unwrap() = ServerStatus::Stopped;
+        self.sync_upstreams().await;
         self.sync_judge().await;
     }
 
-    /// The running model, if any: (installed model, context).
-    pub fn running_model(&self) -> Option<(InstalledModel, u64)> {
-        let ServerStatus::Running { model, context, .. } = self.status.lock().unwrap().clone() else { return None };
-        self.find_installed(&model).map(|m| (m, context))
+    /// Points the guard at every loaded model's server, by alias; requests naming none of
+    /// them go to the most recently loaded.
+    async fn sync_upstreams(&self) {
+        let urls: HashMap<String, String> = self.running.lock().await.iter().map(|(id, r)| (id.clone(), r.server.base_url())).collect();
+        let models = self.models();
+        let by_alias: HashMap<String, String> = models.iter().filter_map(|m| Some((m.alias.clone(), urls.get(&m.id)?.clone()))).collect();
+        let default = models.iter().find_map(|m| urls.get(&m.id).cloned());
+        if let Some(guard) = self.guard.lock().unwrap().as_ref() {
+            guard.set_upstreams(by_alias, default);
+        }
     }
 
-    /// Adds the running model to OpenCode's global config, as its default.
+    /// Adds the loaded models to OpenCode's global config, the most recently used as its default.
     pub fn setup_opencode(&self) -> anyhow::Result<opencode::Installed> {
-        let Some((model, context)) = self.running_model() else { bail!("start a model first") };
+        let loaded = self.loaded_models();
+        let Some((latest, _)) = loaded.first() else { bail!("load a model first") };
         let base_url = self.guard_url().context("the guard is not running")?;
         secrets::local_api_key(&self.paths)?;
         let setup = opencode::Setup {
             base_url,
             api_key_file: self.paths.local_api_key(),
-            models: vec![opencode::SetupModel { alias: model.alias.clone(), name: model.model.name.clone(), context }],
-            default_model: Some(model.alias),
+            models: loaded.iter().map(|(m, context)| opencode::SetupModel { alias: m.alias.clone(), name: m.model.name.clone(), context: *context }).collect(),
+            default_model: Some(latest.alias.clone()),
         };
         opencode::install(&setup)
+    }
+
+    /// The installed model a chat uses, if one was chosen for it.
+    pub fn chat_model(&self, project: &str, chat: &str) -> Option<String> {
+        self.chat_models.lock().unwrap().get(&format!("{project}/{chat}")).cloned()
+    }
+
+    /// Sets (or with `None` forgets) the model a chat uses.
+    pub fn set_chat_model(&self, project: &str, chat: &str, model: Option<String>) -> anyhow::Result<()> {
+        let mut models = self.chat_models.lock().unwrap();
+        let key = format!("{project}/{chat}");
+        match model {
+            Some(model) => models.insert(key, model),
+            None => models.remove(&key),
+        };
+        superviser_core::paths::write_private(&self.paths.chat_models(), serde_json::to_string(&*models)?.as_bytes())?;
+        Ok(())
     }
 
     pub fn project(&self, id: &str) -> Option<Project> {
@@ -525,6 +696,7 @@ impl App {
     pub fn delete_project(&self, id: &str) -> anyhow::Result<()> {
         self.settings.lock().unwrap().projects.retain(|p| p.id != id);
         superviser_core::agent::Chat::delete_all(&self.paths, id);
+        self.chat_models.lock().unwrap().retain(|key, _| !key.starts_with(&format!("{id}/")));
         self.save_settings()?;
         self.sync_projects();
         Ok(())
@@ -543,12 +715,12 @@ impl App {
     /// OpenCode's config is refreshed first so it talks to the guard about the running model.
     pub fn open_project(&self, id: &str) -> anyhow::Result<sandbox::Launched> {
         let project = self.project(id).context("that project no longer exists")?;
-        if self.running_model().is_none() {
-            bail!("Start a model first: OpenCode would have nothing to talk to.");
+        if self.latest_model().is_none() {
+            bail!("Load a model first: OpenCode would have nothing to talk to.");
         }
         self.setup_opencode()?;
         let guard_url = self.guard_url().context("the guard is not running")?;
-        let model = self.running_model().map(|(m, context)| opencode::SetupModel { alias: m.alias, name: m.model.name, context });
+        let model = self.latest_model().map(|(m, context)| opencode::SetupModel { alias: m.alias, name: m.model.name, context });
         let launch = sandbox::Launch {
             project: &project,
             model,
@@ -570,10 +742,10 @@ impl App {
 
     pub fn shutdown(&self) {
         self.engines.stop_all();
-        if let Ok(mut running) = self.running.try_lock()
-            && let Some(mut running) = running.take()
-        {
-            tauri::async_runtime::block_on(running.server.stop());
+        if let Ok(mut running) = self.running.try_lock() {
+            for (_, mut running) in running.drain() {
+                tauri::async_runtime::block_on(running.server.stop());
+            }
         }
         if let Ok(mut judge) = self.judge_server.try_lock()
             && let Some(mut judge) = judge.take()

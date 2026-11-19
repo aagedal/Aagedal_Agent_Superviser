@@ -42,11 +42,24 @@ pub struct ProxyOptions {
     pub judge: Option<Judge>,
 }
 
+/// The model servers requests go to: by the model a request names, else the default.
+#[derive(Default)]
+struct Upstreams {
+    by_model: HashMap<String, String>,
+    default: Option<String>,
+}
+
+impl Upstreams {
+    fn pick(&self, model: Option<&str>) -> Option<String> {
+        model.and_then(|m| self.by_model.get(m)).or(self.default.as_ref()).cloned()
+    }
+}
+
 struct AppState {
     config: Arc<Config>,
     options: ProxyOptions,
     api_key: RwLock<Option<String>>,
-    upstream: RwLock<Option<String>>,
+    upstreams: RwLock<Upstreams>,
     judge: RwLock<Option<Judge>>,
     /// Rules of the projects served at `/projects/<id>/`, by id.
     projects: RwLock<HashMap<String, Arc<ProjectRules>>>,
@@ -90,7 +103,7 @@ impl GuardServer {
             .map_err(std::io::Error::other)?;
         let api_key = RwLock::new(options.api_key.clone());
         let judge = RwLock::new(options.judge.clone());
-        let state = Arc::new(AppState { config: Arc::new(config), options, api_key, upstream: RwLock::new(None), judge, projects: RwLock::new(HashMap::new()), client });
+        let state = Arc::new(AppState { config: Arc::new(config), options, api_key, upstreams: RwLock::new(Upstreams::default()), judge, projects: RwLock::new(HashMap::new()), client });
         let shutdown = serve(listener, state.clone());
         Ok(Self { addr, state, shutdown: Some(shutdown), unix: std::sync::Mutex::new(None) })
     }
@@ -118,7 +131,14 @@ impl GuardServer {
 
     /// Points the guard at a model server (`http://127.0.0.1:PORT`), or at nothing.
     pub fn set_upstream(&self, upstream: Option<String>) {
-        *self.state.upstream.write().unwrap() = upstream.map(|u| u.trim_end_matches('/').to_string());
+        self.set_upstreams(HashMap::new(), upstream);
+    }
+
+    /// Points requests at the server of the model they name (model name → `http://127.0.0.1:PORT`),
+    /// and those naming none of them at `default`. `/v1/models` lists the named ones.
+    pub fn set_upstreams(&self, by_model: HashMap<String, String>, default: Option<String>) {
+        let trim = |u: String| u.trim_end_matches('/').to_string();
+        *self.state.upstreams.write().unwrap() = Upstreams { by_model: by_model.into_iter().map(|(m, u)| (m, trim(u))).collect(), default: default.map(trim) };
     }
 
     /// Replaces the key clients must send.
@@ -137,8 +157,9 @@ impl GuardServer {
         *self.state.judge.write().unwrap() = judge;
     }
 
+    /// Where requests naming no loaded model go.
     pub fn upstream(&self) -> Option<String> {
-        self.state.upstream.read().unwrap().clone()
+        self.state.upstreams.read().unwrap().default.clone()
     }
 
     pub fn stop(&mut self) {
@@ -206,9 +227,16 @@ async fn forward_inner(state: &Arc<AppState>, request: Request) -> Response {
         },
         None => (None, path_and_query.to_string()),
     };
-    let Some(upstream) = state.upstream.read().unwrap().clone() else {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "no model is running; start one from the Agent Superviser menu");
-    };
+    // Every loaded model, not just one server's.
+    if parts.method == Method::GET && path_and_query.split('?').next().is_some_and(|p| p.ends_with("/v1/models") || p == "/models") {
+        let upstreams = state.upstreams.read().unwrap();
+        if upstreams.by_model.len() > 1 {
+            let mut names: Vec<&String> = upstreams.by_model.keys().collect();
+            names.sort();
+            let data: Vec<Value> = names.into_iter().map(|id| json!({ "id": id, "object": "model", "owned_by": "agent-superviser" })).collect();
+            return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json!({ "object": "list", "data": data }).to_string()).into_response();
+        }
+    }
     let body = match axum::body::to_bytes(body, MAX_BODY).await {
         Ok(body) => body,
         Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
@@ -216,6 +244,10 @@ async fn forward_inner(state: &Arc<AppState>, request: Request) -> Response {
 
     // Only JSON object bodies with messages are model calls worth guarding.
     let request_json = serde_json::from_slice::<Value>(&body).ok().filter(Value::is_object);
+    let model = request_json.as_ref().and_then(|r| r.get("model")).and_then(Value::as_str);
+    let Some(upstream) = state.upstreams.read().unwrap().pick(model) else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "no model is loaded; load one from the Agent Superviser menu");
+    };
     let judge = state.judge.read().unwrap().clone();
     let guard = request_json.map(|r| {
         let mut guard = Guard::new(r, state.config.clone());
@@ -403,6 +435,26 @@ mod tests {
         // Without the project's path, its rules don't apply.
         let plain = send("/v1/chat/completions").await.text().await.unwrap();
         assert!(plain.contains("ssh build-box make"), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn routes_by_the_model_a_request_names() {
+        let first = fake_upstream(r#"{"choices":[{"message":{"content":"from first"},"finish_reason":"stop"}]}"#, "application/json").await;
+        let second = fake_upstream(r#"{"choices":[{"message":{"content":"from second"},"finish_reason":"stop"}]}"#, "application/json").await;
+        let server = guard_server(None).await;
+        server.set_upstreams(HashMap::from([("a".to_string(), first.clone()), ("b".to_string(), second)]), Some(first));
+        let ask = |model: &'static str| {
+            let url = format!("http://{}/v1/chat/completions", server.addr);
+            async move { reqwest::Client::new().post(url).bearer_auth("client-key").body(REQUEST.replace(r#""model":"m""#, &format!(r#""model":"{model}""#))).send().await.unwrap().text().await.unwrap() }
+        };
+        assert!(ask("b").await.contains("from second"));
+        assert!(ask("a").await.contains("from first"));
+        // A model nobody loaded goes to the default.
+        assert!(ask("gpt-4").await.contains("from first"));
+        let models: Value = reqwest::Client::new().get(format!("http://{}/v1/models", server.addr)).bearer_auth("client-key").send().await.unwrap().json().await.unwrap();
+        assert_eq!(models["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect::<Vec<_>>(), ["a", "b"]);
+        server.set_upstreams(HashMap::new(), None);
+        assert!(ask("a").await.contains("no model is loaded"));
     }
 
     #[tokio::test]

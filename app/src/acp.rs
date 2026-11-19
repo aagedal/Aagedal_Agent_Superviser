@@ -55,6 +55,12 @@ pub struct Engine {
     asks: Mutex<HashMap<String, (Value, String)>>,
     /// Sessions with a prompt in flight.
     busy: Mutex<HashSet<String>>,
+    /// Sessions this process has open (made or loaded); others must be loaded before a prompt.
+    open: Mutex<HashSet<String>>,
+    /// Sessions being loaded only to prompt them: their replay isn't shown again.
+    quiet: Mutex<HashSet<String>>,
+    /// The project's main folder, for loading sessions.
+    cwd: std::path::PathBuf,
     alive: AtomicBool,
     pid: Option<u32>,
 }
@@ -77,7 +83,7 @@ impl Engines {
         if let Some(old) = running.remove(&project.id) {
             old.stop();
         }
-        let engine = Engine::start(handle.clone(), &project.id, launch).await?;
+        let engine = Engine::start(handle.clone(), project, launch).await?;
         running.insert(project.id.clone(), engine.clone());
         Ok(engine)
     }
@@ -105,8 +111,6 @@ struct Launch {
 
 impl Launch {
     fn new(app: &App, project: &Project) -> anyhow::Result<Self> {
-        // Without a model it can still list and replay saved chats; it starts again once one runs.
-        let model = app.running_model();
         let guard = app.guard_url().context("the guard is not running")?;
         let binary = opencode::binary().context("OpenCode isn't bundled with this build and isn't installed")?;
         let main = std::fs::canonicalize(project.main()).with_context(|| format!("{} is gone", project.main().display()))?;
@@ -115,8 +119,14 @@ impl Launch {
         let setup = opencode::Setup {
             base_url: format!("{}{}/v1", guard.trim_end_matches("/v1"), project.guard_path()),
             api_key_file: app.paths.local_api_key(),
-            models: model.iter().map(|(m, context)| opencode::SetupModel { alias: m.alias.clone(), name: m.model.name.clone(), context: *context }).collect(),
-            default_model: model.as_ref().map(|(m, _)| m.alias.clone()),
+            // Every model a chat might use, so a session's recorded model always resolves.
+            models: app
+                .installed()
+                .into_iter()
+                .filter_map(|m| Some(opencode::SetupModel { context: app.fit(&m.model)?.context, alias: m.alias, name: m.model.name }))
+                .collect(),
+            // No default: each prompt names the chat's model, so switching models needs no restart.
+            default_model: None,
         };
         // The project's rules, and our provider as the only one.
         let mut config = project.opencode_config(&opencode::mcp_servers());
@@ -137,7 +147,7 @@ impl Launch {
 }
 
 impl Engine {
-    async fn start(handle: AppHandle, project: &str, launch: Launch) -> anyhow::Result<Arc<Self>> {
+    async fn start(handle: AppHandle, project: &Project, launch: Launch) -> anyhow::Result<Arc<Self>> {
         let mut child = tokio::process::Command::from(launch.command)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -147,7 +157,10 @@ impl Engine {
         let stdin = child.stdin.take().expect("piped");
         let stdout = child.stdout.take().expect("piped");
         let engine = Arc::new(Self {
-            project: project.to_string(),
+            project: project.id.clone(),
+            open: Mutex::new(HashSet::new()),
+            quiet: Mutex::new(HashSet::new()),
+            cwd: project.main().to_path_buf(),
             fingerprint: launch.fingerprint,
             stdin: tokio::sync::Mutex::new(stdin),
             next_id: AtomicU64::new(1),
@@ -228,6 +241,9 @@ impl Engine {
             }
             (Some("session/update"), None) => {
                 let params = &message["params"];
+                if self.quiet.lock().unwrap().contains(params["sessionId"].as_str().unwrap_or("")) {
+                    return;
+                }
                 let _ = handle.emit(
                     "acp",
                     Event::Update { project: self.project.clone(), session: params["sessionId"].as_str().unwrap_or("").into(), update: params["update"].clone() },
@@ -272,13 +288,31 @@ impl Engine {
             "additionalDirectories": project.related().iter().map(|f| &f.path).collect::<Vec<_>>(),
         });
         let result = self.request("session/new", params, Some(REQUEST_TIMEOUT)).await?;
-        result["sessionId"].as_str().map(str::to_string).context("OpenCode didn't name the session")
+        let session = result["sessionId"].as_str().map(str::to_string).context("OpenCode didn't name the session")?;
+        self.open.lock().unwrap().insert(session.clone());
+        Ok(session)
     }
 
     /// Opens a saved session; OpenCode replays it as updates.
     pub async fn load_session(&self, project: &Project, session: &str) -> anyhow::Result<()> {
         let params = json!({ "sessionId": session, "cwd": project.main(), "mcpServers": [] });
         self.request("session/load", params, Some(REQUEST_TIMEOUT)).await?;
+        self.open.lock().unwrap().insert(session.to_string());
+        Ok(())
+    }
+
+    /// Loads `session` without showing its replay, unless this process has it open already
+    /// (it doesn't after a restart for new project settings).
+    async fn ensure_open(&self, session: &str) -> anyhow::Result<()> {
+        if self.open.lock().unwrap().contains(session) {
+            return Ok(());
+        }
+        self.quiet.lock().unwrap().insert(session.to_string());
+        let params = json!({ "sessionId": session, "cwd": self.cwd, "mcpServers": [] });
+        let loaded = self.request("session/load", params, Some(REQUEST_TIMEOUT)).await;
+        self.quiet.lock().unwrap().remove(session);
+        loaded?;
+        self.open.lock().unwrap().insert(session.to_string());
         Ok(())
     }
 
@@ -291,8 +325,9 @@ impl Engine {
         self.busy.lock().unwrap().contains(session)
     }
 
-    /// Sends the user's message; the reply arrives as events, and the end as a `state` event.
-    pub fn prompt(self: &Arc<Self>, handle: AppHandle, session: &str, text: &str) -> anyhow::Result<()> {
+    /// Sends the user's message, to be answered by `model` (the running one's alias); the reply
+    /// arrives as events, and the end as a `state` event.
+    pub fn prompt(self: &Arc<Self>, handle: AppHandle, session: &str, text: &str, model: &str) -> anyhow::Result<()> {
         if !self.busy.lock().unwrap().insert(session.to_string()) {
             bail!("The agent is still working on this chat.");
         }
@@ -305,10 +340,19 @@ impl Engine {
         };
         let _ = handle.emit("acp", state(true, None, None));
         let engine = self.clone();
-        let (session, text) = (session.to_string(), text.to_string());
+        let (session, text, model) = (session.to_string(), text.to_string(), format!("{}/{model}", opencode::PROVIDER_ID));
         tauri::async_runtime::spawn(async move {
-            let params = json!({ "sessionId": session, "prompt": [{ "type": "text", "text": text }] });
-            let result = engine.request("session/prompt", params, None).await;
+            let result = async {
+                engine.ensure_open(&session).await?;
+                // The session may have been made with another model; the one running answers.
+                let choose = json!({ "sessionId": session, "configId": "model", "value": model });
+                if let Err(e) = engine.request("session/set_config_option", choose, Some(REQUEST_TIMEOUT)).await {
+                    tracing::warn!("choosing {model} for {session}: {e:#}");
+                }
+                let params = json!({ "sessionId": session, "prompt": [{ "type": "text", "text": text }] });
+                engine.request("session/prompt", params, None).await
+            }
+            .await;
             engine.busy.lock().unwrap().remove(&session);
             let event = match result {
                 Ok(result) => Event::State {

@@ -16,7 +16,7 @@ use superviser_guard::CallEvent;
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::DialogExt;
 
-use crate::state::{App, JudgeStatus, ServerStatus};
+use crate::state::{App, JudgeStatus, LoadState, LoadedModel, Room, ServerStatus};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -33,7 +33,10 @@ pub struct Overview {
     hardware: Hardware,
     /// What a model may take now: less while the judge is on.
     model_budget: u64,
+    /// The most recently used loaded model, or one loading or failed (see [`App::status`]).
     status: ServerStatus,
+    /// Every loaded, loading or failed model, most recently used first.
+    models: Vec<LoadedModel>,
     guard_url: Option<String>,
     opencode_version: Option<String>,
     llama_server: Option<String>,
@@ -45,7 +48,8 @@ pub fn overview(app: State<'_, Arc<App>>) -> Overview {
     Overview {
         hardware: app.hardware.clone(),
         model_budget: app.model_hardware().model_budget,
-        status: app.status.lock().unwrap().clone(),
+        status: app.status(),
+        models: app.models(),
         guard_url: app.guard_url(),
         opencode_version: opencode::version(),
         llama_server: superviser_core::runtime::find_llama_server().map(|p| p.display().to_string()),
@@ -212,24 +216,32 @@ pub async fn set_use_other_apps(handle: AppHandle, app: State<'_, Arc<App>>, ena
 
 #[tauri::command]
 pub async fn delete_model(handle: AppHandle, app: State<'_, Arc<App>>, id: String) -> Result<()> {
-    if matches!(&*app.status.lock().unwrap(), ServerStatus::Running { model, .. } | ServerStatus::Loading { model, .. } if *model == id) {
-        return Err("Stop the model before deleting it.".into());
+    if app.models().iter().any(|m| m.id == id && !matches!(m.state, LoadState::Failed { .. })) {
+        return Err("Unload the model before deleting it.".into());
     }
     app.delete_model(&id).map_err(err)?;
     crate::refresh_tray(&handle);
     Ok(())
 }
 
+/// Loads a model beside the loaded ones, if it fits (see `room_for`).
 #[tauri::command]
-pub async fn start_model(handle: AppHandle, app: State<'_, Arc<App>>, id: String) -> Result<()> {
-    crate::start_model(handle, app.inner().clone(), id).await
+pub async fn load_model(handle: AppHandle, app: State<'_, Arc<App>>, id: String) -> Result<()> {
+    crate::load_model(handle, app.inner().clone(), id).await
 }
 
+/// Unloads a model, or every model without `id`.
 #[tauri::command]
-pub async fn stop_model(handle: AppHandle, app: State<'_, Arc<App>>) -> Result<()> {
-    app.stop_model().await;
+pub async fn unload_model(handle: AppHandle, app: State<'_, Arc<App>>, id: Option<String>) -> Result<()> {
+    app.unload_model(id.as_deref()).await;
     crate::status_changed(&handle);
     Ok(())
+}
+
+/// Whether a model can load beside the loaded ones, else which to unload first.
+#[tauri::command]
+pub fn room_for(app: State<'_, Arc<App>>, id: String) -> Result<Room> {
+    app.room_for(&id).map_err(|e| format!("{e:#}"))
 }
 
 #[derive(Serialize)]
@@ -244,7 +256,7 @@ pub fn api_info(app: State<'_, Arc<App>>) -> Result<ApiInfo> {
     Ok(ApiInfo {
         base_url: app.guard_url(),
         api_key: secrets::local_api_key(&app.paths).map_err(err)?,
-        model: app.running_model().map(|(m, _)| m.alias),
+        model: app.latest_model().map(|(m, _)| m.alias),
     })
 }
 
@@ -495,13 +507,12 @@ pub async fn acp_open(handle: AppHandle, app: State<'_, Arc<App>>, project: Stri
 }
 
 #[tauri::command]
-pub async fn acp_prompt(handle: AppHandle, app: State<'_, Arc<App>>, project: String, session: String, text: String) -> Result<()> {
-    if app.running_model().is_none() {
-        return Err("Start a model first.".into());
-    }
+pub async fn acp_prompt(handle: AppHandle, app: State<'_, Arc<App>>, project: String, session: String, text: String, model: String) -> Result<()> {
+    let (model, _) = app.loaded(&model).ok_or("Load the chat's model first.")?;
+    app.touch(&model.id);
     let project = self::project(&app, &project)?;
     let engine = app.engines.get(&handle, &app, &project).await.map_err(|e| format!("{e:#}"))?;
-    engine.prompt(handle, &session, &text).map_err(|e| format!("{e:#}"))
+    engine.prompt(handle, &session, &text, &model.alias).map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
@@ -522,7 +533,22 @@ pub async fn acp_permission(app: State<'_, Arc<App>>, project: String, request: 
 pub async fn acp_delete(handle: AppHandle, app: State<'_, Arc<App>>, project: String, session: String) -> Result<()> {
     let project = self::project(&app, &project)?;
     let engine = app.engines.get(&handle, &app, &project).await.map_err(|e| format!("{e:#}"))?;
-    engine.delete_session(&session).await.map_err(|e| format!("{e:#}"))
+    engine.delete_session(&session).await.map_err(|e| format!("{e:#}"))?;
+    app.set_chat_model(&project.id, &session, None).map_err(err)
+}
+
+/// The installed model a chat uses, if one was chosen for it.
+#[tauri::command]
+pub fn chat_model(app: State<'_, Arc<App>>, project: String, chat: String) -> Option<String> {
+    app.chat_model(&project, &chat)
+}
+
+#[tauri::command]
+pub fn set_chat_model(app: State<'_, Arc<App>>, project: String, chat: String, model: String) -> Result<()> {
+    if app.find_installed(&model).is_none() {
+        return Err(format!("{model} is not installed"));
+    }
+    app.set_chat_model(&project, &chat, Some(model)).map_err(err)
 }
 
 // --- Opening the project's files ---
@@ -626,8 +652,8 @@ pub fn chat_load(app: State<'_, Arc<App>>, project: String, id: String) -> Resul
 
 /// Sends a message (in a new chat without `chat`) and returns the chat's id.
 #[tauri::command]
-pub fn chat_send(handle: AppHandle, app: State<'_, Arc<App>>, project: String, chat: Option<String>, text: String) -> Result<String> {
-    crate::agent::send(handle, app.inner().clone(), &project, chat.as_deref(), &text).map_err(|e| format!("{e:#}"))
+pub fn chat_send(handle: AppHandle, app: State<'_, Arc<App>>, project: String, chat: Option<String>, text: String, model: String) -> Result<String> {
+    crate::agent::send(handle, app.inner().clone(), &project, chat.as_deref(), &text, &model).map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
@@ -643,7 +669,8 @@ pub fn chat_answer(app: State<'_, Arc<App>>, chat: String, call: String, allow: 
 #[tauri::command]
 pub fn chat_delete(app: State<'_, Arc<App>>, project: String, id: String) -> Result<()> {
     app.chats.stop(&id);
-    Chat::delete(&app.paths, &project, &id).map_err(err)
+    Chat::delete(&app.paths, &project, &id).map_err(err)?;
+    app.set_chat_model(&project, &id, None).map_err(err)
 }
 
 /// Opens the chat window on a project (the most recent one without `project`).

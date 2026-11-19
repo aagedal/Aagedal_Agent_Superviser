@@ -74,12 +74,13 @@ fn emit(handle: &AppHandle, event: Event) {
 
 /// Adds the user's message to a chat (a new one without `chat`) and starts the agent on it.
 /// Returns the chat's id at once; the rest arrives as events.
-pub fn send(handle: AppHandle, app: Arc<App>, project: &str, chat: Option<&str>, text: &str) -> anyhow::Result<String> {
+pub fn send(handle: AppHandle, app: Arc<App>, project: &str, chat: Option<&str>, text: &str, model: &str) -> anyhow::Result<String> {
     let project = app.project(project).context("that project no longer exists")?;
     if project.isolation != Isolation::MacosSandbox {
         bail!("The built-in chat runs projects in the macOS sandbox so far. Open this one in OpenCode, or switch it to the macOS sandbox in Projects.");
     }
-    let (model, _) = app.running_model().context("Start a model first.")?;
+    let (model, _) = app.loaded(model).context("Load the chat's model first.")?;
+    app.touch(&model.id);
     let mut chat = match chat {
         Some(id) => Chat::load(&app.paths, &project.id, id)?,
         None => Chat::new(&project.id),

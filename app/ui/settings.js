@@ -101,13 +101,12 @@ function downloadControl(model, { compact = false } = {}) {
     box.replaceChildren();
     const progress = downloads.get(id);
     const local = localCopy(model, id);
-    const running = overview?.status.state === "running" ? overview.status.model : null;
-    if (local && local.id === running) {
-      box.append(chip("Running", "good"));
+    if (local && isLoaded(local.id)) {
+      box.append(chip("Loaded", "good"));
     } else if (installedIds.has(id) && local?.source === "app") {
-      box.append(chip("Installed", "good"), el("button", { class: compact ? "primary" : "", onclick: () => startModel(id) }, "Start"));
+      box.append(chip("Installed", "good"), el("button", { class: compact ? "primary" : "", onclick: () => loadModel(id) }, "Load"));
     } else if (local && !progress) {
-      box.append(chip("On this Mac", "good"), el("button", { class: "primary", onclick: () => startModel(local.id) }, "Start"));
+      box.append(chip("On this Mac", "good"), el("button", { class: "primary", onclick: () => loadModel(local.id) }, "Load"));
       if (local.id !== id && !compact) box.append(el("button", { onclick: () => download(model, id) }, `Download ${model.quant.label}`));
     } else if (progress) {
       const bar = el("progress", { max: progress.total || 1, value: progress.done });
@@ -292,7 +291,7 @@ function statusText(status) {
     case "running": return `Running ${status.name} with a ${Math.round(status.context / 1024)}k context.`;
     case "loading": return `Loading ${status.name}… big models can take a minute.`;
     case "failed": return `Could not start the model: ${status.error}`;
-    default: return "No model is running.";
+    default: return "No model is loaded.";
   }
 }
 
@@ -313,25 +312,43 @@ function setModelFilter(filter) {
 }
 for (const button of document.querySelectorAll("#model-filter button")) button.addEventListener("click", () => setModelFilter(button.dataset.filter));
 
-// The running model, or why none can run, above both filters. Hidden when there's nothing to say.
+// Loaded (or loading) models: in memory, ready for a chat.
+const isLoaded = (id) => overview?.models.some((m) => m.id === id && m.state !== "failed");
+
+function modelLine(m) {
+  switch (m.state) {
+    case "running": return `${m.name} is loaded, with a ${Math.round(m.context / 1024)}k context (${gib(m.memory)}).`;
+    case "loading": return `Loading ${m.name}… big models can take a minute.`;
+    default: return `Could not load ${m.name}: ${m.error}`;
+  }
+}
+
+// The loaded models, or why none can load, above both filters. Hidden when there's nothing to say.
 async function renderStatus() {
   await refreshOverview();
-  const status = overview.status;
   const banner = $("status-banner");
   banner.replaceChildren();
-  banner.classList.toggle("bad", status.state === "failed" || !overview.llama_server);
+  banner.classList.toggle("bad", !overview.llama_server);
   if (!overview.llama_server) {
     banner.append("llama-server was not found. Install llama.cpp (brew install llama.cpp) to run models.");
-  } else if (status.state !== "stopped") {
-    banner.append(el("span", {}, statusText(status)));
-    if (status.state === "running" || status.state === "loading") banner.append(el("button", { onclick: stopModel }, "Stop"));
+  } else {
+    for (const m of overview.models) {
+      banner.append(
+        el(
+          "div",
+          { class: `row model-line ${m.state}` },
+          el("span", { class: "spacer" }, modelLine(m)),
+          el("button", { onclick: () => unloadModel(m.id), title: m.state === "failed" ? "" : "Frees the model's memory" }, m.state === "failed" ? "Dismiss" : "Unload"),
+        ),
+      );
+    }
   }
   banner.hidden = banner.childNodes.length === 0;
   rerenderAllDownloads();
 }
 
-async function stopModel() {
-  await invoke("stop_model");
+async function unloadModel(id) {
+  await invoke("unload_model", { id });
   renderStatus();
   if (modelFilter === "local") renderInstalled();
 }
@@ -345,12 +362,13 @@ async function renderInstalled() {
   list.replaceChildren();
   if (installed.length === 0) list.append(el("p", { class: "muted" }, "Nothing here yet. Pick a model under Suggested."));
   for (const m of installed) {
-    const active = (status.state === "running" || status.state === "loading") && status.model === m.id;
+    const active = isLoaded(m.id);
+    const loading = overview.models.some((l) => l.id === m.id && l.state === "loading");
     const actions = el("div", { class: "actions" });
     if (active) {
-      actions.append(el("button", { onclick: stopModel }, "Stop"));
+      actions.append(el("button", { onclick: () => unloadModel(m.id), title: "Frees the model's memory", disabled: loading }, "Unload"));
     } else {
-      actions.append(el("button", { class: "primary", disabled: !m.fit || status.state === "loading", onclick: () => startModel(m.id) }, "Start"));
+      actions.append(el("button", { class: "primary", disabled: !m.fit, onclick: () => loadModel(m.id) }, "Load"));
     }
     if (m.removable) {
       actions.append(el("button", { class: "danger", disabled: active, onclick: () => deleteModel(m) }, "Delete"));
@@ -416,13 +434,25 @@ $("rescan").addEventListener("click", async () => {
   renderOffers();
 });
 
-async function startModel(id) {
-  const started = invoke("start_model", { id });
+// Loads a model beside the loaded ones; when memory is short, offers to unload the ones used longest ago.
+async function loadModel(id) {
+  try {
+    const room = await invoke("room_for", { id });
+    if (!room.fits) {
+      const names = room.unload.map((u) => overview.models.find((m) => m.id === u)?.name || u);
+      if (!confirm(`There isn't room for this model beside ${names.join(" and ")}. Unload ${names.length === 1 ? "it" : "them"} first?`)) return;
+      for (const u of room.unload) await invoke("unload_model", { id: u });
+    }
+  } catch (e) {
+    alert(e);
+    return;
+  }
+  const loading = invoke("load_model", { id });
   renderStatus();
   try {
-    await started;
+    await loading;
   } catch (e) {
-    // The status banner shows the error.
+    // The status area shows the error.
   }
   renderStatus();
   if (modelFilter === "local") renderInstalled();
@@ -452,7 +482,7 @@ async function renderConnect() {
   const info = await invoke("api_info");
   $("base-url").value = info.base_url || "";
   $("api-key").value = info.api_key;
-  $("model-name").value = info.model || "(start a model first)";
+  $("model-name").value = info.model || "(load a model first)";
   $("opencode-version").textContent = overview.opencode_version ? `OpenCode ${overview.opencode_version} found.` : "OpenCode was not found on your PATH. Install it from opencode.ai, then come back.";
   $("setup-opencode").disabled = overview.status.state !== "running";
   $("hf-status").textContent = overview.hf_token_set ? "A token is saved." : "No token saved.";
@@ -543,7 +573,7 @@ async function renderProjects() {
   const running = overview.status.state === "running";
   $("sandbox-unavailable").hidden = projectsInfo.available;
   $("new-project").disabled = !projectsInfo.available;
-  $("projects-note").textContent = running ? "" : "Start a model to open a project.";
+  $("projects-note").textContent = running ? "" : "Load a model to open a project in OpenCode.";
   renderInstallable(projectsInfo.installable);
   const list = $("project-list");
   list.replaceChildren();
@@ -573,7 +603,7 @@ function projectCard(project, running) {
       "div",
       { class: "actions" },
       el("button", { onclick: () => { editingProject = project.id; renderProjects(); } }, "Edit"),
-      el("button", { disabled: !projectsInfo.available || !running, title: running ? "Open in OpenCode, in a Terminal window" : "Start a model first", onclick: () => invoke("open_project", { id: project.id }) }, "OpenCode"),
+      el("button", { disabled: !projectsInfo.available || !running, title: running ? "Open in OpenCode, in a Terminal window" : "Load a model first", onclick: () => invoke("open_project", { id: project.id }) }, "OpenCode"),
       project.isolation === "macos-sandbox" ? el("button", { class: "primary", onclick: () => invoke("open_chat", { project: project.id }) }, "Chat") : null,
     ),
   );
@@ -910,8 +940,8 @@ async function guideModel() {
   const loading = overview.status.state === "loading";
   return [
     el("h2", {}, "Pick a model"),
-    el("p", { class: "muted" }, "The model writes the code. Bigger ones code better but answer more slowly and leave less memory for your other apps. Start one that's already on this Mac, or download one: downloads keep going while you carry on."),
-    running ? el("div", { class: "banner good" }, `✓ ${running} is running.`) : loading ? el("div", { class: "banner" }, statusText(overview.status)) : null,
+    el("p", { class: "muted" }, "The model writes the code. Bigger ones code better but answer more slowly and leave less memory for your other apps. Load one that's already on this Mac, or download one: downloads keep going while you carry on."),
+    running ? el("div", { class: "banner good" }, `✓ ${running} is loaded.`) : loading ? el("div", { class: "banner" }, statusText(overview.status)) : null,
     ...picks.map(pickCard),
     picks.length ? null : el("div", { class: "banner" }, "None of the suggested models fit in this machine's memory."),
     el("p", { class: "small muted" }, "More models, and models from other apps, are on the Models tab."),
@@ -988,7 +1018,7 @@ async function guideConnect() {
   const running = runningModelName();
   const parts = [el("h2", {}, "Start coding"), el("p", { class: "muted" }, "Tell the agent what to do in the chat window. It works in the project's sandbox, talking to your model through the guard, and asks before it runs commands.")];
   if (!running) {
-    parts.push(el("div", { class: "banner" }, "Start a model first. ", el("button", { onclick: () => goToStep(0) }, "Back to models")));
+    parts.push(el("div", { class: "banner" }, "Load a model first. ", el("button", { onclick: () => goToStep(0) }, "Back to models")));
   } else if (!project) {
     parts.push(el("div", { class: "banner" }, "Choose a project folder first. ", el("button", { onclick: () => goToStep(1) }, "Back to projects")));
   } else if (project.isolation !== "macos-sandbox") {

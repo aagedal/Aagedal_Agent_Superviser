@@ -56,6 +56,11 @@ impl Paths {
         std::env::temp_dir().join(format!("agent-superviser-{user}.sock"))
     }
 
+    /// Which model each chat uses.
+    pub fn chat_models(&self) -> PathBuf {
+        self.data.join("chat-models.json")
+    }
+
     pub fn settings(&self) -> PathBuf {
         self.data.join("settings.json")
     }

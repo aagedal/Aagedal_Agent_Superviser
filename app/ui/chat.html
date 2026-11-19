@@ -19,7 +19,7 @@
     <div class="chat">
       <header>
         <div class="chat-title"><strong id="title">New chat</strong> <span class="muted small" id="where"></span></div>
-        <span class="muted small"><span id="usage"></span> <span id="model"></span></span>
+        <span class="muted small"><span id="usage"></span> <select id="chat-model" title="The model this chat uses"></select> <button class="icon" id="unload" title="Unload the model, freeing its memory" hidden>⏏</button></span>
       </header>
       <div class="messages" id="messages"></div>
       <div class="banner notice" id="notice" hidden></div>

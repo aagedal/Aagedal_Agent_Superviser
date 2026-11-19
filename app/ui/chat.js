@@ -359,7 +359,7 @@ const opencode = {
         awaiting = false;
       }
     }
-    await invoke("acp_prompt", { project: project.id, session, text });
+    await invoke("acp_prompt", { project: project.id, session, text, model: chatModel });
   },
   stop: () => invoke("acp_cancel", { project: project.id, session }),
   remove: (id) => invoke("acp_delete", { project: project.id, session: id }),
@@ -379,7 +379,7 @@ const builtin = {
   async send(text) {
     awaiting = !session;
     try {
-      session = await invoke("chat_send", { project: project.id, chat: session, text });
+      session = await invoke("chat_send", { project: project.id, chat: session, text, model: chatModel });
     } finally {
       awaiting = false;
     }
@@ -450,6 +450,10 @@ async function showChat(id) {
   } else {
     list().append(emptyState());
   }
+  // Its own model, unless that one was deleted since.
+  const own = id && project ? await invoke("chat_model", { project: project.id, chat: id }).catch(() => null) : null;
+  chatModel = models.some((m) => m.id === own) ? own : defaultModel();
+  await refreshRoom();
   list().scrollTop = list().scrollHeight;
   await renderChatList();
   update();
@@ -511,10 +515,83 @@ async function openProject(id) {
 window.openProject = openProject;
 
 async function refreshStatus() {
-  status = (await invoke("overview")).status;
-  $("model").textContent = status.state === "running" ? status.name : status.state === "loading" ? `Loading ${status.name}…` : "No model running";
+  const overview = await invoke("overview");
+  status = overview.status;
+  loadedModels = overview.models;
+  renderModelPicker();
+  await refreshRoom();
   update();
 }
+
+// --- The chat's model ---
+// Each chat keeps the model it was started with: another model would read the whole chat
+// again. Several models can be loaded at once, memory permitting; sending in a chat loads
+// its model if needed, unloading the ones used longest ago when there isn't room.
+
+let models = []; // installed models that fit: {id, name}
+let loadedModels = []; // loaded, loading or failed, most recently used first
+let chatModel = null;
+let room = null; // what loading the chat's model takes, when it isn't loaded
+
+const isLoaded = (id) => loadedModels.some((m) => m.id === id && m.state === "running");
+const isLoading = (id) => loadedModels.some((m) => m.id === id && m.state === "loading");
+
+async function refreshRoom() {
+  room = chatModel && !isLoaded(chatModel) && !isLoading(chatModel) ? await invoke("room_for", { id: chatModel }).catch(() => null) : null;
+}
+const modelName = (id) => models.find((m) => m.id === id)?.name || "the chat's model";
+
+async function loadModels() {
+  const installed = await invoke("installed_models");
+  models = installed.filter((m) => m.fit).map((m) => ({ id: m.id, name: m.model.name }));
+  renderModelPicker();
+}
+
+function defaultModel() {
+  let last = null;
+  try {
+    last = localStorage.getItem("chatModel");
+  } catch {}
+  const latest = loadedModels.find((m) => m.state === "running")?.id;
+  return [latest, last, models[0]?.id].find((id) => id && models.some((m) => m.id === id)) || null;
+}
+
+function renderModelPicker() {
+  const select = $("chat-model");
+  select.replaceChildren(...models.map((m) => el("option", { value: m.id }, isLoaded(m.id) ? `${m.name} ●` : m.name)));
+  if (!models.length) select.append(el("option", { value: "" }, "No models yet"));
+  select.value = chatModel || "";
+  select.disabled = busy || !models.length;
+  $("unload").hidden = !isLoaded(chatModel);
+  $("unload").title = `Unload ${modelName(chatModel)}, freeing its memory`;
+}
+
+$("unload").addEventListener("click", async () => {
+  if (busy) {
+    if (!confirm("The agent is working on this chat. Unloading its model stops it.")) return;
+    await engines[engine].stop().catch(() => {});
+  }
+  await invoke("unload_model", { id: chatModel });
+  await refreshStatus();
+});
+
+$("chat-model").addEventListener("change", async () => {
+  const next = $("chat-model").value;
+  const started = list().querySelector(".msg");
+  if (session && started && next !== chatModel && !confirm(`Use ${modelName(next)} for this chat? Its next reply reads the whole chat again, which takes a while for a long chat.`)) {
+    renderModelPicker();
+    return;
+  }
+  chatModel = next;
+  try {
+    localStorage.setItem("chatModel", next);
+  } catch {}
+  if (session) invoke("set_chat_model", { project: project.id, chat: session, model: next }).catch(() => {});
+  renderModelPicker();
+  await refreshRoom();
+  update();
+});
+window.addEventListener("focus", loadModels);
 
 // What can be done now, and what's in the way.
 function update() {
@@ -522,10 +599,21 @@ function update() {
   const reasons = [];
   if (!project) reasons.push(["Make a project first: a folder for the agent to work in.", "New project…", newProject]);
   else if (project.isolation !== "macos-sandbox") reasons.push(["This project runs in the Linux VM, which the chat doesn't support yet.", "Open in OpenCode", () => invoke("open_project", { id: project.id })]);
-  if (status && status.state !== "running") reasons.push([status.state === "loading" ? "The model is loading…" : "Start a model to chat.", "Models…", () => invoke("open_window", { name: "settings" })]);
-  notice.hidden = reasons.length === 0;
-  notice.replaceChildren(...reasons.map(([text, label, action]) => el("div", { class: "row" }, el("span", { class: "spacer" }, text), el("button", { onclick: action }, label))));
-  $("send").disabled = busy || reasons.length > 0;
+  if (!models.length) reasons.push(["Download a model to chat.", "Models…", () => invoke("open_window", { name: "settings" })]);
+  // Not in the way: sending starts the chat's model.
+  const notes = [];
+  if (isLoading(chatModel)) notes.push(`Loading ${modelName(chatModel)}…`);
+  else if (chatModel && !isLoaded(chatModel) && !busy) {
+    const unload = (room?.unload || []).map((id) => loadedModels.find((m) => m.id === id)?.name || id);
+    notes.push(unload.length ? `Sending loads ${modelName(chatModel)}, unloading ${unload.join(" and ")} to make room.` : `Sending loads ${modelName(chatModel)}.`);
+  }
+  notice.hidden = reasons.length + notes.length === 0;
+  notice.replaceChildren(
+    ...reasons.map(([text, label, action]) => el("div", { class: "row" }, el("span", { class: "spacer" }, text), el("button", { onclick: action }, label))),
+    ...notes.map((text) => el("div", { class: "row info" }, text)),
+  );
+  renderModelPicker();
+  $("send").disabled = busy || reasons.length > 0 || !chatModel;
   $("send").hidden = busy;
   $("stop").hidden = !busy;
 }
@@ -612,7 +700,19 @@ async function send(text) {
   busy = true;
   update();
   try {
+    // The chat's model answers; load it if it isn't, making room if needed.
+    if (!isLoaded(chatModel)) {
+      const needed = await invoke("room_for", { id: chatModel });
+      if (!needed.fits) {
+        const names = needed.unload.map((id) => loadedModels.find((m) => m.id === id)?.name || id);
+        if (!confirm(`Loading ${modelName(chatModel)} needs the memory ${names.join(" and ")} ${names.length === 1 ? "uses" : "use"}. Unload ${names.length === 1 ? "it" : "them"}?`)) throw "Not sent: the chat's model isn't loaded.";
+        for (const id of needed.unload) await invoke("unload_model", { id });
+      }
+      await invoke("load_model", { id: chatModel });
+      await refreshStatus();
+    }
     await engines[engine].send(text);
+    if (session) invoke("set_chat_model", { project: project.id, chat: session, model: chatModel }).catch(() => {});
   } catch (e) {
     finished(String(e), null);
   }
@@ -639,6 +739,7 @@ $("manage").addEventListener("click", () => invoke("open_window", { name: "setti
 
 (async () => {
   engine = await invoke("chat_engine");
+  await loadModels();
   await refreshStatus();
   await openProject(location.hash.slice(1));
 })();
