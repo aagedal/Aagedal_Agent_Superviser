@@ -33,6 +33,16 @@ fn main() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(app.clone())
+        // In the Dock and Command-Tab only while one of its windows is open.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                let label = window.label().to_string();
+                let handle = window.app_handle();
+                if handle.webview_windows().keys().all(|l| *l == label) {
+                    set_in_dock(handle, false);
+                }
+            }
+        })
         .setup(move |tauri_app| {
             #[cfg(target_os = "macos")]
             tauri_app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -353,8 +363,23 @@ pub fn open_chat(handle: &AppHandle, project: Option<&str>) -> tauri::Result<()>
     open_window_at(handle, "chat", project.unwrap_or(""))
 }
 
+/// Shows the app in the Dock and Command-Tab (while it has a window open), or hides it to
+/// the menu bar.
+fn set_in_dock(handle: &AppHandle, shown: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        let policy = if shown { tauri::ActivationPolicy::Regular } else { tauri::ActivationPolicy::Accessory };
+        if let Err(e) = handle.set_activation_policy(policy) {
+            tracing::warn!("activation policy: {e}");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (handle, shown);
+}
+
 /// Like [`open_window`], on a tab of the settings window or a project in the chat window.
 pub fn open_window_at(handle: &AppHandle, name: &str, tab: &str) -> tauri::Result<()> {
+    set_in_dock(handle, true);
     if let Some(window) = handle.get_webview_window(name) {
         if !tab.is_empty() {
             let call = if name == "chat" { "openProject" } else { "showTab" };
