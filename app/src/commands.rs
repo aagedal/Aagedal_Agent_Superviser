@@ -4,14 +4,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
-use superviser_core::catalog::{CatalogModel, Fit, Offer};
+use superviser_core::agent::{Chat, ChatSummary};
+use superviser_core::catalog::{Catalog, CatalogModel, Fit, Offer, Pick};
 use superviser_core::discover::{Locations, MlxModel, Skipped};
 use superviser_core::hardware::Hardware;
 use superviser_core::hub::{Hub, SearchHit};
 use superviser_core::installed::{self, InstalledModel};
+use superviser_core::project::{Project, SUGGESTED_PROGRAMS, TOOL_GROUPS, ToolGroup};
 use superviser_core::{opencode, secrets};
 use superviser_guard::CallEvent;
 use tauri::{AppHandle, Emitter, State};
+use tauri_plugin_dialog::DialogExt;
 
 use crate::state::{App, JudgeStatus, ServerStatus};
 
@@ -52,6 +55,8 @@ pub fn overview(app: State<'_, Arc<App>>) -> Overview {
 
 #[derive(Serialize)]
 pub struct Offers {
+    /// The short list shown first.
+    picks: Vec<Pick>,
     offers: Vec<Offer>,
     /// Curated models left out because they don't fit.
     hidden: usize,
@@ -60,7 +65,8 @@ pub struct Offers {
 #[tauri::command]
 pub fn catalog_offers(app: State<'_, Arc<App>>) -> Offers {
     let offers = app.catalog.offers(&app.model_hardware());
-    Offers { hidden: app.catalog.models.len() - offers.len(), offers }
+    let picks = Catalog::picks(&offers, app.hardware.total_memory);
+    Offers { hidden: app.catalog.models.len() - offers.len(), picks, offers }
 }
 
 #[tauri::command]
@@ -348,20 +354,39 @@ pub fn recent_calls(app: State<'_, Arc<App>>) -> Vec<CallEvent> {
 }
 
 #[derive(Serialize)]
-pub struct SandboxInfo {
+pub struct ProjectView {
+    #[serde(flatten)]
+    project: Project,
+    /// The ways its main folder could be isolated.
+    choices: Vec<superviser_core::sandbox::Choice>,
+}
+
+#[derive(Serialize)]
+pub struct ProjectsInfo {
+    /// Whether projects can be opened isolated on this OS at all.
     available: bool,
-    network: superviser_core::sandbox::Network,
-    recent_projects: Vec<String>,
+    projects: Vec<ProjectView>,
     /// Isolation options that installing something would make available.
     installable: Vec<superviser_core::sandbox::Choice>,
+    tool_groups: &'static [ToolGroup],
+    suggested_programs: &'static [&'static str],
+    /// MCP servers in OpenCode's global config, which a project can turn off.
+    mcp_servers: Vec<String>,
 }
 
 #[tauri::command]
-pub fn sandbox_info(app: State<'_, Arc<App>>) -> SandboxInfo {
-    let settings = app.settings.lock().unwrap();
+pub fn projects_info(app: State<'_, Arc<App>>) -> ProjectsInfo {
+    let projects = app.settings.lock().unwrap().projects.clone();
     // Any folder: whether a backend is installed doesn't depend on the project.
     let installable = superviser_core::sandbox::choices(std::path::Path::new("/")).into_iter().filter(|c| c.setup.is_some()).collect();
-    SandboxInfo { available: cfg!(target_os = "macos"), network: settings.sandbox_network, recent_projects: settings.recent_projects.clone(), installable }
+    ProjectsInfo {
+        available: cfg!(target_os = "macos"),
+        projects: projects.into_iter().map(|p| ProjectView { choices: superviser_core::sandbox::choices(p.main()), project: p }).collect(),
+        installable,
+        tool_groups: TOOL_GROUPS,
+        suggested_programs: SUGGESTED_PROGRAMS,
+        mcp_servers: opencode::mcp_servers().into_iter().map(|s| s.name).collect(),
+    }
 }
 
 /// Opens the download of what an isolation option needs (Apple's signed `container`
@@ -376,44 +401,189 @@ pub async fn get_installer(isolation: superviser_core::sandbox::Isolation) -> Re
     Ok(url)
 }
 
+/// Asks for a folder; `None` if the dialog was cancelled.
 #[tauri::command]
-pub fn set_sandbox_network(handle: AppHandle, app: State<'_, Arc<App>>, network: superviser_core::sandbox::Network) -> Result<()> {
-    app.settings.lock().unwrap().sandbox_network = network;
-    app.save_settings().map_err(err)?;
-    crate::refresh_tray(&handle);
+pub async fn choose_folder(handle: AppHandle, title: String) -> Option<String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut dialog = handle.dialog().file().set_title(title);
+    if let Some(home) = std::env::var_os("HOME") {
+        dialog = dialog.set_directory(home);
+    }
+    dialog.pick_folder(move |folder| {
+        let _ = tx.send(folder.and_then(|f| f.into_path().ok()));
+    });
+    rx.await.ok().flatten().map(|p| p.display().to_string())
+}
+
+/// The project for `folder`, made if there is none.
+#[tauri::command]
+pub fn new_project(handle: AppHandle, app: State<'_, Arc<App>>, folder: String) -> Result<Project> {
+    let project = app.project_for_folder(std::path::Path::new(&folder)).map_err(err)?;
+    projects_changed(&handle);
+    Ok(project)
+}
+
+#[tauri::command]
+pub fn save_project(handle: AppHandle, app: State<'_, Arc<App>>, project: Project) -> Result<Project> {
+    let project = app.save_project(project).map_err(err)?;
+    projects_changed(&handle);
+    Ok(project)
+}
+
+#[tauri::command]
+pub fn delete_project(handle: AppHandle, app: State<'_, Arc<App>>, id: String) -> Result<()> {
+    app.delete_project(&id).map_err(err)?;
+    projects_changed(&handle);
     Ok(())
 }
 
-#[derive(Serialize)]
-pub struct ProjectIsolation {
-    current: superviser_core::sandbox::Isolation,
-    choices: Vec<superviser_core::sandbox::Choice>,
+fn projects_changed(handle: &AppHandle) {
+    let _ = handle.emit("projects", ());
+    crate::refresh_tray(handle);
 }
 
-/// How a project is isolated, and the ways it could be.
+/// Opens a project (or asks for a folder, with `id` unset) in isolated OpenCode.
 #[tauri::command]
-pub fn project_isolation(app: State<'_, Arc<App>>, path: String) -> ProjectIsolation {
-    let project = std::path::Path::new(&path);
-    ProjectIsolation { current: app.isolation(project), choices: superviser_core::sandbox::choices(project) }
-}
-
-#[tauri::command]
-pub fn set_project_isolation(app: State<'_, Arc<App>>, path: String, isolation: superviser_core::sandbox::Isolation) -> Result<()> {
-    let choice = superviser_core::sandbox::choices(std::path::Path::new(&path)).into_iter().find(|c| c.isolation == isolation);
-    if let Some(why) = choice.and_then(|c| c.unavailable) {
-        return Err(why);
-    }
-    app.settings.lock().unwrap().project_isolation.insert(path, isolation);
-    app.save_settings().map_err(err)
-}
-
-/// Opens a project (or asks for one, with `path` unset) in isolated OpenCode.
-#[tauri::command]
-pub fn open_project(handle: AppHandle, path: Option<String>) {
-    match path {
-        Some(path) => crate::open_project(&handle, path.into()),
+pub fn open_project(handle: AppHandle, id: Option<String>) {
+    match id {
+        Some(id) => crate::open_project(&handle, &id),
         None => crate::choose_project(&handle),
     }
+}
+
+// --- The chat window's engine: OpenCode over ACP, else the built-in agent ---
+
+/// `opencode` when OpenCode is bundled or installed, else `builtin`.
+#[tauri::command]
+pub fn chat_engine() -> &'static str {
+    if opencode::binary().is_some() { "opencode" } else { "builtin" }
+}
+
+fn project(app: &App, id: &str) -> Result<superviser_core::project::Project> {
+    app.project(id).ok_or_else(|| "that project no longer exists".to_string())
+}
+
+/// The project's saved OpenCode sessions, most recent first.
+#[tauri::command]
+pub async fn acp_sessions(handle: AppHandle, app: State<'_, Arc<App>>, project: String) -> Result<serde_json::Value> {
+    let project = self::project(&app, &project)?;
+    let engine = app.engines.get(&handle, &app, &project).await.map_err(|e| format!("{e:#}"))?;
+    engine.sessions(&project.main().display().to_string()).await.map_err(|e| format!("{e:#}"))
+}
+
+#[derive(Serialize)]
+pub struct Opened {
+    session: String,
+    busy: bool,
+}
+
+/// Opens a saved session (replayed as events) or, without `session`, a new one.
+#[tauri::command]
+pub async fn acp_open(handle: AppHandle, app: State<'_, Arc<App>>, project: String, session: Option<String>) -> Result<Opened> {
+    let project = self::project(&app, &project)?;
+    let engine = app.engines.get(&handle, &app, &project).await.map_err(|e| format!("{e:#}"))?;
+    let session = match session {
+        Some(session) => {
+            if !engine.is_busy(&session) {
+                engine.load_session(&project, &session).await.map_err(|e| format!("{e:#}"))?;
+            }
+            session
+        }
+        None => engine.new_session(&project).await.map_err(|e| format!("{e:#}"))?,
+    };
+    Ok(Opened { busy: engine.is_busy(&session), session })
+}
+
+#[tauri::command]
+pub async fn acp_prompt(handle: AppHandle, app: State<'_, Arc<App>>, project: String, session: String, text: String) -> Result<()> {
+    if app.running_model().is_none() {
+        return Err("Start a model first.".into());
+    }
+    let project = self::project(&app, &project)?;
+    let engine = app.engines.get(&handle, &app, &project).await.map_err(|e| format!("{e:#}"))?;
+    engine.prompt(handle, &session, &text).map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub async fn acp_cancel(app: State<'_, Arc<App>>, project: String, session: String) -> Result<()> {
+    match app.engines.running(&project).await {
+        Some(engine) => engine.cancel(&session).await.map_err(|e| format!("{e:#}")),
+        None => Ok(()),
+    }
+}
+
+#[tauri::command]
+pub async fn acp_permission(app: State<'_, Arc<App>>, project: String, request: String, option: Option<String>) -> Result<()> {
+    let engine = app.engines.running(&project).await.ok_or("OpenCode isn't running for this project")?;
+    engine.answer(&request, option.as_deref()).await.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub async fn acp_delete(handle: AppHandle, app: State<'_, Arc<App>>, project: String, session: String) -> Result<()> {
+    let project = self::project(&app, &project)?;
+    let engine = app.engines.get(&handle, &app, &project).await.map_err(|e| format!("{e:#}"))?;
+    engine.delete_session(&session).await.map_err(|e| format!("{e:#}"))
+}
+
+// --- The built-in agent ---
+
+#[tauri::command]
+pub fn chat_list(app: State<'_, Arc<App>>, project: String) -> Vec<ChatSummary> {
+    Chat::list(&app.paths, &project)
+}
+
+#[derive(Serialize)]
+pub struct ChatView {
+    #[serde(flatten)]
+    chat: Chat,
+    /// The agent is working on it now.
+    busy: bool,
+}
+
+#[tauri::command]
+pub fn chat_load(app: State<'_, Arc<App>>, project: String, id: String) -> Result<ChatView> {
+    let chat = Chat::load(&app.paths, &project, &id).map_err(err)?;
+    Ok(ChatView { busy: app.chats.busy(&chat.id), chat })
+}
+
+/// Sends a message (in a new chat without `chat`) and returns the chat's id.
+#[tauri::command]
+pub fn chat_send(handle: AppHandle, app: State<'_, Arc<App>>, project: String, chat: Option<String>, text: String) -> Result<String> {
+    crate::agent::send(handle, app.inner().clone(), &project, chat.as_deref(), &text).map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub fn chat_stop(app: State<'_, Arc<App>>, chat: String) {
+    app.chats.stop(&chat);
+}
+
+#[tauri::command]
+pub fn chat_answer(app: State<'_, Arc<App>>, chat: String, call: String, allow: bool) {
+    app.chats.answer(&chat, &call, allow);
+}
+
+#[tauri::command]
+pub fn chat_delete(app: State<'_, Arc<App>>, project: String, id: String) -> Result<()> {
+    app.chats.stop(&id);
+    Chat::delete(&app.paths, &project, &id).map_err(err)
+}
+
+/// Opens the chat window on a project (the most recent one without `project`).
+#[tauri::command]
+pub fn open_chat(handle: AppHandle, project: Option<String>) -> Result<()> {
+    crate::open_chat(&handle, project.as_deref()).map_err(err)
+}
+
+/// Whether the first-run guide was finished or skipped.
+#[tauri::command]
+pub fn setup_done(app: State<'_, Arc<App>>) -> bool {
+    app.settings.lock().unwrap().setup_done
+}
+
+#[tauri::command]
+pub fn set_setup_done(app: State<'_, Arc<App>>, done: bool) -> Result<()> {
+    app.settings.lock().unwrap().setup_done = done;
+    app.save_settings().map_err(err)
 }
 
 #[tauri::command]

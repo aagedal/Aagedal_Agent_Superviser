@@ -13,8 +13,10 @@ pub mod seatbelt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::paths::{Paths, write_private};
+use crate::project::{Folder, Project};
 
 pub use seatbelt::Policy;
 
@@ -39,12 +41,33 @@ pub enum Isolation {
 
 pub struct Request<'a> {
     pub paths: &'a Paths,
+    /// The main folder, where OpenCode starts.
     pub project: &'a Path,
+    /// The project's other folders.
+    pub related: &'a [Folder],
     pub network: Network,
     /// The guard's Unix socket, for backends that can't reach it on localhost.
     pub guard_socket: &'a Path,
     /// The running model, for backends that write OpenCode's config themselves.
     pub model: Option<crate::opencode::SetupModel>,
+    /// The guard's address on this machine (`http://127.0.0.1:8787`).
+    pub guard_url: &'a str,
+    /// The project's path on the guard (`/projects/<id>`), before `/v1`.
+    pub guard_path: &'a str,
+    /// The project's OpenCode config, passed in `OPENCODE_CONFIG_CONTENT`.
+    pub opencode: &'a Value,
+    /// Programs the project's commands may not run.
+    pub blocked_programs: &'a [String],
+}
+
+/// What to open: a project, with the model and guard OpenCode should use.
+pub struct Launch<'a> {
+    pub project: &'a Project,
+    pub model: Option<crate::opencode::SetupModel>,
+    /// The guard's address on this machine (`http://127.0.0.1:8787`).
+    pub guard_url: String,
+    /// [`Project::opencode_config`].
+    pub opencode: Value,
 }
 
 /// What a backend set up for one launch.
@@ -126,6 +149,18 @@ fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))
 }
 
+/// What the Terminal window says about a project's other folders and blocked programs.
+pub fn rules_banner(related: &[Folder], blocked_programs: &[String]) -> Vec<String> {
+    let mut lines: Vec<String> = related
+        .iter()
+        .map(|f| format!("Also {}: {}", if f.writable { "changes" } else { "reads" }, f.path.display()))
+        .collect();
+    if !blocked_programs.is_empty() {
+        lines.push(format!("Blocked programs: {}.", blocked_programs.join(", ")));
+    }
+    lines
+}
+
 /// The Terminal script: into the project, say how it is isolated, start OpenCode.
 pub fn launch_script(project: &Path, label: &str, network: Network, prepared: &Prepared) -> String {
     let name = project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -152,27 +187,47 @@ pub struct Launched {
     pub files: Vec<PathBuf>,
 }
 
-/// Opens OpenCode for `project` in a new Terminal window, isolated by `isolation`.
-pub fn launch(
-    paths: &Paths,
-    project: &Path,
-    isolation: Isolation,
-    network: Network,
-    model: Option<crate::opencode::SetupModel>,
-) -> anyhow::Result<Launched> {
-    anyhow::ensure!(project.is_dir(), "{} is not a folder", project.display());
-    let project = std::fs::canonicalize(project)?;
+/// A folder a project may use: an existing folder, not one holding the home folder.
+fn checked_folder(path: &Path) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(path.is_dir(), "{} is not a folder", path.display());
+    let path = std::fs::canonicalize(path)?;
     if let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
-        anyhow::ensure!(!home.starts_with(&project), "{} contains your home folder; pick a project folder inside it", project.display());
+        anyhow::ensure!(!home.starts_with(&path), "{} contains your home folder; pick a project folder inside it", path.display());
     }
-    let backend = backend(isolation);
+    Ok(path)
+}
+
+/// Opens OpenCode for a project in a new Terminal window, isolated as the project says.
+pub fn launch(paths: &Paths, launch: &Launch) -> anyhow::Result<Launched> {
+    let project = launch.project;
+    let main = checked_folder(project.main())?;
+    let related = project
+        .related()
+        .iter()
+        .map(|f| Ok(Folder { path: checked_folder(&f.path)?, writable: f.writable }))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let backend = backend(project.isolation);
     backend.available().map_err(|why| anyhow::anyhow!("{} isn't available: {why}", backend.label()))?;
-    backend.suits(&project).map_err(|why| anyhow::anyhow!("{} doesn't suit this project: {why}", backend.label()))?;
-    let stem = format!("{:x}", fnv(project.display().to_string().as_bytes()));
+    backend.suits(&main).map_err(|why| anyhow::anyhow!("{} doesn't suit this project: {why}", backend.label()))?;
+    let stem = format!("{:x}", fnv(format!("{}\n{}", project.id, main.display()).as_bytes()));
     let guard_socket = paths.guard_socket();
-    let prepared = backend.prepare(&Request { paths, project: &project, network, guard_socket: &guard_socket, model }, &stem)?;
+    let guard_path = project.guard_path();
+    let request = Request {
+        paths,
+        project: &main,
+        related: &related,
+        network: project.network,
+        guard_socket: &guard_socket,
+        model: launch.model.clone(),
+        guard_url: &launch.guard_url,
+        guard_path: &guard_path,
+        opencode: &launch.opencode,
+        blocked_programs: &project.blocked_programs,
+    };
+    let mut prepared = backend.prepare(&request, &stem)?;
+    prepared.banner.extend(rules_banner(&related, &project.blocked_programs));
     let script = paths.data.join("sandbox").join(format!("open-{stem}.command"));
-    write_private(&script, launch_script(&project, backend.label(), network, &prepared).as_bytes())?;
+    write_private(&script, launch_script(&main, backend.label(), project.network, &prepared).as_bytes())?;
     #[cfg(unix)]
     std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
     let status = std::process::Command::new("/usr/bin/open").args(["-a", "Terminal"]).arg(&script).status()?;
@@ -198,7 +253,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_script_is_valid_zsh() {
-        if which::which("opencode").is_err() {
+        if crate::opencode::binary().is_none() {
             return;
         }
         let root = std::env::temp_dir().join(format!("superviser-backends-{}", std::process::id()));
@@ -208,7 +263,19 @@ mod tests {
         let backend = backend(Isolation::MacosSandbox);
         assert!(backend.available().is_ok());
         let socket = paths.guard_socket();
-        let request = Request { paths: &paths, project: &project, network: Network::Internet, guard_socket: &socket, model: None };
+        let opencode = serde_json::json!({ "permission": { "webfetch": "deny" } });
+        let request = Request {
+            paths: &paths,
+            project: &project,
+            related: &[],
+            network: Network::Internet,
+            guard_socket: &socket,
+            model: None,
+            guard_url: "http://127.0.0.1:8787",
+            guard_path: "/projects/ab12",
+            opencode: &opencode,
+            blocked_programs: &["ssh".into()],
+        };
         let prepared = backend.prepare(&request, "test").unwrap();
         assert!(prepared.files[0].exists() && prepared.command.contains("sandbox-exec"));
         let script = root.join("open.command");

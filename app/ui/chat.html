@@ -3,20 +3,34 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Chat</title>
+  <title>Agent Superviser Chat</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <div class="chat">
-    <header>
-      <div><strong id="model">No model running</strong> <span class="muted small">· local, through the guard</span></div>
-      <button id="clear">New chat</button>
-    </header>
-    <div class="messages" id="messages"></div>
-    <form class="composer" id="composer">
-      <textarea id="input" placeholder="Ask something… (Enter to send, Shift+Enter for a new line)"></textarea>
-      <button class="primary" id="send" type="submit">Send</button>
-    </form>
+  <div class="chat-app">
+    <aside class="sidebar">
+      <select id="project" title="Project"></select>
+      <button class="primary" id="new-chat">New chat</button>
+      <div class="chat-list" id="chat-list"></div>
+      <div class="sidebar-foot">
+        <button class="link" id="manage">Projects and settings…</button>
+      </div>
+    </aside>
+    <div class="chat">
+      <header>
+        <div class="chat-title"><strong id="title">New chat</strong> <span class="muted small" id="where"></span></div>
+        <span class="muted small"><span id="usage"></span> <span id="model"></span></span>
+      </header>
+      <div class="messages" id="messages"></div>
+      <div class="banner notice" id="notice" hidden></div>
+      <form class="composer" id="composer">
+        <textarea id="input" placeholder="Ask the agent to do something… (Enter to send, Shift+Enter for a new line)"></textarea>
+        <div class="composer-actions">
+          <button class="primary" id="send" type="submit">Send</button>
+          <button class="danger" id="stop" type="button" hidden>Stop</button>
+        </div>
+      </form>
+    </div>
   </div>
   <script src="chat.js"></script>
 </body>

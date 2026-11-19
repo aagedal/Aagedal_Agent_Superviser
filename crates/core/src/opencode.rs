@@ -48,9 +48,14 @@ pub fn config_path() -> Option<PathBuf> {
     ["opencode.jsonc", "opencode.json"].iter().map(|n| dir.join(n)).find(|p| p.exists()).or(Some(dir.join("opencode.json")))
 }
 
-/// `opencode --version`, e.g. `v2.3.0`, if OpenCode is installed.
+/// The OpenCode the app runs: the one bundled with it, else one installed on `PATH`.
+pub fn binary() -> Option<PathBuf> {
+    crate::paths::bundled("opencode").or_else(|| which::which("opencode").ok())
+}
+
+/// `opencode --version`, e.g. `v2.3.0`, of [`binary`].
 pub fn version() -> Option<String> {
-    let out = std::process::Command::new("opencode").arg("--version").output().ok()?;
+    let out = std::process::Command::new(binary()?).arg("--version").output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
@@ -65,30 +70,7 @@ pub fn apply(text: &str, setup: &Setup) -> anyhow::Result<String> {
     let Some(config) = root.object_value() else { bail!("the OpenCode config is not a JSON object") };
     let v2_keys = config.get("providers").is_some();
 
-    let models: serde_json::Map<String, Value> = setup
-        .models
-        .iter()
-        .map(|m| {
-            let limit = json!({ "context": m.context, "output": MAX_OUTPUT.min(m.context / 4) });
-            (m.alias.clone(), json!({ "name": m.name, "limit": limit }))
-        })
-        .collect();
-    let key = format!("{{file:{}}}", setup.api_key_file.display());
-    let provider = if v2_keys {
-        json!({
-            "name": PROVIDER_NAME,
-            "package": "@opencode/ai/providers/openai-compatible",
-            "settings": { "baseURL": setup.base_url, "apiKey": key },
-            "models": models,
-        })
-    } else {
-        json!({
-            "name": PROVIDER_NAME,
-            "npm": "@ai-sdk/openai-compatible",
-            "options": { "baseURL": setup.base_url, "apiKey": key },
-            "models": models,
-        })
-    };
+    let provider = provider(setup, v2_keys);
     let providers = config.object_value_or_set(if v2_keys { "providers" } else { "provider" });
     set(&providers, PROVIDER_ID, provider);
 
@@ -104,6 +86,48 @@ pub fn apply(text: &str, setup: &Setup) -> anyhow::Result<String> {
         }
     }
     Ok(root.to_string())
+}
+
+/// Our provider's entry: the guard's address, the key file and the models, in 2.x's keys or 1.x's.
+pub fn provider(setup: &Setup, v2_keys: bool) -> Value {
+    let models: serde_json::Map<String, Value> = setup
+        .models
+        .iter()
+        .map(|m| {
+            let limit = json!({ "context": m.context, "output": MAX_OUTPUT.min(m.context / 4) });
+            (m.alias.clone(), json!({ "name": m.name, "limit": limit }))
+        })
+        .collect();
+    let key = format!("{{file:{}}}", setup.api_key_file.display());
+    if v2_keys {
+        json!({
+            "name": PROVIDER_NAME,
+            "package": "@opencode/ai/providers/openai-compatible",
+            "settings": { "baseURL": setup.base_url, "apiKey": key },
+            "models": models,
+        })
+    } else {
+        json!({
+            "name": PROVIDER_NAME,
+            "npm": "@ai-sdk/openai-compatible",
+            "options": { "baseURL": setup.base_url, "apiKey": key },
+            "models": models,
+        })
+    }
+}
+
+/// Config (for `OPENCODE_CONFIG_CONTENT`) that makes `setup`'s default model the only one
+/// OpenCode may use: our provider alone, every other provider (and its stored keys) off.
+pub fn only_ours(setup: &Setup) -> Value {
+    let mut config = json!({
+        "provider": { PROVIDER_ID: provider(setup, false) },
+        "enabled_providers": [PROVIDER_ID],
+    });
+    if let Some(default) = &setup.default_model {
+        config["model"] = json!(format!("{PROVIDER_ID}/{default}"));
+        config["small_model"] = config["model"].clone();
+    }
+    config
 }
 
 fn set(object: &CstObject, key: &str, value: Value) {
@@ -156,12 +180,61 @@ pub fn install(setup: &Setup) -> anyhow::Result<Installed> {
         std::fs::write(&path, updated)?;
     }
     let version = version();
+    // Only an OpenCode the user installed runs a background service; the bundled one doesn't.
     let restarted_service = is_v2(version.as_deref())
-        && std::process::Command::new("opencode")
-            .args(["service", "restart"])
-            .output()
-            .is_ok_and(|out| out.status.success());
+        && which::which("opencode").is_ok_and(|installed| {
+            std::process::Command::new(installed).args(["service", "restart"]).output().is_ok_and(|out| out.status.success())
+        });
     Ok(Installed { path, backup, version, restarted_service })
+}
+
+/// An MCP server in the global config, as written there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpServer {
+    pub name: String,
+    entry: Value,
+    /// Listed under 2.x's `mcp.servers` (with `disabled`) rather than 1.x's `mcp` (with `enabled`).
+    v2: bool,
+}
+
+/// The MCP servers in the global config.
+pub fn mcp_servers() -> Vec<McpServer> {
+    config_path().and_then(|p| std::fs::read_to_string(p).ok()).map(|text| parse_mcp(&text)).unwrap_or_default()
+}
+
+/// The MCP servers in config `text`: 1.x's `mcp.<name>` or 2.x's `mcp.servers.<name>`.
+pub fn parse_mcp(text: &str) -> Vec<McpServer> {
+    let Ok(config) = jsonc_parser::parse_to_serde_value::<Value>(text, &ParseOptions::default()) else { return Vec::new() };
+    let Some(mcp) = config.get("mcp").and_then(Value::as_object) else { return Vec::new() };
+    let (servers, v2) = match mcp.get("servers").and_then(Value::as_object) {
+        Some(servers) => (servers, true),
+        None => (mcp, false),
+    };
+    servers
+        .iter()
+        .filter(|(_, entry)| entry.is_object())
+        .map(|(name, entry)| McpServer { name: name.clone(), entry: entry.clone(), v2 })
+        .collect()
+}
+
+/// Config (for `OPENCODE_CONFIG_CONTENT`) that turns `servers` off. OpenCode drops partial
+/// entries, so each is repeated whole with the switch flipped.
+pub fn mcp_off<'a>(servers: impl IntoIterator<Item = &'a McpServer>) -> Value {
+    let (mut v1, mut v2) = (serde_json::Map::new(), serde_json::Map::new());
+    for server in servers {
+        let mut entry = server.entry.clone();
+        if server.v2 {
+            entry["disabled"] = Value::Bool(true);
+            v2.insert(server.name.clone(), entry);
+        } else {
+            entry["enabled"] = Value::Bool(false);
+            v1.insert(server.name.clone(), entry);
+        }
+    }
+    if !v2.is_empty() {
+        v1.insert("servers".into(), Value::Object(v2));
+    }
+    Value::Object(v1)
 }
 
 #[cfg(test)]
@@ -222,6 +295,17 @@ mod tests {
         let twice = apply(&once, &setup()).unwrap();
         assert_eq!(once, twice);
         assert_eq!(parse(&once)["$schema"], "https://opencode.ai/config.json");
+    }
+
+    #[test]
+    fn reads_and_turns_off_mcp_servers() {
+        let v1 = parse_mcp(r#"{ // comment
+            "mcp": { "media": { "type": "local", "command": ["/x"], "enabled": true } } }"#);
+        assert_eq!(v1.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["media"]);
+        assert_eq!(mcp_off(&v1), json!({ "media": { "type": "local", "command": ["/x"], "enabled": false } }));
+        let v2 = parse_mcp(r#"{ "mcp": { "servers": { "docs": { "type": "remote", "url": "https://x" } } } }"#);
+        assert_eq!(mcp_off(&v2), json!({ "servers": { "docs": { "type": "remote", "url": "https://x", "disabled": true } } }));
+        assert!(parse_mcp("{}").is_empty() && parse_mcp("not json").is_empty());
     }
 
     #[test]

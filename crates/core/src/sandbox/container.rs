@@ -4,8 +4,10 @@
 //!
 //! The image (`Containerfile`: Debian, common build tools and OpenCode at the host's
 //! version) is built once per OpenCode version, in the Terminal window, on first launch.
-//! The VM sees the project as `/workspace`, OpenCode's config (read-only) and its own
-//! session state; nothing else of the Mac. OpenCode reaches models through the guard's
+//! The VM sees the main folder as `/workspace`, the project's other folders under
+//! `/folders` (read-only unless the project lets the agent change them), OpenCode's config
+//! (read-only) and its own session state; nothing else of the Mac. Blocked programs are
+//! left to the guard here. OpenCode reaches models through the guard's
 //! Unix socket, which `container` forwards into the VM with its SSH-agent forwarding
 //! (`--ssh` forwards whatever `SSH_AUTH_SOCK` names; the user's own agent is never
 //! forwarded). A relay in the VM turns it back into `127.0.0.1:8787`. Nothing on the Mac
@@ -23,6 +25,7 @@ use crate::paths::write_private;
 use crate::{opencode, secrets};
 
 use super::{Backend, Isolation, Network, Prepared, Request, Setup, shell_quote};
+use crate::project::Folder;
 
 const CONTAINERFILE: &str = include_str!("Containerfile");
 /// Bumped whenever `Containerfile` changes, so images are rebuilt.
@@ -34,7 +37,9 @@ const DEFAULT_OPENCODE: &str = "2.3.0";
 const LOCAL_NETWORK: &str = "superviser-local";
 const HOME: &str = "/home/agent";
 /// Where the relay in the VM serves the guard.
-const GUARD_IN_VM: &str = "http://127.0.0.1:8787/v1";
+const GUARD_IN_VM: &str = "http://127.0.0.1:8787";
+/// Where the project's other folders appear in the VM.
+const FOLDERS_IN_VM: &str = "/folders";
 
 /// The first macOS major version Apple's `container` supports.
 const MIN_MACOS: u32 = 26;
@@ -163,7 +168,10 @@ impl Backend for LinuxVm {
     fn prepare(&self, request: &Request, stem: &str) -> anyhow::Result<Prepared> {
         let model = request.model.clone().context("start a model first: OpenCode in the VM needs one to talk to")?;
         let project = request.project.display().to_string();
-        anyhow::ensure!(!project.contains(':') && !project.contains(','), "the Linux VM can't share a folder whose path has ':' or ','");
+        for folder in std::iter::once(request.project).chain(request.related.iter().map(|f| f.path.as_path())) {
+            let path = folder.display().to_string();
+            anyhow::ensure!(!path.contains(':') && !path.contains(','), "the Linux VM can't share {path}: its path has ':' or ','");
+        }
         let container = which::which("container").context("Apple's container tool isn't installed")?;
         run(&container, &["system", "start", "--enable-kernel-install"])?;
         let network = network_name(&container, request.network)?;
@@ -180,7 +188,7 @@ impl Backend for LinuxVm {
         let key = secrets::local_api_key(request.paths)?;
         write_private(&config.join("guard-key"), key.as_bytes())?;
         let setup = opencode::Setup {
-            base_url: GUARD_IN_VM.into(),
+            base_url: format!("{GUARD_IN_VM}{}/v1", request.guard_path),
             api_key_file: PathBuf::from(format!("{HOME}/.config/opencode/guard-key")),
             models: vec![model.clone()],
             default_model: Some(model.alias),
@@ -194,6 +202,13 @@ impl Backend for LinuxVm {
         let q = |p: &Path| shell_quote(&p.display().to_string());
         let c = q(&container);
         let name = format!("superviser-{stem}");
+        let mounts: String = vm_folders(request.related)
+            .iter()
+            .map(|(folder, target)| {
+                let readonly = if folder.writable { "" } else { ",readonly" };
+                format!(" \\\n  --mount {}", shell_quote(&format!("type=bind,source={},target={target}{readonly}", folder.path.display())))
+            })
+            .collect();
         let command = format!(
             "{c} system start --enable-kernel-install >/dev/null || exit 1\n\
              if ! {c} image inspect {image} >/dev/null 2>&1; then\n\
@@ -202,23 +217,46 @@ impl Backend for LinuxVm {
              fi\n\
              {c} stop {name} >/dev/null 2>&1\n\
              SSH_AUTH_SOCK={socket} exec {c} run --rm -it --ssh --name {name} --network {network} --cpus {cpus} --memory {memory_gib}G \\\n\
-             \x20 --volume {volume} \\\n\
+             \x20 --env OPENCODE_CONFIG_CONTENT={config_content} \\\n\
+             \x20 --volume {volume}{mounts} \\\n\
              \x20 --mount {config_mount} \\\n\
              \x20 --volume {state_volume} \\\n\
              \x20 --workdir /workspace {image}",
             socket = q(request.guard_socket),
             containerfile = q(&context.join("Containerfile")),
             context = q(&context),
+            config_content = shell_quote(&request.opencode.to_string()),
             volume = shell_quote(&format!("{project}:/workspace")),
             config_mount = shell_quote(&format!("type=bind,source={},target={HOME}/.config/opencode,readonly", config.display())),
             state_volume = shell_quote(&format!("{}:{HOME}/.local/share/opencode", state.display())),
         );
+        let mut banner = vec!["OpenCode runs in a Linux VM. Only this folder is shared (as /workspace); the rest of your Mac isn't visible.".into()];
+        banner.extend(vm_folders(request.related).iter().map(|(folder, target)| format!("{} is shared as {target}.", folder.path.display())));
         Ok(Prepared {
-            banner: vec!["OpenCode runs in a Linux VM. Only this folder is shared (as /workspace); the rest of your Mac isn't visible.".into()],
+            banner,
             command,
             files: vec![config.join("opencode.json"), context.join("Containerfile")],
         })
     }
+}
+
+/// Where each of `related` appears in the VM: `/folders/<name>`, numbered when names repeat.
+fn vm_folders(related: &[Folder]) -> Vec<(&Folder, String)> {
+    let mut used: Vec<String> = Vec::new();
+    related
+        .iter()
+        .map(|folder| {
+            let base = folder.path.file_name().map_or("folder".into(), |n| n.to_string_lossy().into_owned());
+            let mut name = base.clone();
+            let mut n = 2;
+            while used.contains(&name) {
+                name = format!("{base}-{n}");
+                n += 1;
+            }
+            used.push(name.clone());
+            (folder, format!("{FOLDERS_IN_VM}/{name}"))
+        })
+        .collect()
 }
 
 /// Runs `container ARGS`, failing with its output.
@@ -272,6 +310,14 @@ mod tests {
         // Markers in dependencies don't count.
         assert!(case("deps", &[("node_modules/x/Podfile", "")]).is_none());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn related_folders_get_distinct_names() {
+        let folder = |p: &str| Folder { path: p.into(), writable: false };
+        let related = [folder("/a/docs"), folder("/b/docs"), folder("/c/api")];
+        let names: Vec<String> = vm_folders(&related).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(names, ["/folders/docs", "/folders/docs-2", "/folders/api"]);
     }
 
     #[test]

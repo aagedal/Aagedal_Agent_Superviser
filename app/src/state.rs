@@ -12,15 +12,15 @@ use superviser_core::discover::{self, Discovery, Locations};
 use superviser_core::hardware::Hardware;
 use superviser_core::installed::{self, InstalledModel, Source};
 use superviser_core::paths::{PROTECTED_NAMES, Paths};
+use superviser_core::project::Project;
 use superviser_core::runtime::{self, LlamaServer, ServerConfig};
 use superviser_core::sandbox::{self, Isolation, Network};
 use superviser_core::{opencode, secrets};
 use superviser_guard::journal::Journal;
 use superviser_guard::selfprotect::SelfProtection;
-use superviser_guard::{CallEvent, GuardServer, Judge, JudgeOptions, ProxyOptions};
+use superviser_guard::{CallEvent, GuardServer, Judge, JudgeOptions, ProjectRules, ProxyOptions};
 
 pub const DEFAULT_GUARD_PORT: u16 = 8787;
-const MAX_RECENT_PROJECTS: usize = 6;
 const MAX_EVENTS: usize = 200;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// Origins of the app's own webviews (macOS/Linux, Windows).
@@ -42,12 +42,18 @@ pub struct Settings {
     /// Offer models other apps already downloaded (LM Studio, Ollama, Hugging Face cache…).
     pub use_other_apps: bool,
     pub last_model: Option<String>,
-    /// Internet access inside the OpenCode sandbox.
-    pub sandbox_network: Network,
-    /// Projects opened in OpenCode, most recent first.
-    pub recent_projects: Vec<String>,
-    /// How each project is isolated, when not the default macOS sandbox.
-    pub project_isolation: HashMap<String, Isolation>,
+    /// Projects, most recently opened first.
+    pub projects: Vec<Project>,
+    /// The first-run guide was finished or skipped.
+    pub setup_done: bool,
+    /// Before projects: internet access for every folder, the folders opened, and how each
+    /// was isolated. Read once to make projects of them, never written.
+    #[serde(skip_serializing)]
+    sandbox_network: Network,
+    #[serde(skip_serializing)]
+    recent_projects: Vec<String>,
+    #[serde(skip_serializing)]
+    project_isolation: HashMap<String, Isolation>,
 }
 
 impl Default for Settings {
@@ -60,10 +66,28 @@ impl Default for Settings {
             configure_opencode: true,
             use_other_apps: true,
             last_model: None,
+            projects: Vec::new(),
+            setup_done: false,
             sandbox_network: Network::default(),
             recent_projects: Vec::new(),
             project_isolation: HashMap::new(),
         }
+    }
+}
+
+impl Settings {
+    /// Makes projects of the folders opened before there were projects.
+    fn migrate(&mut self) {
+        for path in std::mem::take(&mut self.recent_projects) {
+            if self.projects.iter().any(|p| p.main().display().to_string() == path) {
+                continue;
+            }
+            let mut project = Project::new(path.clone().into());
+            project.network = self.sandbox_network;
+            project.isolation = self.project_isolation.get(&path).copied().unwrap_or_default();
+            self.projects.push(project);
+        }
+        self.project_isolation.clear();
     }
 }
 
@@ -106,16 +130,21 @@ pub struct App {
     pub events: Mutex<VecDeque<CallEvent>>,
     /// Models other apps downloaded, from the last scan.
     pub discovery: Mutex<Discovery>,
+    /// The built-in agent's turns in progress.
+    pub chats: crate::agent::Chats,
+    /// OpenCode, run headless for the chat window, by project.
+    pub engines: crate::acp::Engines,
 }
 
 impl App {
     pub fn new() -> anyhow::Result<Self> {
         let paths = Paths::new()?;
         superviser_core::paths::private_dir(&paths.data)?;
-        let settings = std::fs::read_to_string(paths.settings())
+        let mut settings: Settings = std::fs::read_to_string(paths.settings())
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
+        settings.migrate();
         Ok(Self {
             hardware: Hardware::detect(),
             catalog: Catalog::bundled(),
@@ -128,6 +157,8 @@ impl App {
             downloads: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             discovery: Mutex::new(Discovery::default()),
+            chats: crate::agent::Chats::default(),
+            engines: crate::acp::Engines::default(),
             paths,
         })
     }
@@ -307,7 +338,26 @@ impl App {
             tracing::warn!("guard socket {}: {e}", self.paths.guard_socket().display());
         }
         *self.guard.lock().unwrap() = Some(server);
+        self.sync_projects();
         Ok(())
+    }
+
+    /// Gives the guard every project's rules.
+    pub fn sync_projects(&self) {
+        let rules = self
+            .settings
+            .lock()
+            .unwrap()
+            .projects
+            .iter()
+            .map(|p| {
+                let rules = ProjectRules { name: p.name.clone(), allowed_hosts: p.allowed_hosts.clone(), blocked_tools: p.blocked_tools(), blocked_programs: p.blocked_programs.clone() };
+                (p.id.clone(), rules)
+            })
+            .collect();
+        if let Some(guard) = self.guard.lock().unwrap().as_ref() {
+            guard.set_projects(rules);
+        }
     }
 
     pub fn guard_url(&self) -> Option<String> {
@@ -449,33 +499,77 @@ impl App {
         opencode::install(&setup)
     }
 
-    /// How `project` is isolated: its saved choice, or the macOS sandbox.
-    pub fn isolation(&self, project: &std::path::Path) -> Isolation {
-        self.settings.lock().unwrap().project_isolation.get(&project.display().to_string()).copied().unwrap_or_default()
+    pub fn project(&self, id: &str) -> Option<Project> {
+        self.settings.lock().unwrap().projects.iter().find(|p| p.id == id).cloned()
     }
 
-    /// Opens `project` in OpenCode, in a new Terminal window, isolated as chosen for it.
+    /// Adds `project`, or replaces the one with its id, and gives the guard its rules.
+    pub fn save_project(&self, project: Project) -> anyhow::Result<Project> {
+        let project = project.normalized()?;
+        let choice = sandbox::choices(project.main()).into_iter().find(|c| c.isolation == project.isolation);
+        if let Some(why) = choice.and_then(|c| c.unavailable) {
+            bail!("{why}");
+        }
+        {
+            let mut settings = self.settings.lock().unwrap();
+            match settings.projects.iter_mut().find(|p| p.id == project.id) {
+                Some(existing) => *existing = project.clone(),
+                None => settings.projects.insert(0, project.clone()),
+            }
+        }
+        self.save_settings()?;
+        self.sync_projects();
+        Ok(project)
+    }
+
+    pub fn delete_project(&self, id: &str) -> anyhow::Result<()> {
+        self.settings.lock().unwrap().projects.retain(|p| p.id != id);
+        superviser_core::agent::Chat::delete_all(&self.paths, id);
+        self.save_settings()?;
+        self.sync_projects();
+        Ok(())
+    }
+
+    /// The project whose main folder is `folder`, made if there is none.
+    pub fn project_for_folder(&self, folder: &std::path::Path) -> anyhow::Result<Project> {
+        let existing = self.settings.lock().unwrap().projects.iter().find(|p| p.main() == folder).cloned();
+        match existing {
+            Some(project) => Ok(project),
+            None => self.save_project(Project::new(folder.to_path_buf())),
+        }
+    }
+
+    /// Opens a project in OpenCode, in a new Terminal window, isolated and limited as it says.
     /// OpenCode's config is refreshed first so it talks to the guard about the running model.
-    pub fn open_project(&self, project: &std::path::Path) -> anyhow::Result<sandbox::Launched> {
+    pub fn open_project(&self, id: &str) -> anyhow::Result<sandbox::Launched> {
+        let project = self.project(id).context("that project no longer exists")?;
         if self.running_model().is_none() {
             bail!("Start a model first: OpenCode would have nothing to talk to.");
         }
         self.setup_opencode()?;
-        let network = self.settings.lock().unwrap().sandbox_network;
+        let guard_url = self.guard_url().context("the guard is not running")?;
         let model = self.running_model().map(|(m, context)| opencode::SetupModel { alias: m.alias, name: m.model.name, context });
-        let launched = sandbox::launch(&self.paths, project, self.isolation(project), network, model)?;
+        let launch = sandbox::Launch {
+            project: &project,
+            model,
+            guard_url: guard_url.trim_end_matches("/v1").to_string(),
+            opencode: project.opencode_config(&opencode::mcp_servers()),
+        };
+        let launched = sandbox::launch(&self.paths, &launch)?;
+        // Most recently opened first.
         {
             let mut settings = self.settings.lock().unwrap();
-            let path = project.display().to_string();
-            settings.recent_projects.retain(|p| *p != path);
-            settings.recent_projects.insert(0, path);
-            settings.recent_projects.truncate(MAX_RECENT_PROJECTS);
+            if let Some(index) = settings.projects.iter().position(|p| p.id == id) {
+                let project = settings.projects.remove(index);
+                settings.projects.insert(0, project);
+            }
         }
         self.save_settings()?;
         Ok(launched)
     }
 
     pub fn shutdown(&self) {
+        self.engines.stop_all();
         if let Ok(mut running) = self.running.try_lock()
             && let Some(mut running) = running.take()
         {

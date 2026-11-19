@@ -61,6 +61,18 @@ impl Paths {
     }
 }
 
+/// A program bundled with the app (Tauri puts them beside its executable, in the `.app`'s
+/// `Contents/MacOS` and in `target/<profile>` when developing).
+pub fn bundled(name: &str) -> Option<PathBuf> {
+    let program = bundled_dir()?.join(name);
+    program.is_file().then_some(program)
+}
+
+/// The folder the app's executable and its bundled programs are in.
+pub fn bundled_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok()?.parent().map(Path::to_path_buf)
+}
+
 /// Creates `dir` (and parents) readable by the owner only.
 pub fn private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
