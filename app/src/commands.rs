@@ -13,7 +13,7 @@ use superviser_core::{opencode, secrets};
 use superviser_guard::CallEvent;
 use tauri::{AppHandle, Emitter, State};
 
-use crate::state::{App, ServerStatus};
+use crate::state::{App, JudgeStatus, ServerStatus};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -28,6 +28,8 @@ fn hub() -> Hub {
 #[derive(Serialize)]
 pub struct Overview {
     hardware: Hardware,
+    /// What a model may take now: less while the judge is on.
+    model_budget: u64,
     status: ServerStatus,
     guard_url: Option<String>,
     opencode_version: Option<String>,
@@ -39,6 +41,7 @@ pub struct Overview {
 pub fn overview(app: State<'_, Arc<App>>) -> Overview {
     Overview {
         hardware: app.hardware.clone(),
+        model_budget: app.model_hardware().model_budget,
         status: app.status.lock().unwrap().clone(),
         guard_url: app.guard_url(),
         opencode_version: opencode::version(),
@@ -56,7 +59,7 @@ pub struct Offers {
 
 #[tauri::command]
 pub fn catalog_offers(app: State<'_, Arc<App>>) -> Offers {
-    let offers = app.catalog.offers(&app.hardware);
+    let offers = app.catalog.offers(&app.model_hardware());
     Offers { hidden: app.catalog.models.len() - offers.len(), offers }
 }
 
@@ -78,6 +81,9 @@ pub async fn check_model(app: State<'_, Arc<App>>, repo: String) -> Result<Check
     let model = CatalogModel::resolve(&hub(), &repo, None, "").await.map_err(|e| format!("{e:#}"))?;
     Ok(Checked { fit: app.fit(&model), model })
 }
+
+/// The download id of the judge's model.
+const JUDGE_DOWNLOAD: &str = "judge";
 
 #[derive(Clone, Serialize)]
 struct DownloadEvent {
@@ -260,17 +266,80 @@ pub fn setup_opencode(app: State<'_, Arc<App>>) -> Result<opencode::Installed> {
 pub struct JudgeSettings {
     enabled: bool,
     fail_closed: bool,
+    /// The judge's model; `None` when this version has none.
+    model: Option<CatalogModel>,
+    /// Memory it takes while it runs.
+    memory: u64,
+    installed: bool,
+    /// False when it doesn't fit beside even the smallest model.
+    fits: bool,
+    status: JudgeStatus,
+    /// Its download id, for progress events.
+    download: &'static str,
 }
 
 #[tauri::command]
 pub fn judge_settings(app: State<'_, Arc<App>>) -> JudgeSettings {
-    let settings = app.settings.lock().unwrap();
-    JudgeSettings { enabled: settings.judge, fail_closed: settings.judge_fail_closed }
+    let (enabled, fail_closed) = {
+        let settings = app.settings.lock().unwrap();
+        (settings.judge, settings.judge_fail_closed)
+    };
+    JudgeSettings {
+        enabled,
+        fail_closed,
+        memory: app.catalog.judge.as_ref().map_or(0, CatalogModel::judge_required),
+        model: app.catalog.judge.clone(),
+        installed: app.judge_installed().is_some(),
+        fits: app.judge_fits(),
+        status: app.judge_status.lock().unwrap().clone(),
+        download: JUDGE_DOWNLOAD,
+    }
 }
 
 #[tauri::command]
-pub fn set_judge(app: State<'_, Arc<App>>, enabled: bool, fail_closed: bool) -> Result<()> {
-    app.set_judge(enabled, fail_closed).map_err(err)
+pub async fn set_judge(handle: AppHandle, app: State<'_, Arc<App>>, enabled: bool, fail_closed: bool) -> Result<()> {
+    let result = app.set_judge(enabled, fail_closed).await.map_err(|e| format!("{e:#}"));
+    // What fits, and so what Settings offers, changed.
+    crate::refresh_tray(&handle);
+    let _ = handle.emit("judge", ());
+    result
+}
+
+/// Downloads the judge's model, then starts it if the judge is on and a model runs.
+#[tauri::command]
+pub fn download_judge(handle: AppHandle, app: State<'_, Arc<App>>) -> Result<()> {
+    let model = app.catalog.judge.clone().ok_or("this version has no judge model")?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut downloads = app.downloads.lock().unwrap();
+        if downloads.contains_key(JUDGE_DOWNLOAD) {
+            return Err("already downloading".into());
+        }
+        downloads.insert(JUDGE_DOWNLOAD.into(), cancel.clone());
+    }
+    let app = app.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let mut last = std::time::Instant::now();
+        let dir = installed::judge_dir(&app.paths, &model);
+        let result = installed::install_to(&hub(), &dir, &model, cancel, |p| {
+            if last.elapsed().as_millis() >= 250 || p.done == p.total {
+                last = std::time::Instant::now();
+                let _ = handle.emit("download", DownloadEvent { id: JUDGE_DOWNLOAD.into(), done: p.done, total: p.total, finished: false, error: None });
+            }
+        })
+        .await;
+        app.downloads.lock().unwrap().remove(JUDGE_DOWNLOAD);
+        let (finished, error) = match result {
+            Ok(_) => (true, None),
+            Err(e) => (false, Some(format!("{e:#}"))),
+        };
+        let _ = handle.emit("download", DownloadEvent { id: JUDGE_DOWNLOAD.into(), done: 0, total: 0, finished, error });
+        if finished {
+            app.sync_judge().await;
+        }
+        let _ = handle.emit("judge", ());
+    });
+    Ok(())
 }
 
 #[tauri::command]

@@ -139,9 +139,30 @@ pub async fn install(
     paths: &Paths,
     model: &CatalogModel,
     cancel: Arc<AtomicBool>,
+    progress: impl FnMut(Progress),
+) -> anyhow::Result<InstalledModel> {
+    install_to(hub, &model_dir(paths, model), model, cancel, progress).await
+}
+
+/// The judge's model: kept in its own folder, so it isn't listed with the chat models.
+pub fn judge_dir(paths: &Paths, model: &CatalogModel) -> PathBuf {
+    paths.judge_model().join(sanitize(&model_id(model)))
+}
+
+/// The judge's model, if this version of it is downloaded.
+pub fn find_judge(paths: &Paths, model: &CatalogModel) -> Option<InstalledModel> {
+    read_manifest(&judge_dir(paths, model).join(MANIFEST)).ok().filter(|m| m.model.revision == model.revision)
+}
+
+/// [`install`] into `dir`.
+pub async fn install_to(
+    hub: &Hub,
+    dir: &Path,
+    model: &CatalogModel,
+    cancel: Arc<AtomicBool>,
     mut progress: impl FnMut(Progress),
 ) -> anyhow::Result<InstalledModel> {
-    let dir = model_dir(paths, model);
+    let dir = dir.to_path_buf();
     let total = model.quant.size;
     let mut finished = 0u64;
     for file in &model.quant.files {

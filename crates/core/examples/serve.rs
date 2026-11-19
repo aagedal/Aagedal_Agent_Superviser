@@ -8,7 +8,7 @@ use std::time::Duration;
 use superviser_core::paths::Paths;
 use superviser_core::runtime::{self, LlamaServer, ServerConfig};
 use superviser_core::{installed, secrets};
-use superviser_guard::{CallEvent, Config, GuardServer, JudgeOptions, ProxyOptions};
+use superviser_guard::{CallEvent, Config, GuardServer, ProxyOptions};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,6 +26,7 @@ async fn main() -> anyhow::Result<()> {
         api_key_file: paths.upstream_api_key(),
         log_file: paths.logs().join("llama-server.log"),
         prompt_cache: 2 << 30,
+        decision: false,
     })
     .await?;
     server.wait_ready(Duration::from_secs(120)).await?;
@@ -37,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
         api_key: Some(client_key),
         upstream_api_key: Some(secrets::upstream_api_key(&paths)?),
         cors_origins: vec![],
-        judge: Some(JudgeOptions::default()),
+        judge: None,
     };
     let guard = GuardServer::start(tokio::net::TcpListener::bind(("127.0.0.1", port)).await?, config, options).await?;
     guard.set_upstream(Some(server.base_url()));

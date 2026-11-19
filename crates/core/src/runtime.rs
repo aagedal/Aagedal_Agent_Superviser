@@ -21,6 +21,8 @@ pub struct ServerConfig {
     pub log_file: PathBuf,
     /// Bytes of RAM for saved conversations; llama-server's own default is 8 GiB.
     pub prompt_cache: u64,
+    /// A decision model reads its whole input in one batch: `context` tokens.
+    pub decision: bool,
 }
 
 pub struct LlamaServer {
@@ -51,7 +53,7 @@ pub fn free_port() -> std::io::Result<u16> {
 }
 
 pub fn args(config: &ServerConfig) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "--model".into(),
         config.model_path.display().to_string(),
         "--alias".into(),
@@ -71,7 +73,13 @@ pub fn args(config: &ServerConfig) -> Vec<String> {
         "--no-webui".into(),
         "--api-key-file".into(),
         config.api_key_file.display().to_string(),
-    ]
+    ];
+    if config.decision {
+        for flag in ["--batch-size", "--ubatch-size"] {
+            args.extend([flag.to_string(), config.context.to_string()]);
+        }
+    }
+    args
 }
 
 impl LlamaServer {
@@ -140,7 +148,11 @@ mod tests {
             api_key_file: "/k/key".into(),
             log_file: "/l/log".into(),
             prompt_cache: 1536 << 20,
+            decision: false,
         };
+        assert!(!args(&config).iter().any(|a| a == "--ubatch-size"));
+        let decision = args(&ServerConfig { decision: true, ..config.clone() });
+        assert!(decision.windows(2).any(|w| w == ["--ubatch-size", "32768"]));
         let args = args(&config);
         assert!(args.windows(2).any(|w| w == ["--api-key-file", "/k/key"]));
         assert!(!args.iter().any(|a| a == "--api-key"));

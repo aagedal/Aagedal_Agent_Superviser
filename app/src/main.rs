@@ -82,6 +82,7 @@ fn main() {
             commands::recent_calls,
             commands::judge_settings,
             commands::set_judge,
+            commands::download_judge,
             commands::open_window,
             commands::sandbox_info,
             commands::set_sandbox_network,

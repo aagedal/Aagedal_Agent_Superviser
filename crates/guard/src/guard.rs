@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 use superviser_scan::{Scanner, Severity, Signal};
 
 use crate::journal::Journal;
-use crate::judge::{Judge, MAX_TASK};
+use crate::judge::Judge;
 use crate::policy::{DEFAULT_ALLOWED_HOSTS, Policy};
 use crate::selfprotect::SelfProtection;
 
@@ -143,6 +143,9 @@ pub fn summary(args: &str) -> String {
         text
     }
 }
+
+/// User turns kept for the judge and the journal, in characters.
+const MAX_TASK: usize = 6000;
 
 /// The text of user turns, for the judge and the journal: no system prompt (long and
 /// generic in most harnesses), tool results or agent turns. Keeps the end when long, as the
@@ -335,23 +338,20 @@ mod tests {
         assert!(guard.allow("bash", r#"{"command": "cat ~/.codex/sessions/x.jsonl"}"#).await);
     }
 
-    /// A model server that answers every judge request with `verdict`, or fails.
-    async fn judge_server(verdict: Option<&'static str>) -> Judge {
+    /// A decision model that answers every judge request with P(block) `p`, or fails.
+    async fn judge_server(p: Option<f64>) -> Judge {
         use axum::http::StatusCode;
         use axum::response::IntoResponse;
         let app = axum::Router::new().fallback(move || async move {
-            match verdict {
-                Some(v) => {
-                    let content = format!(r#"{{"verdict":"{v}","reason":"the task is about the web app"}}"#);
-                    axum::Json(serde_json::json!({"choices": [{"message": {"content": content}}]})).into_response()
-                }
+            match p {
+                Some(p) => axum::Json(serde_json::json!({"answers": {"block": {"type": "noul", "noul": p}}})).into_response(),
                 None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        Judge::new(reqwest::Client::new(), &format!("http://{addr}"), None, "m", JudgeOptions::default())
+        Judge::new(reqwest::Client::new(), &format!("http://{addr}"), None, JudgeOptions::default())
     }
 
     const HISTORY: &str = r#"{"command": "ls ~/.claude/projects/"}"#;
@@ -359,13 +359,13 @@ mod tests {
     #[tokio::test]
     async fn judge_decides_suspicious_calls() {
         let config = Arc::new(Config::default());
-        let mut blocked = Guard::new(bash_request("fix the CSS"), config.clone()).with_judge(judge_server(Some("block")).await);
+        let mut blocked = Guard::new(bash_request("fix the CSS"), config.clone()).with_judge(judge_server(Some(0.97)).await);
         let review = blocked.review("bash", HISTORY).await;
         assert_eq!(review.verdict(), Verdict::Blocked);
-        assert_eq!(review.reason.unwrap(), "side_channel.agent_history_probe (medium); judge: the task is about the web app");
-        assert_eq!(review.judge.unwrap(), "block: the task is about the web app");
+        assert_eq!(review.reason.unwrap(), "side_channel.agent_history_probe (medium); judge: 97% likely the task doesn't need it");
+        assert_eq!(review.judge.unwrap(), "block: 97% likely the task doesn't need it");
 
-        let mut allowed = Guard::new(bash_request("fix the CSS"), config).with_judge(judge_server(Some("allow")).await);
+        let mut allowed = Guard::new(bash_request("fix the CSS"), config).with_judge(judge_server(Some(0.4)).await);
         let review = allowed.review("bash", HISTORY).await;
         assert_eq!(review.verdict(), Verdict::Suspicious);
         assert!(review.judge.unwrap().starts_with("allow: "));
@@ -374,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn judge_is_not_asked_about_clean_or_blocked_calls() {
         // A judge that would block everything: clean calls still pass, blocked ones keep their reason.
-        let mut guard = Guard::new(bash_request("hi"), Arc::new(Config::default())).with_judge(judge_server(Some("block")).await);
+        let mut guard = Guard::new(bash_request("hi"), Arc::new(Config::default())).with_judge(judge_server(Some(1.0)).await);
         assert_eq!(guard.review("bash", r#"{"command": "ls"}"#).await, Review::default());
         assert_eq!(guard.review("shell", "{}").await.judge, None);
     }

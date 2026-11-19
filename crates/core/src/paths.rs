@@ -27,6 +27,10 @@ impl Paths {
     pub fn models(&self) -> PathBuf {
         self.data.join("models")
     }
+    /// The judge's model, apart from the chat models so it is never offered as one.
+    pub fn judge_model(&self) -> PathBuf {
+        self.data.join("judge")
+    }
     pub fn journal(&self) -> PathBuf {
         self.data.join("guard").join("calls.jsonl")
     }

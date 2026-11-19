@@ -40,6 +40,11 @@ impl Hardware {
             arch: std::env::consts::ARCH,
         }
     }
+
+    /// The budgets left once `bytes` go to something else running beside the model.
+    pub fn less(&self, bytes: u64) -> Self {
+        Self { model_budget: self.model_budget.saturating_sub(bytes), ram_budget: self.ram_budget.saturating_sub(bytes), ..self.clone() }
+    }
 }
 
 /// On Apple Silicon, Metal may wire about two thirds of memory up to 36 GB and three quarters
@@ -87,6 +92,14 @@ mod tests {
         assert_eq!(ram_budget(16 * GIB, true), 12 * GIB);
         assert_eq!(ram_budget(8 * GIB, true), 4 * GIB);
         assert_eq!(ram_budget(32 * GIB, false), 28 * GIB);
+    }
+
+    #[test]
+    fn less_takes_from_both_budgets() {
+        let hardware = Hardware { total_memory: 16 * GIB, model_budget: 10 * GIB, ram_budget: 12 * GIB, unified_memory: true, os: "macos", arch: "aarch64" };
+        let left = hardware.less(5 * GIB);
+        assert_eq!((left.model_budget, left.ram_budget, left.total_memory), (5 * GIB, 7 * GIB, 16 * GIB));
+        assert_eq!(hardware.less(20 * GIB).model_budget, 0);
     }
 
     #[test]

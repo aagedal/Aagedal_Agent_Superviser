@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
         api_key_file: paths.upstream_api_key(),
         log_file: paths.logs().join("llama-server.log"),
         prompt_cache: 0,
+        decision: false,
     })
     .await?;
     server.wait_ready(Duration::from_secs(120)).await?;

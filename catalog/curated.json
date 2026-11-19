@@ -217,5 +217,26 @@
         "size": 62768723552
       }
     }
-  ]
+  ],
+  "judge": {
+    "repo": "ggml-org/vllm-d3-mini-GGUF",
+    "revision": "8b29fd3b87373ea85fa59cc2f26251c1591d771a",
+    "name": "d3-mini",
+    "description": "A decision model built on Qwen3.5 4B (Apache-2.0).",
+    "arch": "qwen35",
+    "context_length": 262144,
+    "kv_bytes_per_token": 32768,
+    "kv_fixed_bytes": 0,
+    "quant": {
+      "label": "Q4_K_M",
+      "files": [
+        {
+          "path": "vllm-d3-mini-Q4_K_M.gguf",
+          "size": 3707523584,
+          "sha256": "1e5e5a87dd6903b6d8585331eee94a2f01d5069e369b143e1dceb9de51ba2902"
+        }
+      ],
+      "size": 3707523584
+    }
+  }
 }

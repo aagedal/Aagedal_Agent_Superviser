@@ -1,12 +1,13 @@
-//! Asks a model, run the way the app runs it, to judge a few WARN calls, and prints what it
-//! decided and how long that took.
+//! Asks the judge's decision model, run the way the app runs it, about a few WARN calls, and
+//! prints what it decided and how long that took.
 //!
-//! cargo run -p superviser-core --example judge -- /path/to/model.gguf /tmp/superviser-judge
+//! cargo run -p superviser-core --example judge -- /path/to/vllm-d3-mini-Q4_K_M.gguf /tmp/superviser-judge
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
+use superviser_core::catalog::JUDGE_CONTEXT;
 use superviser_core::runtime::{self, LlamaServer, ServerConfig};
 use superviser_guard::{Config, Guard, Judge, JudgeOptions};
 
@@ -42,18 +43,19 @@ async fn main() -> anyhow::Result<()> {
     let mut server = LlamaServer::start(ServerConfig {
         binary: runtime::find_llama_server().expect("llama-server"),
         model_path: model_path.into(),
-        alias: "model".into(),
-        context: 16384,
+        alias: "judge".into(),
+        context: JUDGE_CONTEXT,
         port: runtime::free_port()?,
         api_key_file: dir.join("key"),
         log_file: dir.join("llama-server.log"),
-        prompt_cache: 2 << 30,
+        prompt_cache: 0,
+        decision: true,
     })
     .await?;
     server.wait_ready(Duration::from_secs(300)).await?;
 
     let config = Arc::new(Config::default());
-    let judge = Judge::new(reqwest::Client::new(), &server.base_url(), Some(key.into()), "model", JudgeOptions::default());
+    let judge = Judge::new(reqwest::Client::new(), &server.base_url(), Some(key.into()), JudgeOptions::default());
     let mut agreed = 0;
     for (task, command, expected) in CASES {
         let request = json!({

@@ -1,7 +1,7 @@
 //! The HTTP side: forwards every request to the upstream model server and guards model
 //! responses on the way back. Port of safeagents' `proxy.py`, plus what an app needs:
 //! a key harnesses must present, a separate key for the upstream, an upstream that can
-//! change while running, CORS for the app's own chat window, and the upstream model as the
+//! change while running, CORS for the app's own chat window, and a decision model as the
 //! judge of suspicious calls.
 
 use std::net::SocketAddr;
@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use crate::guard::{Config, Guard};
-use crate::judge::{Judge, JudgeOptions};
+use crate::judge::Judge;
 use crate::rewrite::{SseRewriter, guard_response};
 
 /// Request headers not forwarded upstream; `accept-encoding` becomes `identity` so
@@ -36,8 +36,8 @@ pub struct ProxyOptions {
     pub upstream_api_key: Option<String>,
     /// Origins allowed to call from a browser (the app's webviews).
     pub cors_origins: Vec<String>,
-    /// Ask the upstream model about suspicious calls; `None` only logs them.
-    pub judge: Option<JudgeOptions>,
+    /// Asked about suspicious calls; `None` only logs them.
+    pub judge: Option<Judge>,
 }
 
 struct AppState {
@@ -45,7 +45,7 @@ struct AppState {
     options: ProxyOptions,
     api_key: RwLock<Option<String>>,
     upstream: RwLock<Option<String>>,
-    judge: RwLock<Option<JudgeOptions>>,
+    judge: RwLock<Option<Judge>>,
     client: reqwest::Client,
 }
 
@@ -85,7 +85,7 @@ impl GuardServer {
             .build()
             .map_err(std::io::Error::other)?;
         let api_key = RwLock::new(options.api_key.clone());
-        let judge = RwLock::new(options.judge);
+        let judge = RwLock::new(options.judge.clone());
         let state = Arc::new(AppState { config: Arc::new(config), options, api_key, upstream: RwLock::new(None), judge, client });
         let shutdown = serve(listener, state.clone());
         Ok(Self { addr, state, shutdown: Some(shutdown), unix: std::sync::Mutex::new(None) })
@@ -122,8 +122,8 @@ impl GuardServer {
         *self.state.api_key.write().unwrap() = key;
     }
 
-    /// Turns the judge on (with these options) or off, for requests from now on.
-    pub fn set_judge(&self, judge: Option<JudgeOptions>) {
+    /// Sets the judge (or none), for requests from now on.
+    pub fn set_judge(&self, judge: Option<Judge>) {
         *self.state.judge.write().unwrap() = judge;
     }
 
@@ -197,13 +197,8 @@ async fn forward_inner(state: &Arc<AppState>, request: Request) -> Response {
 
     // Only JSON object bodies with messages are model calls worth guarding.
     let request_json = serde_json::from_slice::<Value>(&body).ok().filter(Value::is_object);
-    let judge_options = *state.judge.read().unwrap();
+    let judge = state.judge.read().unwrap().clone();
     let guard = request_json.map(|r| {
-        // The judge is the model this request is for, asked in a conversation of its own.
-        let judge = judge_options.map(|options| {
-            let model = r.get("model").and_then(Value::as_str).unwrap_or("judge");
-            Judge::new(state.client.clone(), &upstream, state.options.upstream_api_key.clone(), model, options)
-        });
         let guard = Guard::new(r, state.config.clone());
         match judge {
             Some(judge) => guard.with_judge(judge),
@@ -300,6 +295,7 @@ async fn forward_inner(state: &Arc<AppState>, request: Request) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::judge::JudgeOptions;
 
     async fn fake_upstream(reply: &'static str, content_type: &'static str) -> String {
         let app = axum::Router::new().fallback(move |headers: HeaderMap| async move {
@@ -378,25 +374,20 @@ mod tests {
         assert!(text.ends_with("data: [DONE]\n\n"));
     }
 
-    /// A WARN call in a stream goes to the upstream model as judge, with the upstream key,
-    /// and is replaced when the judge blocks it.
+    /// A WARN call in a stream goes to the judge, and is replaced when the judge blocks it.
     #[tokio::test]
-    async fn upstream_model_judges_suspicious_calls() {
+    async fn judge_decides_suspicious_calls_in_streams() {
         let agent_reply = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls ~/.claude/projects/\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
-        let app = axum::Router::new().fallback(move |headers: HeaderMap, body: String| async move {
-            assert_eq!(headers[header::AUTHORIZATION], "Bearer upstream-key");
+        let server = guard_server(Some(fake_upstream(agent_reply, "text/event-stream").await)).await;
+        let judge_app = axum::Router::new().fallback(|headers: HeaderMap, body: String| async move {
+            assert_eq!(headers[header::AUTHORIZATION], "Bearer judge-key");
             let body: Value = serde_json::from_str(&body).unwrap();
-            if body["messages"][0]["content"] == crate::judge::SYSTEM {
-                assert_eq!(body["model"], "m");
-                let content = r#"{"verdict":"block","reason":"the user asked for a greeting"}"#;
-                return axum::Json(json!({"choices": [{"message": {"content": content}}]})).into_response();
-            }
-            ([(header::CONTENT_TYPE, "text/event-stream")], agent_reply).into_response()
+            assert!(body["state"].as_str().unwrap().contains("ls ~/.claude/projects/"));
+            axum::Json(json!({"answers": {"block": {"type": "noul", "noul": 0.95}}}))
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let server = guard_server(Some(upstream)).await;
+        let judge_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, judge_app).await.unwrap() });
         let send = || async {
             reqwest::Client::new()
                 .post(format!("http://{}/v1/chat/completions", server.addr))
@@ -411,9 +402,9 @@ mod tests {
         };
         // Off by default: the call runs.
         assert!(send().await.contains("~/.claude/projects/"));
-        server.set_judge(Some(JudgeOptions::default()));
+        server.set_judge(Some(Judge::new(reqwest::Client::new(), &judge_url, Some("judge-key".into()), JudgeOptions::default())));
         let text = send().await;
-        assert!(text.contains("judge: the user asked for a greeting"), "{text}");
+        assert!(text.contains("judge: 95% likely the task doesn't need it"), "{text}");
         assert!(text.contains(r#""finish_reason":"stop""#), "{text}");
         assert!(!text.contains(r#""tool_calls":[{"#), "{text}");
     }
