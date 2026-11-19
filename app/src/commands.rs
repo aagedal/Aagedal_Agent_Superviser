@@ -480,7 +480,7 @@ fn project(app: &App, id: &str) -> Result<superviser_core::project::Project> {
 pub async fn acp_sessions(handle: AppHandle, app: State<'_, Arc<App>>, project: String) -> Result<serde_json::Value> {
     let project = self::project(&app, &project)?;
     let engine = app.engines.get(&handle, &app, &project).await.map_err(|e| format!("{e:#}"))?;
-    engine.sessions(&project.main().display().to_string()).await.map_err(|e| format!("{e:#}"))
+    engine.sessions().await.map_err(|e| format!("{e:#}"))
 }
 
 #[derive(Serialize)]
@@ -497,11 +497,11 @@ pub async fn acp_open(handle: AppHandle, app: State<'_, Arc<App>>, project: Stri
     let session = match session {
         Some(session) => {
             if !engine.is_busy(&session) {
-                engine.load_session(&project, &session).await.map_err(|e| format!("{e:#}"))?;
+                engine.load_session(&session).await.map_err(|e| format!("{e:#}"))?;
             }
             session
         }
-        None => engine.new_session(&project).await.map_err(|e| format!("{e:#}"))?,
+        None => engine.new_session().await.map_err(|e| format!("{e:#}"))?,
     };
     Ok(Opened { busy: engine.is_busy(&session), session })
 }

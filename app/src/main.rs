@@ -200,13 +200,14 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
     let opencode = MenuItem::with_id(handle, "opencode", "Set Up OpenCode", matches!(status, ServerStatus::Running { .. }), None::<&str>)?;
     let running = matches!(status, ServerStatus::Running { .. });
     let projects = app.settings.lock().unwrap().projects.clone();
-    // The built-in agent for projects in the macOS sandbox; OpenCode for the Linux VM.
+    // The chat; it runs Linux VM projects with OpenCode, so without it they open in Terminal.
+    let chat_in_vm = superviser_core::opencode::binary().is_some();
     let chat_items: Vec<MenuItem<tauri::Wry>> = projects
         .iter()
         .take(MAX_TRAY_PROJECTS)
         .map(|p| match p.isolation {
-            Isolation::MacosSandbox => MenuItem::with_id(handle, format!("chat:{}", p.id), &p.name, true, None::<&str>),
-            Isolation::LinuxVm => MenuItem::with_id(handle, format!("project:{}", p.id), format!("{} (OpenCode, Linux VM)", p.name), running, None::<&str>),
+            Isolation::LinuxVm if !chat_in_vm => MenuItem::with_id(handle, format!("project:{}", p.id), format!("{} (OpenCode, Linux VM)", p.name), running, None::<&str>),
+            _ => MenuItem::with_id(handle, format!("chat:{}", p.id), &p.name, true, None::<&str>),
         })
         .collect::<tauri::Result<_>>()?;
     let opencode_items: Vec<MenuItem<tauri::Wry>> = projects

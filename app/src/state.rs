@@ -178,6 +178,8 @@ impl App {
         superviser_core::paths::private_dir(&paths.data)?;
         // Model servers a killed or crashed earlier run left behind.
         runtime::stop_leftovers(&paths.run(), &paths.upstream_api_key().display().to_string());
+        // And the chat's Linux VMs; `container` can be slow to answer, so not in the way.
+        std::thread::spawn(superviser_core::sandbox::container::stop_chat_leftovers);
         let mut settings: Settings = std::fs::read_to_string(paths.settings())
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())

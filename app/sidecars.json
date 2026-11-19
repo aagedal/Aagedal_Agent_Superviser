@@ -1,5 +1,5 @@
 {
-  "_comment": "Programs bundled with the app, pinned by SHA-256. build.rs downloads the ones for the build target into binaries/ (Tauri's externalBin) when missing. OpenCode is MIT, ripgrep MIT or Unlicense; see NOTICE.md.",
+  "_comment": "Programs bundled with the app, pinned by SHA-256. build.rs downloads the ones for the build target into binaries/ when missing: a single program becomes a Tauri externalBin; one with a `folder` is copied there with the libraries it links (a Tauri resource). OpenCode is MIT, ripgrep MIT or Unlicense, llama.cpp MIT; see NOTICE.md.",
   "opencode": {
     "version": "2.3.2",
     "aarch64-apple-darwin": {
@@ -24,6 +24,20 @@
       "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-apple-darwin.tar.gz",
       "sha256": "64811cb24e77cac3057d6c40b63ac9becf9082eedd54ca411b475b755d334882",
       "member": "ripgrep-15.1.0-x86_64-apple-darwin/rg"
+    }
+  },
+  "llama-server": {
+    "version": "b12359",
+    "folder": "llama.cpp",
+    "aarch64-apple-darwin": {
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-macos-arm64.tar.gz",
+      "sha256": "82b00abc740160e1b9980e6cc79c117345fa34af058c80e6c0a69aa8ddccde75",
+      "member": "llama-b12359/llama-server"
+    },
+    "x86_64-apple-darwin": {
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-macos-x64.tar.gz",
+      "sha256": "25320d529077ef5a3d16e7b5da26438f221d88c8c0930a32b0c79457f5eede56",
+      "member": "llama-b12359/llama-server"
     }
   }
 }

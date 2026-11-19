@@ -204,7 +204,9 @@ const VERBS = { read: "Read", edit: "Edit", delete: "Delete", move: "Move", sear
 function subject(call) {
   const input = call.rawInput || {};
   const where = (call.locations || [])[0]?.path;
-  const relative = (path) => (project && path?.startsWith(project.folders[0].path + "/") ? path.slice(project.folders[0].path.length + 1) : path);
+  // The Linux VM sees the main folder as /workspace.
+  const main = project?.isolation === "linux-vm" ? "/workspace" : project?.folders[0].path;
+  const relative = (path) => (main && path?.startsWith(main + "/") ? path.slice(main.length + 1) : path);
   switch (call.kind) {
     case "execute":
       return input.command || call.title;
@@ -464,12 +466,15 @@ async function renderChatList() {
   const box = $("chat-list");
   if (!project) return box.replaceChildren();
   let chats = [];
+  // A Linux VM takes a few seconds to start, more the first time.
+  if (box.dataset.project !== project.id && project.isolation === "linux-vm") box.replaceChildren(el("p", { class: "small muted" }, "Starting the Linux VM…"));
   try {
     chats = await engines[engine].sessions();
   } catch (e) {
     box.replaceChildren(el("p", { class: "small muted" }, String(e)));
     return;
   }
+  box.dataset.project = project.id;
   chatTitles = new Map(chats.map((c) => [c.id, c.title]));
   if (session && chatTitles.has(session)) $("title").textContent = chatTitles.get(session);
   box.replaceChildren(
@@ -598,7 +603,7 @@ function update() {
   const notice = $("notice");
   const reasons = [];
   if (!project) reasons.push(["Make a project first: a folder for the agent to work in.", "New project…", newProject]);
-  else if (project.isolation !== "macos-sandbox") reasons.push(["This project runs in the Linux VM, which the chat doesn't support yet.", "Open in OpenCode", () => invoke("open_project", { id: project.id })]);
+  else if (project.isolation !== "macos-sandbox" && engine !== "opencode") reasons.push(["The chat runs Linux VM projects with OpenCode, which this build doesn't include.", "Open in OpenCode", () => invoke("open_project", { id: project.id })]);
   if (!models.length) reasons.push(["Download a model to chat.", "Models…", () => invoke("open_window", { name: "settings" })]);
   // Not in the way: sending starts the chat's model.
   const notes = [];
@@ -641,6 +646,10 @@ function finished(error, stopReason) {
 }
 
 function onOpencode(event) {
+  if (event.type === "starting") {
+    if (event.project === project?.id) $("chat-list").replaceChildren(el("p", { class: "small muted" }, event.text));
+    return;
+  }
   if (event.project !== project?.id || event.session !== session) {
     if (event.type === "state" && !event.busy && event.project === project?.id) renderChatList();
     return;

@@ -32,16 +32,21 @@ pub struct LlamaServer {
     pub context: u64,
 }
 
-/// The bundled sidecar next to the app's executable, then `PATH`.
+/// The folder the app bundles llama.cpp's build in, with its libraries.
+const BUNDLED_FOLDER: &str = "llama.cpp";
+
+/// [`BINARY_ENV`], then the build bundled with the app, then `PATH`.
 pub fn find_llama_server() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os(BINARY_ENV) {
         return Some(PathBuf::from(path));
     }
     let name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
-    if let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)) {
-        let bundled = dir.join(name);
-        if bundled.is_file() {
-            return Some(bundled);
+    if let Some(dir) = crate::paths::bundled_dir() {
+        // In the `.app` resources sit in `Contents/Resources`; when developing, beside the executable.
+        for bundled in [dir.join("../Resources").join(BUNDLED_FOLDER).join(name), dir.join(BUNDLED_FOLDER).join(name), dir.join(name)] {
+            if bundled.is_file() {
+                return Some(bundled);
+            }
         }
     }
     which::which("llama-server").ok()

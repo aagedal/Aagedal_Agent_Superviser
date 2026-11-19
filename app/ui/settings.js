@@ -604,7 +604,7 @@ function projectCard(project, running) {
       { class: "actions" },
       el("button", { onclick: () => { editingProject = project.id; renderProjects(); } }, "Edit"),
       el("button", { disabled: !projectsInfo.available || !running, title: running ? "Open in OpenCode, in a Terminal window" : "Load a model first", onclick: () => invoke("open_project", { id: project.id }) }, "OpenCode"),
-      project.isolation === "macos-sandbox" ? el("button", { class: "primary", onclick: () => invoke("open_chat", { project: project.id }) }, "Chat") : null,
+      el("button", { class: "primary", onclick: () => invoke("open_chat", { project: project.id }) }, "Chat"),
     ),
   );
 }
@@ -1021,8 +1021,6 @@ async function guideConnect() {
     parts.push(el("div", { class: "banner" }, "Load a model first. ", el("button", { onclick: () => goToStep(0) }, "Back to models")));
   } else if (!project) {
     parts.push(el("div", { class: "banner" }, "Choose a project folder first. ", el("button", { onclick: () => goToStep(1) }, "Back to projects")));
-  } else if (project.isolation !== "macos-sandbox") {
-    parts.push(el("div", { class: "row" }, el("button", { class: "primary", onclick: () => invoke("open_project", { id: project.id }) }, `Open ${project.name} in OpenCode`), el("span", { class: "small muted" }, "The built-in chat doesn't run Linux VM projects yet.")));
   } else {
     parts.push(
       el("div", { class: "row" }, el("button", { class: "primary", onclick: () => invoke("open_chat", { project: project.id }) }, `Chat about ${project.name}`), el("span", { class: "small muted" }, `with ${running}`)),
