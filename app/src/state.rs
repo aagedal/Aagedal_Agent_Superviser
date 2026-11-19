@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use superviser_core::catalog::{Catalog, CatalogModel, Fit};
+use superviser_core::catalog::{self, Catalog, CatalogModel, Fit};
 use superviser_core::discover::{self, Discovery, Locations};
 use superviser_core::hardware::Hardware;
 use superviser_core::installed::{self, InstalledModel, Source};
@@ -17,7 +17,7 @@ use superviser_core::sandbox::{self, Isolation, Network};
 use superviser_core::{opencode, secrets};
 use superviser_guard::journal::Journal;
 use superviser_guard::selfprotect::SelfProtection;
-use superviser_guard::{CallEvent, GuardServer, ProxyOptions};
+use superviser_guard::{CallEvent, GuardServer, Judge, JudgeOptions, ProxyOptions};
 
 pub const DEFAULT_GUARD_PORT: u16 = 8787;
 const MAX_RECENT_PROJECTS: usize = 6;
@@ -32,6 +32,11 @@ pub struct Settings {
     pub guard_port: u16,
     /// Block flagged calls (true) or only log them.
     pub block: bool,
+    /// Run the catalog's decision model beside the chat model, ask it whether WARN calls
+    /// serve the task, and block those that don't. Off by default: it takes memory.
+    pub judge: bool,
+    /// Block WARN calls when the judge gives no answer in time.
+    pub judge_fail_closed: bool,
     /// Write OpenCode's config whenever a model starts.
     pub configure_opencode: bool,
     /// Offer models other apps already downloaded (LM Studio, Ollama, Hugging Face cache…).
@@ -50,6 +55,8 @@ impl Default for Settings {
         Self {
             guard_port: DEFAULT_GUARD_PORT,
             block: true,
+            judge: false,
+            judge_fail_closed: false,
             configure_opencode: true,
             use_other_apps: true,
             last_model: None,
@@ -73,6 +80,18 @@ struct Running {
     server: LlamaServer,
 }
 
+/// Where the judge stands, for Settings.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum JudgeStatus {
+    /// Off, or on with no model running.
+    #[default]
+    Idle,
+    Loading,
+    Running,
+    Failed { error: String },
+}
+
 pub struct App {
     pub paths: Paths,
     pub hardware: Hardware,
@@ -81,6 +100,8 @@ pub struct App {
     pub guard: Mutex<Option<GuardServer>>,
     running: tokio::sync::Mutex<Option<Running>>,
     pub status: Mutex<ServerStatus>,
+    judge_server: tokio::sync::Mutex<Option<LlamaServer>>,
+    pub judge_status: Mutex<JudgeStatus>,
     pub downloads: Mutex<HashMap<String, Arc<AtomicBool>>>,
     pub events: Mutex<VecDeque<CallEvent>>,
     /// Models other apps downloaded, from the last scan.
@@ -102,6 +123,8 @@ impl App {
             guard: Mutex::new(None),
             running: tokio::sync::Mutex::new(None),
             status: Mutex::new(ServerStatus::Stopped),
+            judge_server: tokio::sync::Mutex::new(None),
+            judge_status: Mutex::new(JudgeStatus::Idle),
             downloads: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             discovery: Mutex::new(Discovery::default()),
@@ -118,6 +141,118 @@ impl App {
         };
         tracing::info!("found {} models from other apps", discovery.models.len());
         *self.discovery.lock().unwrap() = discovery;
+    }
+
+    /// The memory budgets chat models get: what the judge leaves when it is on.
+    pub fn model_hardware(&self) -> Hardware {
+        match &self.catalog.judge {
+            Some(judge) if self.settings.lock().unwrap().judge => self.hardware.less(judge.judge_required()),
+            _ => self.hardware.clone(),
+        }
+    }
+
+    /// Whether the judge fits beside at least one curated model at its smallest context.
+    pub fn judge_fits(&self) -> bool {
+        self.catalog.judge.as_ref().is_some_and(|judge| !self.catalog.offers(&self.hardware.less(judge.judge_required())).is_empty())
+    }
+
+    /// The judge's model, if downloaded.
+    pub fn judge_installed(&self) -> Option<InstalledModel> {
+        installed::find_judge(&self.paths, self.catalog.judge.as_ref()?)
+    }
+
+    /// Turns the judge on or off, and whether it fails closed. Turning it on while a model
+    /// runs starts it now, if it fits beside that model at the context it has.
+    pub async fn set_judge(&self, enabled: bool, fail_closed: bool) -> anyhow::Result<()> {
+        let judge = self.catalog.judge.as_ref().context("this version has no judge model")?;
+        if enabled
+            && !self.settings.lock().unwrap().judge
+            && let Some((model, context)) = self.running_model()
+        {
+            let left = self.hardware.less(judge.judge_required());
+            if model.model.fit(left.model_budget).is_none_or(|fit| fit.context < context) {
+                bail!(
+                    "{} needs {:.1} GB beside {}, which doesn't fit at {}k context. Stop the model, turn the judge on, and start it again: it will get the context that fits.",
+                    judge.name,
+                    judge.judge_required() as f64 / 1e9,
+                    model.model.name,
+                    context / 1024
+                );
+            }
+        }
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.judge = enabled;
+            settings.judge_fail_closed = fail_closed;
+        }
+        self.save_settings()?;
+        self.sync_judge().await;
+        Ok(())
+    }
+
+    /// Runs the judge while it is on, downloaded and a model is running; stops it otherwise.
+    /// Options changes reach the guard without a restart.
+    pub async fn sync_judge(&self) {
+        let (enabled, fail_closed) = {
+            let settings = self.settings.lock().unwrap();
+            (settings.judge, settings.judge_fail_closed)
+        };
+        let wanted = if enabled && self.running_model().is_some() { self.judge_installed() } else { None };
+        let mut server = self.judge_server.lock().await;
+        let Some(model) = wanted else {
+            if let Some(mut old) = server.take() {
+                old.stop().await;
+            }
+            self.set_guard_judge(None);
+            *self.judge_status.lock().unwrap() = JudgeStatus::Idle;
+            return;
+        };
+        if server.as_mut().is_none_or(|s| !s.is_running()) {
+            *self.judge_status.lock().unwrap() = JudgeStatus::Loading;
+            match self.start_judge(&model).await {
+                Ok(started) => *server = Some(started),
+                Err(e) => {
+                    tracing::warn!("judge: {e:#}");
+                    *server = None;
+                    self.set_guard_judge(None);
+                    *self.judge_status.lock().unwrap() = JudgeStatus::Failed { error: format!("{e:#}") };
+                    return;
+                }
+            }
+        }
+        let options = JudgeOptions { fail_closed, ..JudgeOptions::default() };
+        let base = server.as_ref().unwrap().base_url();
+        let key = secrets::upstream_api_key(&self.paths).ok();
+        self.set_guard_judge(Some(Judge::new(reqwest::Client::new(), &base, key, options)));
+        *self.judge_status.lock().unwrap() = JudgeStatus::Running;
+    }
+
+    async fn start_judge(&self, model: &InstalledModel) -> anyhow::Result<LlamaServer> {
+        let binary = runtime::find_llama_server().context("llama-server was not found")?;
+        let log_file = self.paths.logs().join("judge-server.log");
+        let config = ServerConfig {
+            binary,
+            model_path: model.entry_path().context("judge model has no entry file")?,
+            alias: model.alias.clone(),
+            context: catalog::JUDGE_CONTEXT,
+            port: runtime::free_port()?,
+            api_key_file: self.paths.upstream_api_key(),
+            log_file: log_file.clone(),
+            prompt_cache: 0,
+            decision: true,
+        };
+        let mut server = LlamaServer::start(config).await?;
+        if let Err(e) = server.wait_ready(LOAD_TIMEOUT).await {
+            server.stop().await;
+            return Err(e.context(format!("see {}", log_file.display())));
+        }
+        Ok(server)
+    }
+
+    fn set_guard_judge(&self, judge: Option<Judge>) {
+        if let Some(guard) = self.guard.lock().unwrap().as_ref() {
+            guard.set_judge(judge);
+        }
     }
 
     pub fn save_settings(&self) -> anyhow::Result<()> {
@@ -161,6 +296,8 @@ impl App {
             api_key: Some(secrets::local_api_key(&self.paths)?),
             upstream_api_key: Some(secrets::upstream_api_key(&self.paths)?),
             cors_origins: WEBVIEW_ORIGINS.iter().map(|s| s.to_string()).collect(),
+            // Set once the judge's server runs (`sync_judge`).
+            judge: None,
         };
         let server = GuardServer::start(listener, config, options).await?;
         tracing::info!("guard listening on {}", server.addr);
@@ -213,7 +350,7 @@ impl App {
     }
 
     pub fn fit(&self, model: &CatalogModel) -> Option<Fit> {
-        model.fit(self.hardware.model_budget)
+        model.fit(self.model_hardware().model_budget)
     }
 
     /// Loads `id` in llama-server and points the guard (and OpenCode) at it.
@@ -235,6 +372,8 @@ impl App {
                 old.server.stop().await;
             }
             set_status(ServerStatus::Loading { model: model.id.clone(), name: model.model.name.clone() });
+            let prompt_cache = model.model.prompt_cache(&fit, self.model_hardware().ram_budget);
+            tracing::info!("{}: {}k context, {} MiB for saved conversations", model.alias, fit.context / 1024, prompt_cache >> 20);
             let config = ServerConfig {
                 binary,
                 model_path: entry,
@@ -243,6 +382,8 @@ impl App {
                 port: runtime::free_port()?,
                 api_key_file: self.paths.upstream_api_key(),
                 log_file: self.paths.logs().join("llama-server.log"),
+                prompt_cache,
+                decision: false,
             };
             let mut server = LlamaServer::start(config).await?;
             if let Err(e) = server.wait_ready(LOAD_TIMEOUT).await {
@@ -261,6 +402,7 @@ impl App {
                 set_status(ServerStatus::Running { model: model.id.clone(), name: model.model.name.clone(), context: fit.context });
                 self.settings.lock().unwrap().last_model = Some(model.id.clone());
                 self.save_settings()?;
+                self.sync_judge().await;
                 if self.settings.lock().unwrap().configure_opencode
                     && let Err(e) = self.setup_opencode()
                 {
@@ -270,6 +412,7 @@ impl App {
             }
             Err(e) => {
                 set_status(ServerStatus::Failed { model: model.id.clone(), error: format!("{e:#}") });
+                self.sync_judge().await;
                 Err(e)
             }
         }
@@ -283,6 +426,7 @@ impl App {
             guard.set_upstream(None);
         }
         *self.status.lock().unwrap() = ServerStatus::Stopped;
+        self.sync_judge().await;
     }
 
     /// The running model, if any: (installed model, context).
@@ -336,6 +480,11 @@ impl App {
             && let Some(mut running) = running.take()
         {
             tauri::async_runtime::block_on(running.server.stop());
+        }
+        if let Ok(mut judge) = self.judge_server.try_lock()
+            && let Some(mut judge) = judge.take()
+        {
+            tauri::async_runtime::block_on(judge.stop());
         }
         if let Some(guard) = self.guard.lock().unwrap().as_mut() {
             guard.stop();

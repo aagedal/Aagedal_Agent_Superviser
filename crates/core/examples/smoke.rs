@@ -45,6 +45,8 @@ async fn main() -> anyhow::Result<()> {
         port: runtime::free_port()?,
         api_key_file: paths.upstream_api_key(),
         log_file: paths.logs().join("llama-server.log"),
+        prompt_cache: 0,
+        decision: false,
     })
     .await?;
     server.wait_ready(Duration::from_secs(120)).await?;
@@ -56,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     assert_eq!(direct.status(), 401);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let options = ProxyOptions { api_key: Some("client".into()), upstream_api_key: Some(upstream_key), cors_origins: vec![] };
+    let options = ProxyOptions { api_key: Some("client".into()), upstream_api_key: Some(upstream_key), cors_origins: vec![], judge: None };
     let guard = GuardServer::start(listener, Config::default(), options).await?;
     guard.set_upstream(Some(server.base_url()));
     let url = format!("http://{}/v1/chat/completions", guard.addr);

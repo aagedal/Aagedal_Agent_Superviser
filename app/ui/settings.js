@@ -31,7 +31,10 @@ function showTab(name) {
     invoke("other_apps").then(renderOtherApps);
   }
   if (name === "connect") renderConnect();
-  if (name === "safety") renderCalls();
+  if (name === "safety") {
+    renderJudge();
+    renderCalls();
+  }
 }
 for (const button of document.querySelectorAll("nav button")) button.addEventListener("click", () => showTab(button.dataset.tab));
 
@@ -46,7 +49,8 @@ async function refreshOverview() {
   overview = await invoke("overview");
   const hw = overview.hardware;
   const kind = hw.unified_memory ? "This Mac" : "This computer";
-  $("machine").textContent = `${kind} has ${gib(hw.total_memory)} of memory; up to ${gib(hw.model_budget)} can go to a model. Only models that fit are shown.`;
+  const judge = overview.model_budget < hw.model_budget ? ` (${gib(hw.model_budget - overview.model_budget)} is kept for the judge, see Safety)` : "";
+  $("machine").textContent = `${kind} has ${gib(hw.total_memory)} of memory; up to ${gib(overview.model_budget)} can go to a model${judge}. Only models that fit are shown.`;
 }
 
 async function refreshInstalledIds() {
@@ -112,6 +116,7 @@ listen("download", async ({ payload }) => {
     downloads.set(payload.id, { done: payload.done, total: payload.total });
   }
   downloadButtons.get(payload.id)?.();
+  if (payload.id === judgeDownload) renderJudge();
 });
 
 function modelCard(model, fit, recommended) {
@@ -462,9 +467,107 @@ function callRow(call) {
       {},
       el("code", { class: "selectable" }, `${call.tool}: ${call.summary}`),
       call.reason ? el("div", { class: "reason" }, call.reason) : call.signals?.length ? el("div", { class: "reason" }, call.signals.join(", ")) : null,
+      judgeNote(call),
     ),
   );
 }
+
+// The second check's answer, unless the reason already gives it.
+function judgeNote(call) {
+  if (!call.judge) return null;
+  const [kind, ...rest] = call.judge.split(": ");
+  const why = rest.join(": ");
+  if (kind === "block") return null;
+  const text = kind === "allow" ? `Judge allowed it: ${why}` : `Judge gave no answer: ${why}`;
+  return el("div", { class: "reason" }, text);
+}
+
+const JUDGE_STATUS = {
+  idle: () => "It starts with your next model.",
+  loading: () => "Starting…",
+  running: () => "Running: WARN calls are checked.",
+  failed: (s) => `Couldn't start: ${s.error}`,
+};
+let judgeDownload = null;
+async function renderJudge() {
+  const judge = await invoke("judge_settings");
+  judgeDownload = judge.download;
+  if (!judge.model) {
+    $("judge-enabled").disabled = true;
+    return;
+  }
+  $("judge-name").textContent = judge.model.name;
+  $("judge-about").textContent = `${judge.model.name}: ${judge.model.description} A ${gib(judge.model.quant.size)} download; it takes about ${gib(judge.memory)} of memory while a model runs, which models then can't use.`;
+  $("judge-enabled").checked = judge.enabled;
+  // Too little memory: it can only be turned off.
+  $("judge-enabled").disabled = !judge.fits && !judge.enabled;
+  $("judge-fail-closed").checked = judge.fail_closed;
+  $("judge-fail-closed").disabled = !judge.enabled;
+
+  const box = $("judge-download");
+  box.replaceChildren();
+  const progress = downloads.get(judge.download);
+  if (progress) {
+    const pct = progress.total ? Math.floor((progress.done / progress.total) * 100) : 0;
+    box.append(
+      el("progress", { max: progress.total || 1, value: progress.done }),
+      el("span", { class: "small muted" }, `${pct}%`),
+      el("button", { onclick: () => invoke("cancel_download", { id: judge.download }) }, "Cancel"),
+    );
+  } else if (judge.enabled && !judge.installed) {
+    box.append(el("button", { class: "primary", onclick: downloadJudge }, `Download ${judge.model.name} (${gib(judge.model.quant.size)})`));
+  }
+
+  const status = $("judge-status");
+  status.className = "small";
+  if (!judge.fits && !judge.enabled) {
+    status.textContent = "This machine doesn't have the memory to run it beside a model.";
+    status.classList.add("muted");
+  } else if (!judge.enabled) {
+    status.textContent = "";
+  } else if (!judge.installed) {
+    status.textContent = progress ? "Downloading…" : "Download it to start checking.";
+    status.classList.add("muted");
+  } else {
+    status.textContent = JUDGE_STATUS[judge.status.state](judge.status);
+    if (judge.status.state === "failed") status.style.color = "var(--bad)";
+    else status.style.color = "";
+  }
+}
+async function downloadJudge() {
+  downloads.set(judgeDownload, { done: 0, total: 0 });
+  await renderJudge();
+  try {
+    await invoke("download_judge");
+  } catch (e) {
+    downloads.delete(judgeDownload);
+    alert(e);
+  }
+  await renderJudge();
+}
+async function saveJudge() {
+  const enabled = $("judge-enabled").checked;
+  try {
+    await invoke("set_judge", { enabled, failClosed: $("judge-fail-closed").checked });
+  } catch (e) {
+    alert(e);
+  }
+  await renderJudge();
+  // Start the download on first use.
+  const judge = await invoke("judge_settings");
+  if (enabled && judge.enabled && !judge.installed && !downloads.has(judge.download)) await downloadJudge();
+}
+// What fits changed, or the judge started or stopped.
+listen("judge", async () => {
+  await refreshOverview();
+  renderOffers();
+  renderJudge();
+});
+listen("status", () => {
+  if (!$("safety").hidden) renderJudge();
+});
+$("judge-enabled").addEventListener("change", saveJudge);
+$("judge-fail-closed").addEventListener("change", saveJudge);
 
 async function renderCalls() {
   const calls = await invoke("recent_calls");

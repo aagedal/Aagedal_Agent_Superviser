@@ -1,4 +1,5 @@
-//! Regenerates `catalog/curated.json` from `catalog/sources.json`.
+//! Regenerates `catalog/curated.json` from `catalog/sources.json`. With `--judge-only`, only
+//! the judge's entry is refreshed and the chat models keep their pinned commits.
 
 use serde::Deserialize;
 use superviser_core::catalog::{Catalog, CatalogModel};
@@ -7,6 +8,7 @@ use superviser_core::hub::Hub;
 #[derive(Deserialize)]
 struct Sources {
     models: Vec<Source>,
+    judge: Option<Source>,
 }
 
 #[derive(Deserialize)]
@@ -22,6 +24,16 @@ async fn main() -> anyhow::Result<()> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../catalog");
     let sources: Sources = serde_json::from_str(&std::fs::read_to_string(root.join("sources.json"))?)?;
     let hub = Hub::new(std::env::var("HF_TOKEN").ok());
+    let judge = match &sources.judge {
+        Some(source) => Some(CatalogModel::resolve(&hub, &source.repo, source.name.as_deref(), &source.description).await?),
+        None => None,
+    };
+    if std::env::args().any(|a| a == "--judge-only") {
+        let mut catalog = Catalog::bundled();
+        catalog.judge = judge;
+        std::fs::write(root.join("curated.json"), serde_json::to_string_pretty(&catalog)? + "\n")?;
+        return Ok(());
+    }
     let mut models = Vec::new();
     for source in sources.models {
         let model = CatalogModel::resolve(&hub, &source.repo, source.name.as_deref(), &source.description).await?;
@@ -37,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
         models.push(model);
     }
     let generated = time::OffsetDateTime::now_utc().date().to_string();
-    let catalog = Catalog { version: 1, generated, models };
+    let catalog = Catalog { version: 1, generated, models, judge };
     std::fs::write(root.join("curated.json"), serde_json::to_string_pretty(&catalog)? + "\n")?;
     Ok(())
 }

@@ -20,6 +20,19 @@ pub const MIN_CONTEXT: u64 = 32_768;
 /// grouped-query sharing, which overestimates most current models.
 const FALLBACK_KV_PER_TOKEN: u64 = 192 * 1024;
 
+/// What a conversation saved to RAM takes per token beyond its KV cells (measured: 7.4 KiB).
+const SAVED_BYTES_PER_TOKEN: u64 = 8 * 1024;
+/// Room for a short conversation saved beside it, such as OpenCode's title requests to the
+/// same model (a short one measured 150 MiB).
+const SAVED_EXTRA_BYTES: u64 = 256 << 20;
+
+/// Tokens the judge reads at most. A decision model reads its whole input in one batch, and
+/// the judge's input is cut to about 6,000 characters, so this leaves room for dense text.
+pub const JUDGE_CONTEXT: u64 = 8192;
+/// What the judge takes beside its weights at that context: KV cache and compute buffers
+/// (measured for d3-mini: 2.1 GiB).
+const JUDGE_BUFFERS: u64 = 2304 << 20;
+
 const BUNDLED: &str = include_str!("../../../catalog/curated.json");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +40,9 @@ pub struct Catalog {
     pub version: u32,
     pub generated: String,
     pub models: Vec<CatalogModel>,
+    /// The decision model that judges suspicious calls, when the judge is on.
+    #[serde(default)]
+    pub judge: Option<CatalogModel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +112,20 @@ impl Catalog {
 impl CatalogModel {
     pub fn fit(&self, budget: u64) -> Option<Fit> {
         fit(self.quant.size + self.kv_fixed_bytes, self.kv_bytes_per_token, self.context_length, budget)
+    }
+
+    /// Memory the judge takes while it runs beside a model.
+    pub fn judge_required(&self) -> u64 {
+        self.quant.size + JUDGE_BUFFERS
+    }
+
+    /// RAM llama-server may keep saved conversations in: enough for one at full context, so
+    /// the agent's survives a short request in between, but never more than the model leaves
+    /// free of `ram_budget`. With less, a long conversation is read again after one.
+    pub fn prompt_cache(&self, fit: &Fit, ram_budget: u64) -> u64 {
+        let per_token = self.kv_bytes_per_token.unwrap_or(FALLBACK_KV_PER_TOKEN) + SAVED_BYTES_PER_TOKEN;
+        let conversation = per_token * fit.context + self.kv_fixed_bytes + SAVED_EXTRA_BYTES;
+        conversation.min(ram_budget.saturating_sub(fit.required))
     }
 
     /// Resolves a repo into a catalog entry: its default 4-bit quant, pinned to the current
@@ -188,12 +218,32 @@ mod tests {
     #[test]
     fn offers_leave_out_what_does_not_fit() {
         let catalog = Catalog::bundled();
-        let small = Hardware { total_memory: 16 * GIB, model_budget: 10 * GIB, unified_memory: true, os: "macos", arch: "aarch64" };
+        let small = Hardware { total_memory: 16 * GIB, model_budget: 10 * GIB, ram_budget: 12 * GIB, unified_memory: true, os: "macos", arch: "aarch64" };
         let offers = catalog.offers(&small);
         assert!(offers.iter().all(|o| o.fit.required <= small.model_budget));
         assert!(offers.len() < catalog.models.len());
         assert_eq!(offers.iter().filter(|o| o.recommended).count(), usize::from(!offers.is_empty()));
         assert!(offers.first().is_none_or(|o| o.recommended));
+    }
+
+    #[test]
+    fn prompt_cache_holds_one_conversation_and_stays_in_free_memory() {
+        let catalog = Catalog::bundled();
+        let model = catalog.models.iter().find(|m| m.repo == "unsloth/Qwen3.5-4B-GGUF").unwrap();
+        let fit = Fit { context: 32_768, required: 5 * GIB };
+        // 40 KiB per token at 32k context, plus room for a short one.
+        assert_eq!(model.prompt_cache(&fit, 60 * GIB), (1280 + 256) << 20);
+        assert_eq!(model.prompt_cache(&fit, 5 * GIB + (500 << 20)), 500 << 20);
+        assert_eq!(model.prompt_cache(&fit, 5 * GIB), 0);
+        assert_eq!(model.prompt_cache(&fit, 4 * GIB), 0);
+    }
+
+    #[test]
+    fn bundled_judge_is_pinned_and_small() {
+        let judge = Catalog::bundled().judge.expect("a judge model");
+        assert_eq!(judge.revision.len(), 40);
+        assert!(judge.quant.entry_file().is_some());
+        assert!(judge.judge_required() < 6 * GIB, "{}", judge.judge_required());
     }
 
     #[test]

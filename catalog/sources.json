@@ -11,5 +11,6 @@
     { "repo": "unsloth/Qwen3.6-35B-A3B-GGUF", "name": "Qwen3.6 35B-A3B", "description": "Newer fast mixture-of-experts model for coding agents." },
     { "repo": "unsloth/Qwen3-Coder-Next-GGUF", "name": "Qwen3 Coder Next", "description": "Large coding specialist for 64 GB+ machines." },
     { "repo": "unsloth/gpt-oss-120b-GGUF", "name": "gpt-oss 120B", "description": "OpenAI's large open model, for 96 GB+ machines." }
-  ]
+  ],
+  "judge": { "repo": "ggml-org/vllm-d3-mini-GGUF", "name": "d3-mini", "description": "A decision model built on Qwen3.5 4B (Apache-2.0)." }
 }
