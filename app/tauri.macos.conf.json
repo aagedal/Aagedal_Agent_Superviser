@@ -1,6 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
-    "externalBin": ["binaries/opencode", "binaries/rg"]
+    "externalBin": ["binaries/opencode", "binaries/rg"],
+    "resources": { "binaries/llama.cpp/": "llama.cpp/" }
   }
 }

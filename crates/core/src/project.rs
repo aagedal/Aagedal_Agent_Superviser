@@ -136,10 +136,13 @@ impl Project {
     }
 
     /// An existing file or folder of the project, by a path relative to the main folder or
-    /// absolute, with symlinks resolved; `None` outside its folders.
+    /// absolute (as the Linux VM sees it, for a project there), with symlinks resolved; `None`
+    /// outside its folders.
     pub fn find(&self, path: &str) -> Option<PathBuf> {
         let path = Path::new(path.trim());
-        let found = std::fs::canonicalize(if path.is_absolute() { path.to_path_buf() } else { self.main().join(path) }).ok()?;
+        let vm_path = (self.isolation == Isolation::LinuxVm).then(|| crate::sandbox::container::host_path(self.main(), self.related(), path)).flatten();
+        let path = vm_path.unwrap_or_else(|| if path.is_absolute() { path.to_path_buf() } else { self.main().join(path) });
+        let found = std::fs::canonicalize(path).ok()?;
         self.folders.iter().filter_map(|f| std::fs::canonicalize(&f.path).ok()).any(|f| found.starts_with(f)).then_some(found)
     }
 

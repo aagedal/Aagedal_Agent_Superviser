@@ -77,7 +77,7 @@ fn emit(handle: &AppHandle, event: Event) {
 pub fn send(handle: AppHandle, app: Arc<App>, project: &str, chat: Option<&str>, text: &str, model: &str) -> anyhow::Result<String> {
     let project = app.project(project).context("that project no longer exists")?;
     if project.isolation != Isolation::MacosSandbox {
-        bail!("The built-in chat runs projects in the macOS sandbox so far. Open this one in OpenCode, or switch it to the macOS sandbox in Projects.");
+        bail!("The built-in agent runs projects in the macOS sandbox only; the chat runs Linux VM projects with OpenCode, which this build doesn't include. Open this one in OpenCode, or switch it to the macOS sandbox in Projects.");
     }
     let (model, _) = app.loaded(model).context("Load the chat's model first.")?;
     app.touch(&model.id);

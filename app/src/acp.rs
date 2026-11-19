@@ -1,10 +1,11 @@
 //! The chat window's engine: OpenCode's Agent Client Protocol server (`opencode acp`), one
-//! per project, run in the project's macOS sandbox and spoken to over its stdin and stdout
-//! (JSON-RPC, a message per line). It reaches the model through the guard on the project's
-//! path, with every provider but ours turned off. What it reports goes to the window as
+//! per project, run in the project's macOS sandbox or Linux VM and spoken to over its stdin
+//! and stdout (JSON-RPC, a message per line). It reaches the model through the guard on the
+//! project's path, with every provider but ours turned off. What it reports goes to the window as
 //! `acp` events, and its permission requests wait there for the user's answer.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,7 +14,8 @@ use anyhow::{Context, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 use superviser_core::project::{Folder, Project};
-use superviser_core::sandbox::{Isolation, seatbelt};
+use superviser_core::sandbox::container::{self, Use, Vm};
+use superviser_core::sandbox::{self, Isolation, seatbelt};
 use superviser_core::{opencode, secrets};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -36,6 +38,8 @@ enum Event {
     Permission { project: String, session: String, request: String, tool_call: Value, options: Value },
     /// A prompt started or ended.
     State { project: String, session: String, busy: bool, stop_reason: Option<String>, error: Option<String> },
+    /// OpenCode is starting slowly for the project: why.
+    Starting { project: String, text: String },
 }
 
 /// The running engines, by project id.
@@ -59,19 +63,19 @@ pub struct Engine {
     open: Mutex<HashSet<String>>,
     /// Sessions being loaded only to prompt them: their replay isn't shown again.
     quiet: Mutex<HashSet<String>>,
-    /// The project's main folder, for loading sessions.
-    cwd: std::path::PathBuf,
+    /// The project's main folder and its others, where OpenCode sees them.
+    cwd: String,
+    folders: Vec<String>,
     alive: AtomicBool,
     pid: Option<u32>,
+    /// The VM it runs in (`container` and the VM's name), stopped with it.
+    vm: Option<(PathBuf, String)>,
 }
 
 impl Engines {
     /// The engine for `project`, started (or restarted, when its settings or the model changed
     /// and it's idle) as needed.
     pub async fn get(&self, handle: &AppHandle, app: &App, project: &Project) -> anyhow::Result<Arc<Engine>> {
-        if project.isolation != Isolation::MacosSandbox {
-            bail!("The chat runs projects in the macOS sandbox so far. Open this one in OpenCode, or switch it to the macOS sandbox in Projects.");
-        }
         let launch = Launch::new(app, project)?;
         let mut running = self.running.lock().await;
         if let Some(engine) = running.get(&project.id)
@@ -83,7 +87,7 @@ impl Engines {
         if let Some(old) = running.remove(&project.id) {
             old.stop();
         }
-        let engine = Engine::start(handle.clone(), project, launch).await?;
+        let engine = Engine::start(handle.clone(), app, project, launch).await?;
         running.insert(project.id.clone(), engine.clone());
         Ok(engine)
     }
@@ -93,62 +97,125 @@ impl Engines {
         self.running.lock().await.get(project).filter(|e| e.alive.load(Ordering::SeqCst)).cloned()
     }
 
-    /// Stops every engine (when the app quits).
+    /// Stops every engine (when the app quits), waiting for their VMs to stop.
     pub fn stop_all(&self) {
         if let Ok(mut running) = self.running.try_lock() {
-            for (_, engine) in running.drain() {
-                engine.stop();
+            let stopping: Vec<_> = running.drain().filter_map(|(_, engine)| engine.stop()).collect();
+            for vm in stopping {
+                let _ = vm.join();
             }
         }
     }
 }
 
-/// How to start OpenCode for a project.
+/// How to start OpenCode for a project. Cheap to make: what takes time happens in [`Launch::command`].
 struct Launch {
-    command: std::process::Command,
+    /// The project's rules, and our provider as the only one.
+    config: Value,
     fingerprint: String,
+    main: PathBuf,
+    related: Vec<Folder>,
 }
 
 impl Launch {
     fn new(app: &App, project: &Project) -> anyhow::Result<Self> {
         let guard = app.guard_url().context("the guard is not running")?;
-        let binary = opencode::binary().context("OpenCode isn't bundled with this build and isn't installed")?;
         let main = std::fs::canonicalize(project.main()).with_context(|| format!("{} is gone", project.main().display()))?;
         let related: Vec<Folder> = project.related().iter().filter_map(|f| Some(Folder { path: std::fs::canonicalize(&f.path).ok()?, writable: f.writable })).collect();
         secrets::local_api_key(&app.paths)?;
-        let setup = opencode::Setup {
-            base_url: format!("{}{}/v1", guard.trim_end_matches("/v1"), project.guard_path()),
-            api_key_file: app.paths.local_api_key(),
-            // Every model a chat might use, so a session's recorded model always resolves.
-            models: app
-                .installed()
-                .into_iter()
-                .filter_map(|m| Some(opencode::SetupModel { context: app.fit(&m.model)?.context, alias: m.alias, name: m.model.name }))
-                .collect(),
-            // No default: each prompt names the chat's model, so switching models needs no restart.
-            default_model: None,
+        // Every model a chat might use, so a session's recorded model always resolves.
+        let models = app
+            .installed()
+            .into_iter()
+            .filter_map(|m| Some(opencode::SetupModel { context: app.fit(&m.model)?.context, alias: m.alias, name: m.model.name }))
+            .collect();
+        // No default model: each prompt names the chat's, so switching models needs no restart.
+        let setup = match project.isolation {
+            Isolation::MacosSandbox => opencode::Setup {
+                base_url: format!("{}{}/v1", guard.trim_end_matches("/v1"), project.guard_path()),
+                api_key_file: app.paths.local_api_key(),
+                models,
+                default_model: None,
+            },
+            Isolation::LinuxVm => container::provider_setup(&project.guard_path(), models, None),
         };
-        // The project's rules, and our provider as the only one.
         let mut config = project.opencode_config(&opencode::mcp_servers());
         if let (Some(config), Value::Object(ours)) = (config.as_object_mut(), opencode::only_ours(&setup)) {
             config.extend(ours);
         }
+        let binary = opencode::binary();
         let fingerprint = json!({ "project": project, "config": config, "binary": binary }).to_string();
-        let profile = seatbelt::write_project_profile(&app.paths, &main, &related, project.network, &project.blocked_programs, &format!("acp-{}", project.id))?;
-        let mut command = seatbelt::sandboxed(&profile, &main, &binary, &["acp"]);
-        command.env("OPENCODE_CONFIG_CONTENT", config.to_string());
+        Ok(Self { config, fingerprint, main, related })
+    }
+
+    /// Where OpenCode sees the main folder, and the others.
+    fn folders(&self, project: &Project) -> (String, Vec<String>) {
+        match project.isolation {
+            Isolation::MacosSandbox => (self.main.display().to_string(), self.related.iter().map(|f| f.path.display().to_string()).collect()),
+            Isolation::LinuxVm => container::vm_paths(&self.related),
+        }
+    }
+
+    /// The command that starts OpenCode, isolated as the project says, and the VM it runs
+    /// in, if one. A VM's first start builds its image, which takes a few minutes.
+    async fn command(&self, handle: &AppHandle, app: &App, project: &Project) -> anyhow::Result<(std::process::Command, Option<(PathBuf, String)>)> {
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(app.paths.logs().join("opencode-acp.log"))?;
+        let (mut command, vm) = match project.isolation {
+            Isolation::MacosSandbox => {
+                let binary = opencode::binary().context("OpenCode isn't bundled with this build and isn't installed")?;
+                let profile = seatbelt::write_project_profile(&app.paths, &self.main, &self.related, project.network, &project.blocked_programs, &format!("acp-{}", project.id))?;
+                let mut command = seatbelt::sandboxed(&profile, &self.main, &binary, &["acp"]);
+                command.env("OPENCODE_CONFIG_CONTENT", self.config.to_string());
+                (command, None)
+            }
+            Isolation::LinuxVm => {
+                let guard = app.guard_url().context("the guard is not running")?;
+                let (paths, owned, config, main, related) = (app.paths.clone(), project.clone(), self.config.clone(), self.main.clone(), self.related.clone());
+                // Starting `container`'s services can take a while.
+                let vm = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<Vm> {
+                    let project = owned;
+                    let backend = sandbox::backend(Isolation::LinuxVm);
+                    backend.available().map_err(|why| anyhow::anyhow!("The Linux VM isn't available: {why}"))?;
+                    backend.suits(&main).map_err(|why| anyhow::anyhow!("The Linux VM doesn't suit this project: {why}"))?;
+                    let (guard_socket, guard_path) = (paths.guard_socket(), project.guard_path());
+                    let request = sandbox::Request {
+                        paths: &paths,
+                        project: &main,
+                        related: &related,
+                        network: project.network,
+                        guard_socket: &guard_socket,
+                        model: None,
+                        guard_url: &guard,
+                        guard_path: &guard_path,
+                        opencode: &config,
+                        blocked_programs: &project.blocked_programs,
+                    };
+                    Vm::new(&request, &sandbox::stem(&project.id, &main), Use::Chat)
+                })
+                .await??;
+                if !vm.has_image() {
+                    let text = "Building the Linux environment. This happens once and takes a few minutes…".to_string();
+                    let _ = handle.emit("acp", Event::Starting { project: project.id.clone(), text });
+                    let status = tokio::process::Command::from(vm.build_command()).stdout(log.try_clone()?).stderr(log.try_clone()?).status().await?;
+                    anyhow::ensure!(status.success(), "Building the Linux environment failed; see the opencode-acp log.");
+                }
+                let name = vm.name(Use::Chat);
+                (vm.command(Use::Chat, &["opencode", "acp"]), Some((vm.container.clone(), name)))
+            }
+        };
         // Its own process group, so stopping it stops the shells it started.
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
-        let log = std::fs::OpenOptions::new().create(true).append(true).open(app.paths.logs().join("opencode-acp.log"))?;
         command.stderr(log);
-        Ok(Self { command, fingerprint })
+        Ok((command, vm))
     }
 }
 
 impl Engine {
-    async fn start(handle: AppHandle, project: &Project, launch: Launch) -> anyhow::Result<Arc<Self>> {
-        let mut child = tokio::process::Command::from(launch.command)
+    async fn start(handle: AppHandle, app: &App, project: &Project, launch: Launch) -> anyhow::Result<Arc<Self>> {
+        let (command, vm) = launch.command(&handle, app, project).await?;
+        let (cwd, folders) = launch.folders(project);
+        let mut child = tokio::process::Command::from(command)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -160,7 +227,8 @@ impl Engine {
             project: project.id.clone(),
             open: Mutex::new(HashSet::new()),
             quiet: Mutex::new(HashSet::new()),
-            cwd: project.main().to_path_buf(),
+            cwd,
+            folders,
             fingerprint: launch.fingerprint,
             stdin: tokio::sync::Mutex::new(stdin),
             next_id: AtomicU64::new(1),
@@ -169,6 +237,7 @@ impl Engine {
             busy: Mutex::new(HashSet::new()),
             alive: AtomicBool::new(true),
             pid: child.id(),
+            vm,
         });
         let reader = engine.clone();
         tauri::async_runtime::spawn(async move {
@@ -195,11 +264,14 @@ impl Engine {
         Ok(engine)
     }
 
-    fn stop(&self) {
+    /// Stops OpenCode, and its VM in the background (join to wait for it).
+    fn stop(&self) -> Option<std::thread::JoinHandle<()>> {
         self.alive.store(false, Ordering::SeqCst);
         if let Some(pid) = self.pid {
             let _ = std::process::Command::new("/bin/kill").args(["-TERM", &format!("-{pid}")]).status();
         }
+        let (container, name) = self.vm.clone()?;
+        Some(std::thread::spawn(move || container::stop(&container, &name)))
     }
 
     async fn send(&self, message: Value) -> anyhow::Result<()> {
@@ -275,18 +347,14 @@ impl Engine {
     }
 
     /// The project's saved sessions, most recent first.
-    pub async fn sessions(&self, cwd: &str) -> anyhow::Result<Value> {
-        let result = self.request("session/list", json!({ "cwd": cwd }), Some(REQUEST_TIMEOUT)).await?;
+    pub async fn sessions(&self) -> anyhow::Result<Value> {
+        let result = self.request("session/list", json!({ "cwd": self.cwd }), Some(REQUEST_TIMEOUT)).await?;
         Ok(result["sessions"].clone())
     }
 
     /// A new session in the project's folders; returns its id.
-    pub async fn new_session(&self, project: &Project) -> anyhow::Result<String> {
-        let params = json!({
-            "cwd": project.main(),
-            "mcpServers": [],
-            "additionalDirectories": project.related().iter().map(|f| &f.path).collect::<Vec<_>>(),
-        });
+    pub async fn new_session(&self) -> anyhow::Result<String> {
+        let params = json!({ "cwd": self.cwd, "mcpServers": [], "additionalDirectories": self.folders });
         let result = self.request("session/new", params, Some(REQUEST_TIMEOUT)).await?;
         let session = result["sessionId"].as_str().map(str::to_string).context("OpenCode didn't name the session")?;
         self.open.lock().unwrap().insert(session.clone());
@@ -294,8 +362,8 @@ impl Engine {
     }
 
     /// Opens a saved session; OpenCode replays it as updates.
-    pub async fn load_session(&self, project: &Project, session: &str) -> anyhow::Result<()> {
-        let params = json!({ "sessionId": session, "cwd": project.main(), "mcpServers": [] });
+    pub async fn load_session(&self, session: &str) -> anyhow::Result<()> {
+        let params = json!({ "sessionId": session, "cwd": self.cwd, "mcpServers": [] });
         self.request("session/load", params, Some(REQUEST_TIMEOUT)).await?;
         self.open.lock().unwrap().insert(session.to_string());
         Ok(())

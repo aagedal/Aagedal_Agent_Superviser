@@ -149,6 +149,11 @@ fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))
 }
 
+/// What a project's launch files (and its VM) are named after: its id and main folder.
+pub fn stem(project_id: &str, main: &Path) -> String {
+    format!("{:x}", fnv(format!("{project_id}\n{}", main.display()).as_bytes()))
+}
+
 /// What the Terminal window says about a project's other folders and blocked programs.
 pub fn rules_banner(related: &[Folder], blocked_programs: &[String]) -> Vec<String> {
     let mut lines: Vec<String> = related
@@ -209,7 +214,7 @@ pub fn launch(paths: &Paths, launch: &Launch) -> anyhow::Result<Launched> {
     let backend = backend(project.isolation);
     backend.available().map_err(|why| anyhow::anyhow!("{} isn't available: {why}", backend.label()))?;
     backend.suits(&main).map_err(|why| anyhow::anyhow!("{} doesn't suit this project: {why}", backend.label()))?;
-    let stem = format!("{:x}", fnv(format!("{}\n{}", project.id, main.display()).as_bytes()));
+    let stem = stem(&project.id, &main);
     let guard_socket = paths.guard_socket();
     let guard_path = project.guard_path();
     let request = Request {
