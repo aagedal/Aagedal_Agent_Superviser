@@ -2,3 +2,5 @@
 **/*.rs.bk
 .DS_Store
 /app/gen
+# Bundled programs, fetched by app/build.rs from app/sidecars.json
+/app/binaries
