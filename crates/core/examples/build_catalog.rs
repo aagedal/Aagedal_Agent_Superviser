@@ -1,5 +1,7 @@
 //! Regenerates `catalog/curated.json` from `catalog/sources.json`. With `--judge-only`, only
-//! the judge's entry is refreshed and the chat models keep their pinned commits.
+//! the judge's entry is refreshed and the chat models keep their pinned commits. With
+//! `--new-only`, models already in `curated.json` keep their pins (their names, descriptions
+//! and ratings still come from `sources.json`) and only new ones are fetched.
 
 use serde::Deserialize;
 use superviser_core::catalog::{Catalog, CatalogModel};
@@ -17,6 +19,8 @@ struct Source {
     name: Option<String>,
     #[serde(default)]
     description: String,
+    capability: Option<u8>,
+    active_params: Option<f32>,
 }
 
 #[tokio::main]
@@ -24,7 +28,10 @@ async fn main() -> anyhow::Result<()> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../catalog");
     let sources: Sources = serde_json::from_str(&std::fs::read_to_string(root.join("sources.json"))?)?;
     let hub = Hub::new(std::env::var("HF_TOKEN").ok());
+    let new_only = std::env::args().any(|a| a == "--new-only");
+    let pinned = Catalog::bundled();
     let judge = match &sources.judge {
+        Some(_) if new_only => pinned.judge.clone(),
         Some(source) => Some(CatalogModel::resolve(&hub, &source.repo, source.name.as_deref(), &source.description).await?),
         None => None,
     };
@@ -36,7 +43,16 @@ async fn main() -> anyhow::Result<()> {
     }
     let mut models = Vec::new();
     for source in sources.models {
-        let model = CatalogModel::resolve(&hub, &source.repo, source.name.as_deref(), &source.description).await?;
+        let mut model = match pinned.models.iter().find(|m| new_only && m.repo == source.repo) {
+            Some(model) => model.clone(),
+            None => CatalogModel::resolve(&hub, &source.repo, source.name.as_deref(), &source.description).await?,
+        };
+        if let Some(name) = &source.name {
+            model.name = name.clone();
+        }
+        model.description = source.description.clone();
+        model.capability = source.capability;
+        model.active_params = source.active_params;
         eprintln!(
             "{:<50} {:<11} {:>6.1} GiB  kv {:>7} B/token  ctx {:?}  {}",
             model.repo,
@@ -48,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
         );
         models.push(model);
     }
-    let generated = time::OffsetDateTime::now_utc().date().to_string();
+    let generated = if new_only && models.len() == pinned.models.len() { pinned.generated } else { time::OffsetDateTime::now_utc().date().to_string() };
     let catalog = Catalog { version: 1, generated, models, judge };
     std::fs::write(root.join("curated.json"), serde_json::to_string_pretty(&catalog)? + "\n")?;
     Ok(())

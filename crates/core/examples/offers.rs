@@ -18,5 +18,9 @@ fn main() {
             })
             .collect();
         println!("{total_gb:>3} GB Mac (budget {:.1} GiB): {}", hardware.model_budget as f64 / GIB as f64, if names.is_empty() { "nothing fits".into() } else { names.join(", ") });
+        let picks: Vec<String> = Catalog::picks(&offers, total).iter().map(|p| format!("{:?}: {}", p.role, p.offer.model.name)).collect();
+        if !picks.is_empty() {
+            println!("{:>12}short list: {}", "", picks.join(", "));
+        }
     }
 }

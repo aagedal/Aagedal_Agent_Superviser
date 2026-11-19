@@ -405,6 +405,8 @@ fn evaluate(candidate: Candidate) -> Result<InstalledModel, String> {
             revision: candidate.revision,
             name: candidate.name,
             description: String::new(),
+            capability: None,
+            active_params: None,
             arch: info.arch.clone(),
             context_length,
             kv_bytes_per_token: info.kv_bytes_per_token(),
