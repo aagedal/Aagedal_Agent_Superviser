@@ -525,6 +525,84 @@ pub async fn acp_delete(handle: AppHandle, app: State<'_, Arc<App>>, project: St
     engine.delete_session(&session).await.map_err(|e| format!("{e:#}"))
 }
 
+// --- Opening the project's files ---
+
+/// Editors offered in "Open with", if installed.
+const EDITORS: &[&str] = &["Visual Studio Code", "Cursor", "Zed", "Sublime Text", "BBEdit", "Nova", "Xcode", "TextEdit"];
+
+/// Kinds of file whose default app runs them: opening one would run the agent's code
+/// outside the sandbox, so they only open in an editor or Finder.
+const RUNS_CODE: &[&str] = &[
+    "app", "command", "sh", "bash", "zsh", "fish", "csh", "ksh", "tool", "terminal", "scpt", "scptd", "applescript", "workflow",
+    "action", "shortcut", "pkg", "mpkg", "dmg", "jar", "py", "pyw", "rb", "pl", "php", "url", "webloc", "inetloc", "fileloc",
+    "osax", "prefpane", "kext", "plugin", "bundle", "dylib", "so", "mobileconfig",
+];
+
+fn installed_app(name: &str) -> bool {
+    let home = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Applications"));
+    ["/Applications".into(), "/System/Applications".into()].into_iter().chain(home).any(|dir: std::path::PathBuf| dir.join(format!("{name}.app")).exists())
+}
+
+/// Whether opening `path` in its default app could run it.
+fn runs_code(path: &std::path::Path) -> bool {
+    let extension = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if RUNS_CODE.contains(&extension.as_str()) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path.is_file() && std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0) {
+            return true;
+        }
+    }
+    false
+}
+
+#[derive(Serialize)]
+pub struct FileInfo {
+    /// Its full path.
+    path: String,
+    /// Its default app might run it; offer an editor or Finder instead.
+    runs_code: bool,
+    is_dir: bool,
+}
+
+/// A project file the chat mentions, if it exists in the project's folders.
+#[tauri::command]
+pub fn project_file(app: State<'_, Arc<App>>, project: String, path: String) -> Option<FileInfo> {
+    let found = app.project(&project)?.find(&path)?;
+    Some(FileInfo { runs_code: runs_code(&found), is_dir: found.is_dir(), path: found.display().to_string() })
+}
+
+/// The editors installed, for "Open with".
+#[tauri::command]
+pub fn editors() -> Vec<&'static str> {
+    EDITORS.iter().copied().filter(|name| installed_app(name)).collect()
+}
+
+/// Opens a project file in its default app (`how` = `default`), in one of [`EDITORS`]
+/// (`editor`, with `editor` set), or shows it in Finder (`finder`).
+#[tauri::command]
+pub fn open_file(app: State<'_, Arc<App>>, project: String, path: String, how: String, editor: Option<String>) -> Result<()> {
+    let project = self::project(&app, &project)?;
+    let file = project.find(&path).ok_or_else(|| format!("{path} isn't in this project's folders"))?;
+    let mut command = std::process::Command::new("/usr/bin/open");
+    match how.as_str() {
+        "finder" => {
+            command.arg("-R");
+        }
+        "editor" => {
+            let editor = editor.filter(|e| EDITORS.contains(&e.as_str()) && installed_app(e)).ok_or("that editor isn't installed")?;
+            command.args(["-a", &editor]);
+        }
+        _ if runs_code(&file) => return Err(format!("{} could run as a program, outside the sandbox. Open it in an editor or show it in Finder.", file.display())),
+        _ => {}
+    }
+    let status = command.arg(&file).status().map_err(err)?;
+    if status.success() { Ok(()) } else { Err(format!("couldn't open {}", file.display())) }
+}
+
 // --- The built-in agent ---
 
 #[tauri::command]

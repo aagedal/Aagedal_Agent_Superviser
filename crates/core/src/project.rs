@@ -135,6 +135,14 @@ impl Project {
         Ok(self)
     }
 
+    /// An existing file or folder of the project, by a path relative to the main folder or
+    /// absolute, with symlinks resolved; `None` outside its folders.
+    pub fn find(&self, path: &str) -> Option<PathBuf> {
+        let path = Path::new(path.trim());
+        let found = std::fs::canonicalize(if path.is_absolute() { path.to_path_buf() } else { self.main().join(path) }).ok()?;
+        self.folders.iter().filter_map(|f| std::fs::canonicalize(&f.path).ok()).any(|f| found.starts_with(f)).then_some(found)
+    }
+
     /// Tool names the guard blocks for it.
     pub fn blocked_tools(&self) -> Vec<String> {
         self.off_groups().flat_map(|g| g.names.iter().map(|n| n.to_string())).collect()
@@ -222,6 +230,22 @@ mod tests {
         assert_eq!(project.tools_off, ["web"]);
         assert!(Project { folders: vec![], ..project.clone() }.normalized().is_err());
         assert!(Project { id: "../x".into(), ..project }.normalized().is_err());
+    }
+
+    #[test]
+    fn finds_only_files_in_its_folders() {
+        let root = std::env::temp_dir().join(format!("superviser-find-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("site/src")).unwrap();
+        std::fs::write(root.join("site/src/app.js"), "").unwrap();
+        std::fs::write(root.join("secret.txt"), "").unwrap();
+        let project = Project::new(root.join("site"));
+        let found = project.find("src/app.js").unwrap();
+        assert!(found.ends_with("site/src/app.js"));
+        assert_eq!(project.find(&found.display().to_string()), Some(found));
+        assert_eq!(project.find("../secret.txt"), None);
+        assert_eq!(project.find(&root.join("secret.txt").display().to_string()), None);
+        assert_eq!(project.find("missing.js"), None);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

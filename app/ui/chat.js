@@ -38,20 +38,103 @@ const view = {
 
 // --- Drawing ---
 
-// Text with ```fenced``` blocks and `inline code`, built without HTML.
+// Text with ```fenced``` blocks, `inline code`, **bold** and # headings, built without HTML.
+// Inline code naming one of the project's files becomes a link to it.
 function richText(text) {
   const box = el("div", { class: "text" });
   text.split("```").forEach((part, i) => {
     if (i % 2) {
       box.append(el("pre", {}, el("code", {}, part.replace(/^[^\n]*\n/, "").replace(/\n$/, ""))));
     } else if (part.trim()) {
-      const p = el("div", { class: "prose" });
-      part.split(/`([^`\n]+)`/).forEach((piece, j) => p.append(j % 2 ? el("code", {}, piece) : piece));
-      box.append(p);
+      const prose = el("div", { class: "prose" });
+      const lines = part.replace(/^\n+|\n+$/g, "").split("\n");
+      lines.forEach((line, n) => {
+        const heading = /^#{1,6}\s+(.*)$/.exec(line);
+        if (heading) prose.append(el("div", { class: "md-h" }, inline(heading[1])));
+        else prose.append(...inline(line), n < lines.length - 1 ? "\n" : "");
+      });
+      box.append(prose);
     }
   });
   return box;
 }
+
+function inline(text) {
+  return text.split(/`([^`\n]+)`/).flatMap((piece, i) => {
+    if (i % 2) {
+      const code = el("code", {}, piece);
+      if (looksLikePath(piece)) linkPath(code, piece);
+      return [code];
+    }
+    return piece.split(/\*\*([^*\n]+)\*\*/).map((part, j) => (j % 2 ? el("strong", {}, part) : part));
+  });
+}
+
+const looksLikePath = (text) => !/\s/.test(text) && (text.includes("/") || /\.[A-Za-z0-9]{1,8}$/.test(text)) && !/^[a-z]+:\/\//i.test(text);
+
+// --- Opening the project's files ---
+
+let editors = null; // the installed ones, asked once
+const fileInfo = new Map(); // "project\npath" -> what `project_file` said, asked once per chat
+
+// Makes `node` open `path` if it's one of the project's files: a click opens it, a right-click offers more.
+async function linkPath(node, path) {
+  if (!project || !path || node.dataset.path === path) return;
+  node.dataset.path = path;
+  const key = `${project.id}\n${path}`;
+  if (!fileInfo.has(key)) fileInfo.set(key, invoke("project_file", { project: project.id, path }).catch(() => null));
+  const info = await fileInfo.get(key);
+  if (!info || node.dataset.path !== path) return;
+  node.classList.add("path-link");
+  node.title = info.runs_code ? "Could run as a program: click for options" : `${info.is_dir ? "Show in Finder" : "Open"}; right-click for more`;
+  node.onclick = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (info.runs_code) fileMenu(event, info);
+    else openFile(info.path, "default");
+  };
+  node.oncontextmenu = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    fileMenu(event, info);
+  };
+}
+
+async function openFile(path, how, editor = null) {
+  try {
+    await invoke("open_file", { project: project.id, path, how, editor });
+  } catch (e) {
+    alert(e);
+  }
+}
+
+async function fileMenu(event, info) {
+  closeMenu();
+  editors ??= await invoke("editors");
+  const item = (label, action) => el("button", { class: "menu-item", onclick: () => { closeMenu(); action(); } }, label);
+  const menu = el(
+    "div",
+    { class: "menu", id: "file-menu" },
+    info.runs_code
+      ? el("div", { class: "menu-note" }, "This could run as a program, outside the sandbox, so it only opens in an editor or Finder.")
+      : item(info.is_dir ? "Open in Finder" : "Open", () => openFile(info.path, "default")),
+    ...editors.filter((name) => !(info.is_dir && name === "TextEdit")).map((name) => item(`Open in ${name}`, () => openFile(info.path, "editor", name))),
+    item("Show in Finder", () => openFile(info.path, "finder")),
+  );
+  document.body.append(menu);
+  const { innerWidth, innerHeight } = window;
+  menu.style.left = `${Math.min(event.clientX, innerWidth - menu.offsetWidth - 8)}px`;
+  menu.style.top = `${Math.min(event.clientY, innerHeight - menu.offsetHeight - 8)}px`;
+}
+
+function closeMenu() {
+  $("file-menu")?.remove();
+}
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#file-menu")) closeMenu();
+});
+document.addEventListener("keydown", (event) => event.key === "Escape" && closeMenu());
+window.addEventListener("blur", closeMenu);
 
 function textOf(content) {
   return content?.type === "text" ? content.text || "" : "";
@@ -63,6 +146,8 @@ function list() {
 
 function clearView() {
   for (const map of Object.values(view)) map.clear();
+  // Files may have come or gone since.
+  fileInfo.clear();
   list().replaceChildren();
 }
 
@@ -177,7 +262,9 @@ function upsertTool(update) {
   }
   const call = card.call;
   card.verb.textContent = VERBS[call.kind] || call.name || call.title || "Tool";
-  card.what.textContent = subject(call) || "";
+  const about = subject(call) || "";
+  if (card.what.textContent !== about) card.what.textContent = about;
+  if (["read", "edit", "delete", "move"].includes(call.kind) && about) linkPath(card.what, about);
   const failed = call.status === "failed";
   card.box.classList.toggle("failed", failed);
   // A finished call has no question left.
