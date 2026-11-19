@@ -59,6 +59,21 @@ fn main() {
             });
             tauri::async_runtime::block_on(app.start_guard(on_event))?;
 
+            // Killed (Activity Monitor, `kill`, a logout): quit properly, stopping the model servers.
+            #[cfg(unix)]
+            {
+                let quit = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    let (Ok(mut term), Ok(mut interrupt)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else { return };
+                    tokio::select! {
+                        _ = term.recv() => {}
+                        _ = interrupt.recv() => {}
+                    }
+                    quit.exit(0);
+                });
+            }
+            app.rescan();
 
             TrayIconBuilder::with_id(TRAY_ID)
                 .icon(Image::from_bytes(include_bytes!("../icons/tray.png"))?)

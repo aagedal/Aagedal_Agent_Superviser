@@ -176,6 +176,8 @@ impl App {
     pub fn new() -> anyhow::Result<Self> {
         let paths = Paths::new()?;
         superviser_core::paths::private_dir(&paths.data)?;
+        // Model servers a killed or crashed earlier run left behind.
+        runtime::stop_leftovers(&paths.run(), &paths.upstream_api_key().display().to_string());
         let mut settings: Settings = std::fs::read_to_string(paths.settings())
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
@@ -264,6 +266,7 @@ impl App {
         let mut server = self.judge_server.lock().await;
         let Some(model) = wanted else {
             if let Some(mut old) = server.take() {
+                self.remember_pid("judge", None);
                 old.stop().await;
             }
             self.set_guard_judge(None);
@@ -273,7 +276,10 @@ impl App {
         if server.as_mut().is_none_or(|s| !s.is_running()) {
             *self.judge_status.lock().unwrap() = JudgeStatus::Loading;
             match self.start_judge(&model).await {
-                Ok(started) => *server = Some(started),
+                Ok(started) => {
+                    self.remember_pid("judge", started.pid());
+                    *server = Some(started);
+                }
                 Err(e) => {
                     tracing::warn!("judge: {e:#}");
                     *server = None;
@@ -589,6 +595,7 @@ impl App {
                     server.stop().await;
                     bail!("{} was unloaded while it loaded", model.model.name);
                 }
+                self.remember_pid(&model.alias, server.pid());
                 self.running.lock().await.insert(id.to_string(), Running { server });
                 set_state(LoadState::Running { context: fit.context });
                 self.sync_upstreams().await;
@@ -620,10 +627,25 @@ impl App {
         };
         self.models.lock().unwrap().retain(|m| id.is_some_and(|id| id != m.id));
         for mut running in stopping {
+            self.remember_pid(&running.server.alias, None);
             running.server.stop().await;
         }
         self.sync_upstreams().await;
         self.sync_judge().await;
+    }
+
+    /// Records (or with `None` forgets) a model server's pid in `run/`, for [`runtime::stop_leftovers`].
+    fn remember_pid(&self, name: &str, pid: Option<u32>) {
+        let file = self.paths.run().join(format!("{name}.pid"));
+        match pid {
+            Some(pid) => {
+                let _ = superviser_core::paths::private_dir(&self.paths.run());
+                let _ = superviser_core::paths::write_private(&file, pid.to_string().as_bytes());
+            }
+            None => {
+                let _ = std::fs::remove_file(file);
+            }
+        }
     }
 
     /// Points the guard at every loaded model's server, by alias; requests naming none of
@@ -744,12 +766,14 @@ impl App {
         self.engines.stop_all();
         if let Ok(mut running) = self.running.try_lock() {
             for (_, mut running) in running.drain() {
+                self.remember_pid(&running.server.alias, None);
                 tauri::async_runtime::block_on(running.server.stop());
             }
         }
         if let Ok(mut judge) = self.judge_server.try_lock()
             && let Some(mut judge) = judge.take()
         {
+            self.remember_pid("judge", None);
             tauri::async_runtime::block_on(judge.stop());
         }
         if let Some(guard) = self.guard.lock().unwrap().as_mut() {

@@ -56,6 +56,11 @@ impl Paths {
         std::env::temp_dir().join(format!("agent-superviser-{user}.sock"))
     }
 
+    /// Process ids of the model servers running, so a later run can stop them if this one dies.
+    pub fn run(&self) -> PathBuf {
+        self.data.join("run")
+    }
+
     /// Which model each chat uses.
     pub fn chat_models(&self) -> PathBuf {
         self.data.join("chat-models.json")

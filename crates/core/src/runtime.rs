@@ -124,12 +124,43 @@ impl LlamaServer {
         }
     }
 
+    /// Its process id, while it runs.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
 
     pub async fn stop(&mut self) {
         let _ = self.child.kill().await;
+    }
+}
+
+/// Stops llama-servers a previous run of the app left behind (it was killed, or crashed),
+/// listed as `<name>.pid` files in `dir`, and removes the files. A pid is only stopped if it
+/// still runs llama-server with `marker` (the app's key file) in its arguments, so a reused pid
+/// or the user's own llama-server is left alone.
+pub fn stop_leftovers(dir: &Path, marker: &str) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "pid") {
+            continue;
+        }
+        if let Some(pid) = std::fs::read_to_string(&path).ok().and_then(|t| t.trim().parse::<u32>().ok())
+            && std::process::Command::new("/bin/ps")
+                .args(["-o", "command=", "-p", &pid.to_string()])
+                .output()
+                .is_ok_and(|out| {
+                    let command = String::from_utf8_lossy(&out.stdout);
+                    command.contains("llama-server") && command.contains(marker)
+                })
+        {
+            tracing::info!("stopping a model server left from an earlier run (pid {pid})");
+            let _ = std::process::Command::new("/bin/kill").arg(pid.to_string()).status();
+        }
+        let _ = std::fs::remove_file(path);
     }
 }
 
