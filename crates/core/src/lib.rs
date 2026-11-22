@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod awake;
 pub mod catalog;
+pub mod conversations;
 pub mod discover;
 pub mod gguf;
 pub mod hardware;

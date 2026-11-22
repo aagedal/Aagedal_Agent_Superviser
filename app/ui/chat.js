@@ -28,6 +28,9 @@ let busy = false;
 let status = null; // the model server's
 let pending = []; // events for a chat whose id isn't known yet
 let awaiting = false;
+let usage = null; // {used, size} tokens of the open chat, as OpenCode reports them
+let archived = new Set(); // the project's archived chats
+let showArchived = false;
 
 const view = {
   tools: new Map(), // toolCallId -> card
@@ -330,7 +333,11 @@ function applyUpdate(update) {
       upsertTool(update);
       break;
     case "usage_update":
-      if (update.size) $("usage").textContent = `${Math.round(update.used / 1000)}k of ${Math.round(update.size / 1000)}k tokens`;
+      if (update.size) {
+        usage = { used: update.used, size: update.size };
+        $("usage").textContent = `${Math.round(update.used / 1000)}k of ${Math.round(update.size / 1000)}k tokens`;
+        update();
+      }
       break;
   }
 }
@@ -440,6 +447,7 @@ function emptyState() {
 async function showChat(id) {
   session = id;
   busy = false;
+  usage = null;
   clearView();
   $("usage").textContent = "";
   $("title").textContent = "New chat";
@@ -475,18 +483,37 @@ async function renderChatList() {
     return;
   }
   box.dataset.project = project.id;
+  archived = new Set(await invoke("archived_chats", { project: project.id }).catch(() => []));
   chatTitles = new Map(chats.map((c) => [c.id, c.title]));
   if (session && chatTitles.has(session)) $("title").textContent = chatTitles.get(session);
-  box.replaceChildren(
-    ...chats.map((chat) =>
-      el(
-        "div",
-        { class: `chat-item${chat.id === session ? " active" : ""}`, onclick: () => showChat(chat.id) },
-        el("span", { class: "chat-item-title" }, chat.title),
-        el("button", { class: "chat-item-delete", title: "Delete chat", onclick: (event) => { event.stopPropagation(); deleteChat(chat); } }, "×"),
-      ),
-    ),
-  );
+  const item = (chat) =>
+    el(
+      "div",
+      { class: `chat-item${chat.id === session ? " active" : ""}`, onclick: () => showChat(chat.id) },
+      el("span", { class: "chat-item-title" }, chat.title),
+      archived.has(chat.id)
+        ? el("button", { class: "chat-item-action", title: "Put back in the list", onclick: (event) => { event.stopPropagation(); archiveChat(chat.id, false); } }, "↩")
+        : el("button", { class: "chat-item-action", title: "Archive chat", onclick: (event) => { event.stopPropagation(); archiveChat(chat.id, true); } }, "⤓"),
+      el("button", { class: "chat-item-action", title: "Delete chat", onclick: (event) => { event.stopPropagation(); deleteChat(chat); } }, "×"),
+    );
+  const kept = chats.filter((c) => archived.has(c.id));
+  const more = el("details", { class: "archived-chats" }, el("summary", { class: "small muted" }, `Archived (${kept.length})`), ...kept.map(item));
+  more.open = showArchived || kept.some((c) => c.id === session);
+  more.addEventListener("toggle", () => (showArchived = more.open));
+  box.replaceChildren(...chats.filter((c) => !archived.has(c.id)).map(item), ...(kept.length ? [more] : []));
+  update();
+}
+
+// Archived chats are kept, out of the list; sending in one puts it back.
+async function archiveChat(id, archive) {
+  try {
+    await invoke("set_chat_archived", { project: project.id, chat: id, archived: archive });
+  } catch (e) {
+    alert(e);
+    return;
+  }
+  if (archive && id === session) showChat(null);
+  else renderChatList();
 }
 
 async function deleteChat(chat) {
@@ -599,6 +626,10 @@ $("chat-model").addEventListener("change", async () => {
 window.addEventListener("focus", loadModels);
 
 // What can be done now, and what's in the way.
+// Of the context, from where a new chat is suggested: well before OpenCode summarizes it, which
+// it does when what's left won't hold a reply (we give replies a quarter of the context).
+const LONG_CHAT = 0.6;
+
 function update() {
   const notice = $("notice");
   const reasons = [];
@@ -612,11 +643,16 @@ function update() {
     const unload = (room?.unload || []).map((id) => loadedModels.find((m) => m.id === id)?.name || id);
     notes.push(unload.length ? `Sending loads ${modelName(chatModel)}, unloading ${unload.join(" and ")} to make room.` : `Sending loads ${modelName(chatModel)}.`);
   }
-  notice.hidden = reasons.length + notes.length === 0;
   notice.replaceChildren(
     ...reasons.map(([text, label, action]) => el("div", { class: "row" }, el("span", { class: "spacer" }, text), el("button", { onclick: action }, label))),
     ...notes.map((text) => el("div", { class: "row info" }, text)),
   );
+  // Long chats: a new one for a new task beats OpenCode summarizing this one when it's full.
+  const share = usage && usage.size ? usage.used / usage.size : 0;
+  const long = session && !busy && share >= LONG_CHAT ? [`This chat uses ${Math.round(usage.used / 1000)}k of ${Math.round(usage.size / 1000)}k tokens. Local models get slower and less reliable as a chat grows, and when it's nearly full OpenCode replaces it with a summary, which loses detail. If this task is done, start a new chat.`] : [];
+  notice.hidden = reasons.length + notes.length + long.length === 0;
+  notice.append(...long.map((text) => el("div", { class: "row info" }, el("span", { class: "spacer" }, text), el("button", { onclick: () => archiveChat(session, true) }, "Archive and start a new chat"))));
+  $("archive").hidden = !session || archived.has(session);
   renderModelPicker();
   $("send").disabled = busy || reasons.length > 0 || !chatModel;
   $("send").hidden = busy;
@@ -720,6 +756,7 @@ async function send(text) {
       await invoke("load_model", { id: chatModel });
       await refreshStatus();
     }
+    if (session && archived.has(session)) await invoke("set_chat_archived", { project: project.id, chat: session, archived: false }).then(() => archived.delete(session)).catch(() => {});
     await engines[engine].send(text);
     if (session) invoke("set_chat_model", { project: project.id, chat: session, model: chatModel }).catch(() => {});
   } catch (e) {
@@ -743,6 +780,7 @@ $("input").addEventListener("keydown", (event) => {
 });
 $("stop").addEventListener("click", () => session && engines[engine].stop());
 $("new-chat").addEventListener("click", () => showChat(null));
+$("archive").addEventListener("click", () => session && archiveChat(session, true));
 $("project").addEventListener("change", () => openProject($("project").value));
 $("manage").addEventListener("click", () => invoke("open_window", { name: "settings" }));
 

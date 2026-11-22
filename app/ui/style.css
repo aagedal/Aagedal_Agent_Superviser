@@ -191,8 +191,10 @@ progress { width: 140px; height: 6px; accent-color: var(--accent); }
 .chat-item:hover { background: var(--chip); }
 .chat-item.active { background: var(--chip); font-weight: 500; }
 .chat-item-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chat-item-delete { visibility: hidden; border: none; background: none; padding: 0 4px; color: var(--muted); }
-.chat-item:hover .chat-item-delete { visibility: visible; }
+.chat-item-action { visibility: hidden; border: none; background: none; padding: 0 4px; color: var(--muted); }
+.chat-item:hover .chat-item-action { visibility: visible; }
+.archived-chats { margin-top: 8px; }
+.archived-chats summary { cursor: pointer; padding: 4px 8px; }
 .sidebar-foot { border-top: 1px solid var(--line); padding-top: 8px; }
 .chat { display: flex; flex-direction: column; height: 100%; min-width: 0; }
 .chat header { padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; justify-content: space-between; align-items: center; gap: 12px; }

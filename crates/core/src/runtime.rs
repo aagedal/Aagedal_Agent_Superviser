@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 
-use crate::catalog::Sampling;
+use crate::catalog::{KvType, Sampling};
 
 /// Overrides where llama-server is found.
 pub const BINARY_ENV: &str = "SUPERVISER_LLAMA_SERVER";
@@ -32,6 +32,9 @@ pub struct ServerConfig {
     pub speculative: bool,
     /// Thinking tokens before the model is told to answer; `None` is unlimited.
     pub reasoning_budget: Option<u32>,
+    pub kv: KvType,
+    /// Where it may save its conversation and load it back ([`LlamaServer::save_slot`]).
+    pub slot_dir: Option<PathBuf>,
 }
 
 pub struct LlamaServer {
@@ -39,7 +42,25 @@ pub struct LlamaServer {
     pub port: u16,
     pub alias: String,
     pub context: u64,
+    api_key_file: PathBuf,
 }
+
+/// Its conversation as `/slots` describes it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Slot {
+    pub tokens: u64,
+    pub busy: bool,
+}
+
+/// A conversation written to the slot folder.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Saved {
+    pub tokens: u64,
+    pub bytes: u64,
+}
+
+/// Saving waits for a reply in progress; restoring reads a few GB at most.
+const SLOT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The folder the app bundles llama.cpp's build in, with its libraries.
 const BUNDLED_FOLDER: &str = "llama.cpp";
@@ -84,6 +105,14 @@ pub fn args(config: &ServerConfig) -> Vec<String> {
         "--api-key-file".into(),
         config.api_key_file.display().to_string(),
     ];
+    if config.kv != KvType::F16 {
+        for flag in ["--cache-type-k", "--cache-type-v"] {
+            args.extend([flag.to_string(), config.kv.llama_name().to_string()]);
+        }
+    }
+    if let Some(dir) = &config.slot_dir {
+        args.extend(["--slot-save-path".into(), dir.display().to_string()]);
+    }
     if config.decision {
         for flag in ["--batch-size", "--ubatch-size"] {
             args.extend([flag.to_string(), config.context.to_string()]);
@@ -123,7 +152,46 @@ impl LlamaServer {
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("starting {}", config.binary.display()))?;
-        Ok(Self { child, port: config.port, alias: config.alias, context: config.context })
+        Ok(Self { child, port: config.port, alias: config.alias, context: config.context, api_key_file: config.api_key_file })
+    }
+
+    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match std::fs::read_to_string(&self.api_key_file) {
+            Ok(key) => request.bearer_auth(key.trim()),
+            Err(_) => request,
+        }
+    }
+
+    /// The conversation in its one slot.
+    pub async fn slot(&self) -> anyhow::Result<Slot> {
+        let request = reqwest::Client::new().get(format!("{}/slots", self.base_url())).timeout(Duration::from_secs(5));
+        let slots: serde_json::Value = self.authorized(request).send().await?.error_for_status()?.json().await?;
+        let slot = slots.get(0).context("llama-server listed no slots")?;
+        Ok(Slot { tokens: slot["n_prompt_tokens"].as_u64().unwrap_or(0), busy: slot["is_processing"].as_bool().unwrap_or(false) })
+    }
+
+    async fn slot_action(&self, action: &str, filename: &str) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}/slots/0?action={action}", self.base_url());
+        let request = reqwest::Client::new().post(url).json(&serde_json::json!({ "filename": filename })).timeout(SLOT_TIMEOUT);
+        let response = self.authorized(request).send().await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("llama-server couldn't {action} the conversation ({status}): {}", body["error"]["message"].as_str().unwrap_or(""));
+        }
+        Ok(body)
+    }
+
+    /// Writes its conversation to `filename` in the slot folder.
+    pub async fn save_slot(&self, filename: &str) -> anyhow::Result<Saved> {
+        let body = self.slot_action("save", filename).await?;
+        Ok(Saved { tokens: body["n_saved"].as_u64().unwrap_or(0), bytes: body["n_written"].as_u64().unwrap_or(0) })
+    }
+
+    /// Loads a conversation saved by [`LlamaServer::save_slot`]; returns its tokens.
+    pub async fn restore_slot(&self, filename: &str) -> anyhow::Result<u64> {
+        let body = self.slot_action("restore", filename).await?;
+        Ok(body["n_restored"].as_u64().unwrap_or(0))
     }
 
     pub fn base_url(&self) -> String {
@@ -210,8 +278,15 @@ mod tests {
             sampling: None,
             speculative: false,
             reasoning_budget: None,
+            kv: KvType::F16,
+            slot_dir: None,
         };
         assert!(!args(&config).iter().any(|a| a == "--ubatch-size"));
+        assert!(!args(&config).iter().any(|a| a == "--cache-type-k" || a == "--slot-save-path"));
+        let q8 = args(&ServerConfig { kv: KvType::Q8, slot_dir: Some("/c/slots".into()), ..config.clone() });
+        for pair in [["--cache-type-k", "q8_0"], ["--cache-type-v", "q8_0"], ["--slot-save-path", "/c/slots"]] {
+            assert!(q8.windows(2).any(|w| w == pair), "{pair:?} in {q8:?}");
+        }
         let decision = args(&ServerConfig { decision: true, ..config.clone() });
         assert!(decision.windows(2).any(|w| w == ["--ubatch-size", "32768"]));
         let args = args(&config);
@@ -238,6 +313,8 @@ mod tests {
             sampling: Some(sampling),
             speculative: true,
             reasoning_budget: Some(16384),
+            kv: KvType::Q8,
+            slot_dir: None,
         };
         let args = args(&config);
         for pair in [["--spec-type", "ngram-mod"], ["--reasoning-budget", "16384"], ["--temp", "0.6"], ["--top-p", "0.95"], ["--top-k", "20"], ["--min-p", "0"], ["--repeat-penalty", "1"]] {

@@ -98,12 +98,43 @@ fn one() -> f32 {
     1.0
 }
 
+/// How llama-server stores the KV cache. 8-bit (q8_0: 32 values in 34 bytes) takes 17/32 of
+/// 16-bit's memory, so models get the full context on smaller Macs and more fit at once. It
+/// reads prompts a little slower (7% on Gemma 3 4B at 24k tokens on an M5 Pro), and its error
+/// is far below the 4-bit weights'. The GGUF header gives the 16-bit size.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KvType {
+    #[default]
+    Q8,
+    F16,
+}
+
+impl KvType {
+    /// What `f16` bytes of cache take in this type.
+    pub fn bytes(self, f16: u64) -> u64 {
+        match self {
+            Self::Q8 => f16 * 17 / 32,
+            Self::F16 => f16,
+        }
+    }
+
+    /// llama-server's name for it (`--cache-type-k`, `--cache-type-v`).
+    pub fn llama_name(self) -> &'static str {
+        match self {
+            Self::Q8 => "q8_0",
+            Self::F16 => "f16",
+        }
+    }
+}
+
 /// How a model would run here.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
 pub struct Fit {
     pub context: u64,
     /// Weights, KV cache at `context` and runtime buffers.
     pub required: u64,
+    pub kv: KvType,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -224,8 +255,19 @@ impl CatalogModel {
         self.active_params.is_some_and(|b| b <= FAST_ACTIVE_PARAMS)
     }
 
+    /// How it fits `budget` with the default (8-bit) KV cache.
     pub fn fit(&self, budget: u64) -> Option<Fit> {
-        fit(self.quant.size + self.kv_fixed_bytes, self.kv_bytes_per_token, self.context_length, budget)
+        self.fit_with(budget, KvType::default())
+    }
+
+    pub fn fit_with(&self, budget: u64, kv: KvType) -> Option<Fit> {
+        fit(self.quant.size + kv.bytes(self.kv_fixed_bytes), self.kv_bytes_per_token, self.context_length, budget, kv)
+    }
+
+    /// About what a conversation of `tokens` takes saved to disk: its KV cells and the
+    /// sliding-window layers' cache.
+    pub fn saved_bytes(&self, tokens: u64, kv: KvType) -> u64 {
+        kv.bytes(self.kv_bytes_per_token.unwrap_or(FALLBACK_KV_PER_TOKEN) * tokens + self.kv_fixed_bytes)
     }
 
     /// Memory the judge takes while it runs beside a model.
@@ -237,8 +279,8 @@ impl CatalogModel {
     /// the agent's survives a short request in between, but never more than the model leaves
     /// free of `ram_budget`. With less, a long conversation is read again after one.
     pub fn prompt_cache(&self, fit: &Fit, ram_budget: u64) -> u64 {
-        let per_token = self.kv_bytes_per_token.unwrap_or(FALLBACK_KV_PER_TOKEN) + SAVED_BYTES_PER_TOKEN;
-        let conversation = per_token * fit.context + self.kv_fixed_bytes + SAVED_EXTRA_BYTES;
+        let per_token = fit.kv.bytes(self.kv_bytes_per_token.unwrap_or(FALLBACK_KV_PER_TOKEN)) + SAVED_BYTES_PER_TOKEN;
+        let conversation = per_token * fit.context + fit.kv.bytes(self.kv_fixed_bytes) + SAVED_EXTRA_BYTES;
         conversation.min(ram_budget.saturating_sub(fit.required))
     }
 
@@ -279,9 +321,9 @@ impl CatalogModel {
 }
 
 /// The largest of [`CONTEXTS`] (capped at the model's own) at which the model fits `budget`.
-/// `weights` includes any context-independent cache.
-pub fn fit(weights: u64, kv_per_token: Option<u64>, model_context: Option<u64>, budget: u64) -> Option<Fit> {
-    let kv = kv_per_token.unwrap_or(FALLBACK_KV_PER_TOKEN);
+/// `weights` includes any context-independent cache; `kv_per_token` is the 16-bit size.
+pub fn fit(weights: u64, kv_per_token: Option<u64>, model_context: Option<u64>, budget: u64, kv_type: KvType) -> Option<Fit> {
+    let kv = kv_type.bytes(kv_per_token.unwrap_or(FALLBACK_KV_PER_TOKEN));
     // Compute buffers grow with the model; half a GiB covers the small ones.
     let overhead = (512 << 20) + weights / 32;
     let max_context = model_context.unwrap_or(MIN_CONTEXT);
@@ -290,7 +332,7 @@ pub fn fit(weights: u64, kv_per_token: Option<u64>, model_context: Option<u64>, 
     }
     CONTEXTS.iter().map(|&c| c.min(max_context)).find_map(|context| {
         let required = weights + kv * context + overhead;
-        (required <= budget).then_some(Fit { context, required })
+        (required <= budget).then_some(Fit { context, required, kv: kv_type })
     })
 }
 
@@ -311,16 +353,25 @@ mod tests {
     #[test]
     fn picks_the_largest_context_that_fits() {
         // 5 GiB of weights, 32 KiB per token: 64k context needs 2 GiB of cache.
-        let fit64 = fit(5 * GIB, Some(32 * 1024), Some(262_144), 10 * GIB).unwrap();
+        let fit64 = fit(5 * GIB, Some(32 * 1024), Some(262_144), 10 * GIB, KvType::F16).unwrap();
         assert_eq!(fit64.context, 65_536);
-        let fit32 = fit(5 * GIB, Some(32 * 1024), Some(262_144), 7 * GIB).unwrap();
+        let fit32 = fit(5 * GIB, Some(32 * 1024), Some(262_144), 7 * GIB, KvType::F16).unwrap();
         assert_eq!(fit32.context, 32_768);
-        assert_eq!(fit(5 * GIB, Some(32 * 1024), Some(262_144), 6 * GIB), None);
+        assert_eq!(fit(5 * GIB, Some(32 * 1024), Some(262_144), 6 * GIB, KvType::F16), None);
+    }
+
+    #[test]
+    fn an_8_bit_cache_gets_more_context_in_the_same_memory() {
+        // 64k context at 17 KiB per token is 1.06 GiB of cache instead of 2.
+        let fit = fit(5 * GIB, Some(32 * 1024), Some(262_144), 7 * GIB, KvType::Q8).unwrap();
+        assert_eq!((fit.context, fit.kv), (65_536, KvType::Q8));
+        assert_eq!(KvType::Q8.bytes(32 * 1024), 17 * 1024);
+        assert_eq!(KvType::default(), KvType::Q8);
     }
 
     #[test]
     fn short_context_models_are_not_offered() {
-        assert_eq!(fit(GIB, Some(1024), Some(8192), 64 * GIB), None);
+        assert_eq!(fit(GIB, Some(1024), Some(8192), 64 * GIB, KvType::Q8), None);
     }
 
     #[test]
@@ -385,9 +436,11 @@ mod tests {
     fn prompt_cache_holds_one_conversation_and_stays_in_free_memory() {
         let catalog = Catalog::bundled();
         let model = catalog.models.iter().find(|m| m.repo == "unsloth/Qwen3.5-4B-GGUF").unwrap();
-        let fit = Fit { context: 32_768, required: 5 * GIB };
+        let fit = Fit { context: 32_768, required: 5 * GIB, kv: KvType::F16 };
         // 40 KiB per token at 32k context, plus room for a short one.
         assert_eq!(model.prompt_cache(&fit, 60 * GIB), (1280 + 256) << 20);
+        // 8-bit: 17 + 8 KiB per token.
+        assert_eq!(model.prompt_cache(&Fit { kv: KvType::Q8, ..fit }, 60 * GIB), (800 + 256) << 20);
         assert_eq!(model.prompt_cache(&fit, 5 * GIB + (500 << 20)), 500 << 20);
         assert_eq!(model.prompt_cache(&fit, 5 * GIB), 0);
         assert_eq!(model.prompt_cache(&fit, 4 * GIB), 0);

@@ -92,6 +92,9 @@ impl Policy {
         let temp_root = real(&temp).parent().map(Path::to_path_buf).unwrap_or(real(&temp));
         let mut policy = Self::for_home(project, &home, &temp_root, network);
         policy.hidden.push(real(&paths.data));
+        // Under Library/Caches, which tools may write: saved conversations hold other
+        // projects' chats, and one planted there would be read as a model's context.
+        policy.hidden.push(real(&paths.cache));
         policy.readable.push(real(&paths.local_api_key()));
         Ok(policy)
     }
@@ -312,6 +315,16 @@ mod tests {
         // Hidden paths come after the writable ones, so they win.
         assert!(profile.find("(deny file-read* file-write*").unwrap() > profile.find("(allow file-write*").unwrap());
         assert!(!Policy::for_home(Path::new("/p"), Path::new("/h"), Path::new("/t"), Network::Internet).profile().contains("remote ip"));
+    }
+
+    #[test]
+    fn saved_conversations_are_hidden_though_caches_are_writable() {
+        let paths = Paths::at("/nonexistent/state");
+        let policy = Policy::new(Path::new("/nonexistent/app"), &paths, Network::Internet).unwrap();
+        let profile = policy.profile();
+        let hidden = profile.find("(deny file-read* file-write*").unwrap();
+        let cache = profile.rfind(&format!("(subpath \"{}\")", paths.cache.display())).expect("the cache folder in the profile");
+        assert!(cache > hidden, "{profile}");
     }
 
     #[test]

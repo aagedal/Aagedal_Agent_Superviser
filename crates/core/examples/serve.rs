@@ -31,6 +31,8 @@ async fn main() -> anyhow::Result<()> {
         decision: false,
         sampling: catalog.curated(&model.model.repo).and_then(|m| m.sampling),
         reasoning_budget: catalog.curated(&model.model.repo).and_then(|m| m.reasoning_budget),
+        kv: superviser_core::catalog::KvType::Q8,
+        slot_dir: None,
         speculative: true,
     })
     .await?;

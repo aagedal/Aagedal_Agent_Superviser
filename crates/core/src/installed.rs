@@ -228,7 +228,7 @@ fn check_space(name: &str, missing: u64, free: u64) -> anyhow::Result<()> {
 /// Bytes free at `dir` (or the nearest folder above it that exists) for files the user asked
 /// for: on macOS this counts the purgeable space the system frees on demand, as Finder does,
 /// which `statvfs` leaves out. `None` where we can't tell.
-fn available_space(dir: &Path) -> Option<u64> {
+pub(crate) fn available_space(dir: &Path) -> Option<u64> {
     let existing = dir.ancestors().find(|d| d.is_dir())?;
     #[cfg(target_os = "macos")]
     {
