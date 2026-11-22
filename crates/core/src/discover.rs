@@ -369,6 +369,10 @@ fn evaluate(candidate: Candidate) -> Result<InstalledModel, String> {
     if info.ints.contains_key("pooling_type") {
         return Err("an embedding model, not a chat model".into());
     }
+    // Unsloth's own layout of looped models (Inkling 2): mainline llama.cpp gives gibberish.
+    if info.ints.contains_key("num_loops") {
+        return Err("made for Unsloth's llama.cpp build; download it in the app instead".into());
+    }
     let label = quant::label(&entry)
         .or_else(|| info.file_type.and_then(quant::label_for_file_type).map(str::to_string))
         .ok_or("unknown quantization")?;
@@ -411,6 +415,8 @@ fn evaluate(candidate: Candidate) -> Result<InstalledModel, String> {
             context_length,
             kv_bytes_per_token: info.kv_bytes_per_token(),
             kv_fixed_bytes: info.kv_cache().map_or(0, |kv| kv.fixed),
+            sampling: None,
+            reasoning_budget: None,
             quant: QuantGroup { label, files, size },
         },
         installed_at,
@@ -475,6 +481,8 @@ mod tests {
         tree.file(&format!("{snap}/mtp-Qwen3.8-27B.gguf"), &model(262_144, 7));
         tree.file("models--unsloth--Big-GGUF/snapshots/a/Q4_K_M/Big-Q4_K_M-00001-of-00002.gguf", &model(131_072, 15));
         tree.file("models--unsloth--bge-small-en-v1.5-GGUF/snapshots/b/bge-small-en-v1.5-f16.gguf", &model(512, 1));
+        let looped = header_with("inkling2", &[], &[("block_count", 48), ("context_length", 1_048_576), ("num_loops", 3)], &[]);
+        tree.file("models--unsloth--Inkling-2-Mini-GGUF/snapshots/d/Inkling-2-Mini-UD-Q4_K_M.gguf", &looped);
         tree.file("models--mlx-community--Qwen3.5-2B-4bit/snapshots/c/config.json", b"{}");
         tree.file("models--mlx-community--Qwen3.5-2B-4bit/snapshots/c/model.safetensors", b"");
 
@@ -490,6 +498,7 @@ mod tests {
         assert!(reasons.iter().any(|r| r.contains("incomplete download (1 of 2 parts)")), "{reasons:?}");
         assert!(reasons.iter().any(|r| r.contains("not a chat model")), "{reasons:?}");
         assert!(reasons.iter().any(|r| r.contains("draft")), "{reasons:?}");
+        assert!(reasons.iter().any(|r| r.contains("Unsloth's llama.cpp build")), "{reasons:?}");
         assert_eq!(found.mlx.len(), 1);
     }
 

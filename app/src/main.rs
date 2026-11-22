@@ -7,6 +7,7 @@ mod acp;
 mod agent;
 mod commands;
 mod state;
+mod update;
 
 use std::sync::Arc;
 
@@ -32,7 +33,9 @@ fn main() {
     let app = Arc::new(App::new().expect("app state"));
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(app.clone())
+        .manage(update::Updates::default())
         // In the Dock and Command-Tab only while one of its windows is open.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
@@ -83,6 +86,8 @@ fn main() {
                 .show_menu_on_left_click(true)
                 .on_menu_event(on_menu_event)
                 .build(tauri_app)?;
+
+            update::start(&handle);
 
             // Until the first-run guide is finished or skipped, open it.
             if !app.settings.lock().unwrap().setup_done {
@@ -227,9 +232,21 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
     let in_opencode = Submenu::with_id_and_items(handle, "in-opencode", "Open in OpenCode", cfg!(target_os = "macos") && !opencode_refs.is_empty(), &opencode_refs)?;
     let settings = MenuItem::with_id(handle, "settings", "Settings…", true, Some("CmdOrCtrl+,"))?;
     let quit = MenuItem::with_id(handle, "quit", "Quit Agent Superviser", true, Some("CmdOrCtrl+Q"))?;
+    let update = handle.state::<update::Updates>().available().map(|(version, installing)| {
+        let label = if installing { format!("Installing {version}…") } else { format!("Update to {version} and Restart…") };
+        MenuItem::with_id(handle, "update", label, !installing, None::<&str>)
+    });
+    let update = update.transpose()?;
+    let separator_top = PredefinedMenuItem::separator(handle)?;
+    let mut top: Vec<&dyn IsMenuItem<tauri::Wry>> = Vec::new();
+    if let Some(update) = &update {
+        top.extend([update as &dyn IsMenuItem<tauri::Wry>, &separator_top]);
+    }
     Menu::with_items(
         handle,
         &[
+            &top[..],
+            &[
             &status_item,
             &guard_item,
             &PredefinedMenuItem::separator(handle)?,
@@ -243,7 +260,9 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
             &settings,
             &PredefinedMenuItem::separator(handle)?,
             &quit,
-        ],
+            ],
+        ]
+        .concat(),
     )
 }
 
@@ -280,6 +299,7 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
     let handle = handle.clone();
     match id.as_str() {
         "quit" => handle.exit(0),
+        "update" => update::install(&handle),
         "chat" => {
             if let Err(e) = open_chat(&handle, None) {
                 tracing::warn!("opening chat: {e}");

@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use superviser_core::catalog::Catalog;
 use superviser_core::paths::Paths;
 use superviser_core::runtime::{self, LlamaServer, ServerConfig};
 use superviser_core::{installed, secrets};
@@ -17,6 +18,7 @@ async fn main() -> anyhow::Result<()> {
     let port: u16 = args[1].parse()?;
     let client_key = std::fs::read_to_string(&args[2])?.trim().to_string();
     let model = installed::list(&paths).into_iter().next().expect("an installed model");
+    let catalog = Catalog::bundled();
     let mut server = LlamaServer::start(ServerConfig {
         binary: runtime::find_llama_server().expect("llama-server"),
         model_path: model.entry_path().unwrap(),
@@ -27,6 +29,9 @@ async fn main() -> anyhow::Result<()> {
         log_file: paths.logs().join("llama-server.log"),
         prompt_cache: 2 << 30,
         decision: false,
+        sampling: catalog.curated(&model.model.repo).and_then(|m| m.sampling),
+        reasoning_budget: catalog.curated(&model.model.repo).and_then(|m| m.reasoning_budget),
+        speculative: true,
     })
     .await?;
     server.wait_ready(Duration::from_secs(120)).await?;
@@ -39,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
         upstream_api_key: Some(secrets::upstream_api_key(&paths)?),
         cors_origins: vec![],
         judge: None,
+        on_model_call: None,
     };
     let guard = GuardServer::start(tokio::net::TcpListener::bind(("127.0.0.1", port)).await?, config, options).await?;
     guard.set_upstream(Some(server.base_url()));

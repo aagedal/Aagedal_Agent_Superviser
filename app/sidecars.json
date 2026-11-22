@@ -1,7 +1,8 @@
 {
-  "_comment": "Programs bundled with the app, pinned by SHA-256. build.rs downloads the ones for the build target into binaries/ when missing: a single program becomes a Tauri externalBin; one with a `folder` is copied there with the libraries it links (a Tauri resource). OpenCode is MIT, ripgrep MIT or Unlicense, llama.cpp MIT; see NOTICE.md.",
+  "_comment": "Programs bundled with the app, pinned by SHA-256. build.rs downloads the ones for the build target into binaries/ when missing: a single program becomes a Tauri externalBin, which a signed build signs as the app; one with a `folder` is copied there with the libraries it links (a Tauri resource), which keeps its own signature (OpenCode's is its authors' Developer ID, with the JIT entitlements Bun needs). OpenCode is MIT, ripgrep MIT or Unlicense, llama.cpp MIT; see NOTICE.md.",
   "opencode": {
     "version": "2.3.2",
+    "folder": "opencode",
     "aarch64-apple-darwin": {
       "url": "https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-darwin-arm64.zip",
       "sha256": "31ab5a06a29edc7e49b895f35c2b64ebfe7c7f0437b0f2581b006efcd79fee1a",
@@ -27,17 +28,17 @@
     }
   },
   "llama-server": {
-    "version": "b12359",
+    "version": "b12631",
     "folder": "llama.cpp",
     "aarch64-apple-darwin": {
-      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-macos-arm64.tar.gz",
-      "sha256": "82b00abc740160e1b9980e6cc79c117345fa34af058c80e6c0a69aa8ddccde75",
-      "member": "llama-b12359/llama-server"
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12631/llama-b12631-bin-macos-arm64.tar.gz",
+      "sha256": "8de65a20e743b27405f05e6f89c636b879fd040fdd2c9abd4730fc0632ca49a5",
+      "member": "llama-b12631/llama-server"
     },
     "x86_64-apple-darwin": {
-      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-macos-x64.tar.gz",
-      "sha256": "25320d529077ef5a3d16e7b5da26438f221d88c8c0930a32b0c79457f5eede56",
-      "member": "llama-b12359/llama-server"
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12631/llama-b12631-bin-macos-x64.tar.gz",
+      "sha256": "3c785878e79257be7ba52c08b1303871a5b64665866036824b15c11c7b008e26",
+      "member": "llama-b12631/llama-server"
     }
   }
 }

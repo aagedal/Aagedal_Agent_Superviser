@@ -1,0 +1,173 @@
+# Builds, signs and notarizes the macOS app (Apple silicon only, for now) for a version tag (`v0.2.0`), and drafts a GitHub
+# release with the DMGs and the updater's files. Publishing the draft is what ships it: the
+# app's updater reads `latest.json` from the latest published release.
+#
+# Secrets (see README → Releases): APPLE_CERTIFICATE (base64 .p12 of a Developer ID
+# Application certificate), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY, APPLE_ID,
+# APPLE_PASSWORD (an app-specific password), APPLE_TEAM_ID, TAURI_SIGNING_PRIVATE_KEY and
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TAURI_CLI_VERSION: 2.12.6
+  TARGET: aarch64-apple-darwin
+
+jobs:
+  build:
+    name: Build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the tag and the updater key
+        run: |
+          version=$(python3 -c 'import json; print(json.load(open("app/tauri.conf.json"))["version"])')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME doesn't match version $version in app/tauri.conf.json"; exit 1
+          fi
+          pubkey=$(python3 -c 'import json; print(json.load(open("app/tauri.conf.json"))["plugins"]["updater"]["pubkey"])')
+          if [ -z "$pubkey" ]; then
+            echo "::error::app/tauri.conf.json has no updater public key (plugins.updater.pubkey); see README → Releases"; exit 1
+          fi
+          # A missing secret is an empty string, and Tauri then silently skips signing or notarizing.
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY; do
+            if [ -z "${!name}" ]; then echo "::error::The secret $name is not set"; exit 1; fi
+          done
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+
+      - name: Install Rust and the Tauri CLI
+        run: |
+          rustup update stable
+          rustup target add $TARGET
+          cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
+
+      - name: Import the signing certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(openssl rand -base64 24)
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+
+      # Tauri signs the app and ripgrep (an externalBin) but not resources. OpenCode keeps its
+      # authors' Developer ID signature; llama.cpp's release is only ad-hoc signed, so it's
+      # signed here (build.rs keeps the fetched files, since their checksum marker still matches).
+      - name: Fetch the bundled programs and sign llama.cpp
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          cargo check --release -p agent-superviser --target $TARGET
+          for file in app/binaries/llama.cpp/llama-server app/binaries/llama.cpp/*.dylib; do
+            codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$file"
+          done
+          codesign --verify --strict --verbose=2 app/binaries/opencode/opencode
+          codesign -dv app/binaries/opencode/opencode 2>&1 | grep -q 'flags=.*runtime' || { echo "::error::OpenCode isn't signed with the hardened runtime"; exit 1; }
+
+      - name: Build, sign and notarize the app
+        working-directory: app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: cargo tauri build --ci --target $TARGET --config '{"bundle":{"createUpdaterArtifacts":true}}'
+
+      # Tauri notarizes the app but only signs the DMG, so the DMG is notarized and stapled here.
+      - name: Notarize the DMG and check both
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          bundle="target/$TARGET/release/bundle"
+          app="$bundle/macos/Agent Superviser.app"
+          dmg=$(ls "$bundle"/dmg/*.dmg)
+          xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait --timeout 1h
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+
+      - name: Collect the release files
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          bundle="target/$TARGET/release/bundle"
+          mkdir dist
+          cp "$(ls "$bundle"/dmg/*.dmg)" "dist/Agent-Superviser_${version}_aarch64.dmg"
+          cp "$bundle/macos/Agent Superviser.app.tar.gz" "dist/Agent-Superviser_aarch64.app.tar.gz"
+          cp "$bundle/macos/Agent Superviser.app.tar.gz.sig" "dist/Agent-Superviser_aarch64.app.tar.gz.sig"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Draft the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: dist
+
+      - name: Write the updater manifest
+        run: |
+          python3 - <<'EOF'
+          import datetime, json, os, pathlib
+          tag = os.environ["GITHUB_REF_NAME"]
+          base = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{tag}"
+          platforms = {}
+          for arch in ("aarch64",):
+              name = f"Agent-Superviser_{arch}.app.tar.gz"
+              signature = pathlib.Path("dist", name + ".sig").read_text().strip()
+              platforms[f"darwin-{arch}"] = {"signature": signature, "url": f"{base}/{name}"}
+          manifest = {
+              "version": tag.removeprefix("v"),
+              "notes": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/tag/{tag}",
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": platforms,
+          }
+          pathlib.Path("dist/latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          EOF
+
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "Agent Superviser ${GITHUB_REF_NAME#v}" --generate-notes

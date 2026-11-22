@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use superviser_core::catalog::CatalogModel;
+use superviser_core::catalog::{Catalog, CatalogModel};
 use superviser_core::hub::Hub;
 use superviser_core::paths::Paths;
 use superviser_core::runtime::{self, LlamaServer, ServerConfig};
@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
     assert_eq!(installed::list(&paths).len(), 1);
 
     let upstream_key = secrets::upstream_api_key(&paths)?;
+    let catalog = Catalog::bundled();
     let mut server = LlamaServer::start(ServerConfig {
         binary: runtime::find_llama_server().expect("llama-server on PATH"),
         model_path: installed.entry_path().unwrap(),
@@ -47,6 +48,9 @@ async fn main() -> anyhow::Result<()> {
         log_file: paths.logs().join("llama-server.log"),
         prompt_cache: 0,
         decision: false,
+        sampling: catalog.curated(&installed.model.repo).and_then(|m| m.sampling),
+        reasoning_budget: catalog.curated(&installed.model.repo).and_then(|m| m.reasoning_budget),
+        speculative: true,
     })
     .await?;
     server.wait_ready(Duration::from_secs(120)).await?;
@@ -58,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     assert_eq!(direct.status(), 401);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let options = ProxyOptions { api_key: Some("client".into()), upstream_api_key: Some(upstream_key), cors_origins: vec![], judge: None };
+    let options = ProxyOptions { api_key: Some("client".into()), upstream_api_key: Some(upstream_key), cors_origins: vec![], judge: None, on_model_call: None };
     let guard = GuardServer::start(listener, Config::default(), options).await?;
     guard.set_upstream(Some(server.base_url()));
     let url = format!("http://{}/v1/chat/completions", guard.addr);

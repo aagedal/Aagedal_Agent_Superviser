@@ -78,6 +78,13 @@ pub fn bundled(name: &str) -> Option<PathBuf> {
     program.is_file().then_some(program)
 }
 
+/// A program bundled with the app in a folder of its own (with the libraries it needs): in the
+/// `.app`'s `Contents/Resources/<folder>`, or beside the executable when developing.
+pub fn bundled_in(folder: &str, name: &str) -> Option<PathBuf> {
+    let dir = bundled_dir()?;
+    [dir.join("../Resources").join(folder).join(name), dir.join(folder).join(name)].into_iter().find(|p| p.is_file())
+}
+
 /// The folder the app's executable and its bundled programs are in.
 pub fn bundled_dir() -> Option<PathBuf> {
     std::env::current_exe().ok()?.parent().map(Path::to_path_buf)

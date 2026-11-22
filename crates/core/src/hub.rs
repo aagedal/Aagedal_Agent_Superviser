@@ -162,7 +162,7 @@ impl Hub {
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let part = dest.with_extension("gguf.part");
+        let part = part_path(dest);
         let mut hasher = Sha256::new();
         let mut have = 0u64;
         if let Ok(mut existing) = tokio::fs::File::open(&part).await {
@@ -232,10 +232,18 @@ impl Hub {
     }
 }
 
+/// Where [`Hub::download`] keeps a download to `dest` until it is complete.
+pub fn part_path(dest: &Path) -> std::path::PathBuf {
+    dest.with_extension("gguf.part")
+}
+
 fn group_quants(entries: Vec<TreeEntry>) -> Vec<QuantGroup> {
+    // A repo with files in mainline llama.cpp's layout publishes its plain GGUFs for another build.
+    let mainline = entries.iter().any(|e| e.kind == "file" && quant::is_mainline(&e.path));
     let mut groups: Vec<QuantGroup> = Vec::new();
     for entry in entries {
-        if entry.kind != "file" || !entry.path.to_ascii_lowercase().ends_with(".gguf") || quant::is_auxiliary(&entry.path) {
+        let gguf = if mainline { quant::is_mainline(&entry.path) } else { entry.path.to_ascii_lowercase().ends_with(".gguf") };
+        if entry.kind != "file" || !gguf || quant::is_auxiliary(&entry.path) {
             continue;
         }
         let Some(label) = quant::label(&entry.path) else { continue };
@@ -285,5 +293,18 @@ mod tests {
         assert_eq!(labels, ["Q4_K_M", "Q8_0"]);
         assert_eq!(groups[0].size, 15);
         assert_eq!(groups[0].entry_file().unwrap().path, "Q4_K_M/m-Q4_K_M-00001-of-00002.gguf");
+    }
+
+    #[test]
+    fn prefers_files_for_mainline_llama_cpp() {
+        let groups = group_quants(vec![
+            entry("m-UD-Q4_K_M.gguf", 10),
+            entry("m-UD-Q8_K_XL.gguf", 20),
+            entry("Mainline_Support/m-UD-Q4_K_M.gguf_file", 11),
+            entry("mmproj-F16.gguf", 1),
+        ]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "UD-Q4_K_M");
+        assert_eq!(groups[0].entry_file().unwrap().path, "Mainline_Support/m-UD-Q4_K_M.gguf_file");
     }
 }

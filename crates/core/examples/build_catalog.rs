@@ -4,7 +4,7 @@
 //! and ratings still come from `sources.json`) and only new ones are fetched.
 
 use serde::Deserialize;
-use superviser_core::catalog::{Catalog, CatalogModel};
+use superviser_core::catalog::{Catalog, CatalogModel, Sampling};
 use superviser_core::hub::Hub;
 
 #[derive(Deserialize)]
@@ -21,6 +21,8 @@ struct Source {
     description: String,
     capability: Option<u8>,
     active_params: Option<f32>,
+    sampling: Option<Sampling>,
+    reasoning_budget: Option<u32>,
 }
 
 #[tokio::main]
@@ -53,6 +55,8 @@ async fn main() -> anyhow::Result<()> {
         model.description = source.description.clone();
         model.capability = source.capability;
         model.active_params = source.active_params;
+        model.sampling = source.sampling;
+        model.reasoning_budget = source.reasoning_budget;
         eprintln!(
             "{:<50} {:<11} {:>6.1} GiB  kv {:>7} B/token  ctx {:?}  {}",
             model.repo,

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated": "2026-11-19",
+  "generated": "2026-11-22",
   "models": [
     {
       "repo": "unsloth/Qwen3.5-4B-GGUF",
@@ -13,6 +13,14 @@
       "context_length": 262144,
       "kv_bytes_per_token": 32768,
       "kv_fixed_bytes": 0,
+      "sampling": {
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
       "quant": {
         "label": "Q4_K_M",
         "files": [
@@ -36,6 +44,14 @@
       "context_length": 262144,
       "kv_bytes_per_token": 32768,
       "kv_fixed_bytes": 0,
+      "sampling": {
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
       "quant": {
         "label": "Q4_K_M",
         "files": [
@@ -59,6 +75,14 @@
       "context_length": 262144,
       "kv_bytes_per_token": 16384,
       "kv_fixed_bytes": 503316480,
+      "sampling": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 64,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0
+      },
       "quant": {
         "label": "Q4_K_M",
         "files": [
@@ -82,6 +106,14 @@
       "context_length": 131072,
       "kv_bytes_per_token": 24576,
       "kv_fixed_bytes": 15728640,
+      "sampling": {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0
+      },
       "quant": {
         "label": "Q4_K_M",
         "files": [
@@ -105,6 +137,14 @@
       "context_length": 393216,
       "kv_bytes_per_token": 163840,
       "kv_fixed_bytes": 0,
+      "sampling": {
+        "temperature": 0.15,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0
+      },
       "quant": {
         "label": "Q4_K_M",
         "files": [
@@ -128,6 +168,14 @@
       "context_length": 262144,
       "kv_bytes_per_token": 65536,
       "kv_fixed_bytes": 0,
+      "sampling": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0
+      },
       "quant": {
         "label": "UD-Q4_K_M",
         "files": [
@@ -141,6 +189,38 @@
       }
     },
     {
+      "repo": "unsloth/Inkling-2-Mini-GGUF",
+      "revision": "45fd08764f2b0bf16b03a5483a80e5c7aaec8772",
+      "name": "Inkling 2 Mini",
+      "description": "Thinking Machines' looped mixture-of-experts model. Close to Qwen3.8 27B, and faster.",
+      "capability": 8,
+      "active_params": 5.4,
+      "arch": "inkling2_loop",
+      "context_length": 1048576,
+      "kv_bytes_per_token": 32768,
+      "kv_fixed_bytes": 251658240,
+      "sampling": {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0
+      },
+      "reasoning_budget": 16384,
+      "quant": {
+        "label": "UD-Q4_K_M",
+        "files": [
+          {
+            "path": "Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file",
+            "size": 16610544608,
+            "sha256": "78fcedcf93c5d1bfe83e225513b71392bb52259be0eaa5f8899c856a2e5834ae"
+          }
+        ],
+        "size": 16610544608
+      }
+    },
+    {
       "repo": "unsloth/GLM-4.7-Flash-GGUF",
       "revision": "0d32489ecb9db6d2a4fc93bd27ef01519f95474d",
       "name": "GLM-4.7 Flash",
@@ -151,6 +231,14 @@
       "context_length": 202752,
       "kv_bytes_per_token": 102272,
       "kv_fixed_bytes": 0,
+      "sampling": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.01,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0
+      },
       "quant": {
         "label": "Q4_K_M",
         "files": [
@@ -174,6 +262,14 @@
       "context_length": 262144,
       "kv_bytes_per_token": 98304,
       "kv_fixed_bytes": 0,
+      "sampling": {
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.05
+      },
       "quant": {
         "label": "Q4_K_M",
         "files": [
@@ -197,6 +293,14 @@
       "context_length": 262144,
       "kv_bytes_per_token": 20480,
       "kv_fixed_bytes": 0,
+      "sampling": {
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0
+      },
       "quant": {
         "label": "UD-Q4_K_M",
         "files": [
@@ -220,6 +324,14 @@
       "context_length": 262144,
       "kv_bytes_per_token": 24576,
       "kv_fixed_bytes": 0,
+      "sampling": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0
+      },
       "quant": {
         "label": "Q4_K_M",
         "files": [
@@ -243,6 +355,14 @@
       "context_length": 131072,
       "kv_bytes_per_token": 36864,
       "kv_fixed_bytes": 23592960,
+      "sampling": {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0
+      },
       "quant": {
         "label": "Q4_K_M",
         "files": [

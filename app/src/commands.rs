@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 use superviser_core::agent::{Chat, ChatSummary};
+use superviser_core::awake::Awake;
 use superviser_core::catalog::{Catalog, CatalogModel, Fit, Offer, Pick};
 use superviser_core::discover::{Locations, MlxModel, Skipped};
 use superviser_core::hardware::Hardware;
@@ -121,6 +122,7 @@ pub fn download_model(handle: AppHandle, app: State<'_, Arc<App>>, model: Catalo
     let app = app.inner().clone();
     let task_id = id.clone();
     tauri::async_runtime::spawn(async move {
+        let _awake = Awake::hold();
         let mut last = std::time::Instant::now();
         let result = installed::install(&hub(), &app.paths, &model, cancel, |p| {
             if last.elapsed().as_millis() >= 250 || p.done == p.total {
@@ -337,6 +339,7 @@ pub fn download_judge(handle: AppHandle, app: State<'_, Arc<App>>) -> Result<()>
     }
     let app = app.inner().clone();
     tauri::async_runtime::spawn(async move {
+        let _awake = Awake::hold();
         let mut last = std::time::Instant::now();
         let dir = installed::judge_dir(&app.paths, &model);
         let result = installed::install_to(&hub(), &dir, &model, cancel, |p| {
