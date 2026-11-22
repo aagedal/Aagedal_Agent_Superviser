@@ -36,8 +36,28 @@ static LABEL: LazyLock<Regex> = LazyLock::new(|| {
 static SHARD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-\d{5}-of-\d{5}$").unwrap());
 static FIRST_SHARD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-0*1-of-\d{5}\.gguf$").unwrap());
 
+/// What Unsloth names GGUFs in mainline llama.cpp's layout when the plain `.gguf` files in
+/// the same repo need its own llama.cpp build (`Mainline_Support/*.gguf_file`).
+const MAINLINE_SUFFIX: &str = ".gguf_file";
+
+/// Whether `path` is a GGUF in mainline llama.cpp's layout, published beside files that need
+/// another build; see [`MAINLINE_SUFFIX`].
+pub fn is_mainline(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(MAINLINE_SUFFIX)
+}
+
+/// Where a repo file is saved: the same path, with `.gguf_file` renamed to `.gguf` so llama.cpp
+/// finds the other shards.
+pub fn local_path(path: &str) -> String {
+    match path.len().checked_sub(MAINLINE_SUFFIX.len()) {
+        Some(stem) if is_mainline(path) => format!("{}.gguf", &path[..stem]),
+        _ => path.to_string(),
+    }
+}
+
 /// The quant label of a GGUF file path, upper-cased (`Q4_K_M`, `UD-Q4_K_XL`, `BF16`).
 pub fn label(path: &str) -> Option<String> {
+    let path = local_path(path);
     let file = path.rsplit('/').next()?;
     let stem = file.strip_suffix(".gguf").or_else(|| file.strip_suffix(".GGUF"))?;
     let stem = SHARD.replace(stem, "");
@@ -71,11 +91,13 @@ pub fn preferred<'a>(labels: impl IntoIterator<Item = &'a str>) -> Option<&'a st
 
 /// Whether `path` is the file llama.cpp should be pointed at: the only file, or the first shard.
 pub fn is_entry_file(path: &str) -> bool {
-    !SHARD.is_match(path.trim_end_matches(".gguf")) || FIRST_SHARD.is_match(path)
+    let path = local_path(path);
+    !SHARD.is_match(path.trim_end_matches(".gguf")) || FIRST_SHARD.is_match(&path)
 }
 
 /// `(index, total)` of a shard such as `m-Q4_K_M-00002-of-00003.gguf`.
 pub fn shard(path: &str) -> Option<(u32, u32)> {
+    let path = local_path(path);
     let stem = path.trim_end_matches(".gguf");
     let tail = SHARD.find(stem)?.as_str();
     let (index, total) = tail.trim_start_matches('-').split_once("-of-")?;
@@ -189,5 +211,16 @@ mod tests {
         assert!(is_entry_file("Q4_K_M/a-Q4_K_M-00001-of-00003.gguf"));
         assert!(!is_entry_file("Q4_K_M/a-Q4_K_M-00002-of-00003.gguf"));
         assert!(is_auxiliary("mmproj-F16.gguf"));
+    }
+
+    #[test]
+    fn mainline_files_are_saved_as_gguf() {
+        let path = "Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file";
+        assert!(is_mainline(path));
+        assert_eq!(local_path(path), "Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf");
+        assert_eq!(label(path).as_deref(), Some("UD-Q4_K_M"));
+        assert!(is_entry_file(path));
+        assert!(!is_entry_file("Mainline_Support/a-Q4_K_M-00002-of-00003.gguf_file"));
+        assert_eq!(local_path("a-Q4_K_M.gguf"), "a-Q4_K_M.gguf");
     }
 }

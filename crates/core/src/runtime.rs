@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 
+use crate::catalog::Sampling;
+
 /// Overrides where llama-server is found.
 pub const BINARY_ENV: &str = "SUPERVISER_LLAMA_SERVER";
 
@@ -23,6 +25,13 @@ pub struct ServerConfig {
     pub prompt_cache: u64,
     /// A decision model reads its whole input in one batch: `context` tokens.
     pub decision: bool,
+    /// The server's defaults; requests can still set their own.
+    pub sampling: Option<Sampling>,
+    /// Draft from n-grams already in the conversation. Coding agents re-emit much of what they
+    /// read (whole files in edits), which this speeds up about sixfold, with the same output.
+    pub speculative: bool,
+    /// Thinking tokens before the model is told to answer; `None` is unlimited.
+    pub reasoning_budget: Option<u32>,
 }
 
 pub struct LlamaServer {
@@ -41,16 +50,12 @@ pub fn find_llama_server() -> Option<PathBuf> {
         return Some(PathBuf::from(path));
     }
     let name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
-    if let Some(dir) = crate::paths::bundled_dir() {
-        // In the `.app` resources sit in `Contents/Resources`; when developing, beside the executable.
-        for bundled in [dir.join("../Resources").join(BUNDLED_FOLDER).join(name), dir.join(BUNDLED_FOLDER).join(name), dir.join(name)] {
-            if bundled.is_file() {
-                return Some(bundled);
-            }
-        }
-    }
-    which::which("llama-server").ok()
+    crate::paths::bundled_in(BUNDLED_FOLDER, name).or_else(|| crate::paths::bundled(name)).or_else(|| which::which("llama-server").ok())
 }
+
+/// What a model reads when its reasoning budget runs out, before thinking ends: a nudge to act
+/// rather than an abrupt cut mid-sentence.
+const BUDGET_MESSAGE: &str = "\n\nI've thought about this long enough, so I'll act on what I have now.\n";
 
 /// A port nothing listens on right now.
 pub fn free_port() -> std::io::Result<u16> {
@@ -83,6 +88,23 @@ pub fn args(config: &ServerConfig) -> Vec<String> {
         for flag in ["--batch-size", "--ubatch-size"] {
             args.extend([flag.to_string(), config.context.to_string()]);
         }
+    }
+    if config.speculative {
+        args.extend(["--spec-type".into(), "ngram-mod".into()]);
+    }
+    if let Some(budget) = config.reasoning_budget {
+        args.extend(["--reasoning-budget".into(), budget.to_string(), "--reasoning-budget-message".into(), BUDGET_MESSAGE.into()]);
+    }
+    if let Some(s) = config.sampling {
+        let flags = [
+            ("--temp", s.temperature.to_string()),
+            ("--top-p", s.top_p.to_string()),
+            ("--top-k", s.top_k.to_string()),
+            ("--min-p", s.min_p.to_string()),
+            ("--presence-penalty", s.presence_penalty.to_string()),
+            ("--repeat-penalty", s.repeat_penalty.to_string()),
+        ];
+        args.extend(flags.into_iter().flat_map(|(flag, value)| [flag.to_string(), value]));
     }
     args
 }
@@ -185,6 +207,9 @@ mod tests {
             log_file: "/l/log".into(),
             prompt_cache: 1536 << 20,
             decision: false,
+            sampling: None,
+            speculative: false,
+            reasoning_budget: None,
         };
         assert!(!args(&config).iter().any(|a| a == "--ubatch-size"));
         let decision = args(&ServerConfig { decision: true, ..config.clone() });
@@ -194,5 +219,29 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--api-key"));
         assert!(args.windows(2).any(|w| w == ["--host", "127.0.0.1"]));
         assert!(args.windows(2).any(|w| w == ["--cache-ram", "1536"]));
+        assert!(!args.iter().any(|a| a == "--temp" || a == "--spec-type" || a == "--reasoning-budget"));
+    }
+
+    #[test]
+    fn sampling_becomes_server_defaults() {
+        let sampling = Sampling { temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0, repeat_penalty: 1.0 };
+        let config = ServerConfig {
+            binary: "llama-server".into(),
+            model_path: "/m/a.gguf".into(),
+            alias: "a".into(),
+            context: 32768,
+            port: 1234,
+            api_key_file: "/k/key".into(),
+            log_file: "/l/log".into(),
+            prompt_cache: 0,
+            decision: false,
+            sampling: Some(sampling),
+            speculative: true,
+            reasoning_budget: Some(16384),
+        };
+        let args = args(&config);
+        for pair in [["--spec-type", "ngram-mod"], ["--reasoning-budget", "16384"], ["--temp", "0.6"], ["--top-p", "0.95"], ["--top-k", "20"], ["--min-p", "0"], ["--repeat-penalty", "1"]] {
+            assert!(args.windows(2).any(|w| w == pair), "{pair:?} in {args:?}");
+        }
     }
 }

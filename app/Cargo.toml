@@ -24,3 +24,4 @@ tracing.workspace = true
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-dialog = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tauri-plugin-updater = "2"

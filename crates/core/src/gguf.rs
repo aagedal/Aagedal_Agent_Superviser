@@ -235,9 +235,19 @@ impl GgufInfo {
             Some(per_layer) => per_layer.clone(),
             None => vec![self.int("attention.head_count_kv").unwrap_or(heads); layers as usize],
         };
+        // Looped models (inkling2_loop) run layers `loop.start..loop.end` `loop.count` times,
+        // and llama.cpp keeps a cache for each pass.
+        let mut slots: Vec<usize> = (0..per_layer_heads.len()).collect();
+        if let (Some(start), Some(end), Some(count)) = (self.int("loop.start"), self.int("loop.end"), self.int("loop.count")) {
+            let core = start as usize..(end as usize).min(per_layer_heads.len());
+            for _ in 1..count {
+                slots.extend(core.clone());
+            }
+        }
         let interval = self.int("full_attention_interval");
         let mut cache = KvCache::default();
-        for (index, kv_heads) in per_layer_heads.iter().enumerate() {
+        for index in slots {
+            let kv_heads = &per_layer_heads[index];
             if interval.is_some_and(|n| n > 0 && !(index as u64 + 1).is_multiple_of(n)) {
                 continue;
             }
@@ -368,6 +378,21 @@ pub(crate) mod tests {
             &[("attention.head_count_kv", vec![0, 2, 0, 2])],
         );
         assert_eq!(parse(&data).unwrap().kv_bytes_per_token(), Some(2 * 2 * 256 * 2));
+    }
+
+    #[test]
+    fn looped_layers_keep_a_cache_per_pass() {
+        // Inkling-2-Mini-like: layers 6..18 run three times; every 6th layer is global.
+        let pattern: Vec<u32> = (0..24).map(|i| u32::from(i % 6 != 5)).collect();
+        let data = header(
+            "inkling2_loop",
+            &[("block_count", 24), ("embedding_length", 2304), ("attention.key_length", 128), ("attention.value_length", 128), ("attention.sliding_window", 1024), ("loop.start", 6), ("loop.end", 18), ("loop.count", 3)],
+            &[("attention.head_count", vec![24; 24]), ("attention.head_count_kv", vec![8; 24]), ("attention.sliding_window_pattern", pattern)],
+        );
+        let kv = parse(&data).unwrap().kv_cache().unwrap();
+        // Global layers 5 and 23 once, 11 and 17 in each of three passes.
+        assert_eq!(kv.per_token, 8 * 8 * 256 * 2);
+        assert_eq!(kv.fixed, 40 * 8 * 256 * 2 * (1024 + 512));
     }
 
     #[test]

@@ -65,7 +65,37 @@ pub struct CatalogModel {
     /// KV cache that doesn't grow with context (sliding-window layers).
     #[serde(default)]
     pub kv_fixed_bytes: u64,
+    /// The model card's recommended sampling, set in `sources.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<Sampling>,
+    /// Most tokens it may think for before it's told to answer, for models whose card warns
+    /// they can get stuck in reasoning loops. Set in `sources.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_budget: Option<u32>,
     pub quant: QuantGroup,
+}
+
+/// Sampling a model card recommends, which llama-server uses unless a request says otherwise.
+/// What a card doesn't mention is off, as in the reference implementations; llama.cpp's own
+/// defaults would add top-k 40 and min-p 0.05.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Sampling {
+    pub temperature: f32,
+    #[serde(default = "one")]
+    pub top_p: f32,
+    /// 0 is off.
+    #[serde(default)]
+    pub top_k: u32,
+    #[serde(default)]
+    pub min_p: f32,
+    #[serde(default)]
+    pub presence_penalty: f32,
+    #[serde(default = "one")]
+    pub repeat_penalty: f32,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 /// How a model would run here.
@@ -119,6 +149,13 @@ const FAST_ACTIVE_PARAMS: f32 = 12.0;
 impl Catalog {
     pub fn bundled() -> Self {
         serde_json::from_str(BUNDLED).expect("bundled catalog is valid")
+    }
+
+    /// The curated entry for `repo`, in any quant, for how to run it (sampling, reasoning
+    /// budget). Looked up here rather than in a model's manifest, so models installed earlier or
+    /// found in other apps get current values.
+    pub fn curated(&self, repo: &str) -> Option<&CatalogModel> {
+        self.models.iter().find(|m| m.repo.eq_ignore_ascii_case(repo))
     }
 
     /// The models that fit `hardware`: the recommended one, then the rest largest first.
@@ -234,6 +271,8 @@ impl CatalogModel {
             context_length,
             kv_bytes_per_token: kv.map(|kv| kv.per_token),
             kv_fixed_bytes: kv.map_or(0, |kv| kv.fixed),
+            sampling: None,
+            reasoning_budget: None,
             quant: group,
         })
     }
@@ -315,7 +354,7 @@ mod tests {
         };
         assert_eq!(
             names(64 * GIB),
-            [(Role::MostCapable, "Qwen3.8 27B".into()), (Role::Fast, "Qwen3.6 35B-A3B".into()), (Role::Light, "Gemma 4 12B".into()), (Role::Basic, "Qwen3.5 4B".into())]
+            [(Role::MostCapable, "Qwen3.8 27B".into()), (Role::Fast, "Inkling 2 Mini".into()), (Role::Light, "Gemma 4 12B".into()), (Role::Basic, "Qwen3.5 4B".into())]
         );
         // Few models fit, and the most capable is already fast.
         assert_eq!(names(16 * GIB), [(Role::MostCapable, "Gemma 4 12B".into()), (Role::Light, "Qwen3.5 4B".into())]);
@@ -327,7 +366,19 @@ mod tests {
         for model in &Catalog::bundled().models {
             assert!(model.capability.is_some_and(|c| (1..=10).contains(&c)), "{} has no capability", model.repo);
             assert!(model.active_params.is_some(), "{} has no active_params", model.repo);
+            assert!(model.sampling.is_some(), "{} has no recommended sampling", model.repo);
         }
+    }
+
+    #[test]
+    fn sampling_leaves_unmentioned_samplers_off() {
+        let sampling: Sampling = serde_json::from_str(r#"{ "temperature": 0.15 }"#).unwrap();
+        assert_eq!(sampling, Sampling { temperature: 0.15, top_p: 1.0, top_k: 0, min_p: 0.0, presence_penalty: 0.0, repeat_penalty: 1.0 });
+        let catalog = Catalog::bundled();
+        let inkling = catalog.curated("unsloth/inkling-2-mini-gguf").unwrap();
+        assert_eq!(inkling.sampling.map(|s| (s.temperature, s.top_k)), Some((1.0, 0)));
+        assert!(inkling.reasoning_budget.is_some());
+        assert!(catalog.curated("someone/else-GGUF").is_none());
     }
 
     #[test]

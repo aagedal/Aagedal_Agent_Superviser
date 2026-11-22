@@ -13,6 +13,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
+use superviser_core::awake::Awake;
 use superviser_core::project::{Folder, Project};
 use superviser_core::sandbox::container::{self, Use, Vm};
 use superviser_core::sandbox::{self, Isolation, seatbelt};
@@ -410,6 +411,8 @@ impl Engine {
         let engine = self.clone();
         let (session, text, model) = (session.to_string(), text.to_string(), format!("{}/{model}", opencode::PROVIDER_ID));
         tauri::async_runtime::spawn(async move {
+            // Including the tools it runs between requests to the model.
+            let _awake = Awake::hold();
             let result = async {
                 engine.ensure_open(&session).await?;
                 // The session may have been made with another model; the one running answers.

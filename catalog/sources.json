@@ -1,17 +1,18 @@
 {
-  "_comment": "Hand-edited. Run `cargo run -p superviser-core --example build_catalog` to regenerate curated.json. `capability` is our 1-10 judgment of how well a model does agentic coding; `active_params` is billions of parameters read per token, which sets speed. Both decide the short list in Settings.",
+  "_comment": "Hand-edited. Run `cargo run -p superviser-core --example build_catalog` to regenerate curated.json. `capability` is our 1-10 judgment of how well a model does agentic coding; `active_params` is billions of parameters read per token, which sets speed. Both decide the short list in Settings. `sampling` is what the model card recommends for coding (in its default thinking mode); samplers it leaves out are off. `reasoning_budget` caps thinking tokens for models whose card warns of reasoning loops.",
   "models": [
-    { "repo": "unsloth/Qwen3.5-4B-GGUF", "name": "Qwen3.5 4B", "description": "Small and quick. For light edits on machines with little memory.", "capability": 2, "active_params": 4 },
-    { "repo": "unsloth/Qwen3.5-9B-GGUF", "name": "Qwen3.5 9B", "description": "Good all-rounder for 16 GB machines.", "capability": 4, "active_params": 9 },
-    { "repo": "unsloth/gemma-4-12b-it-GGUF", "name": "Gemma 4 12B", "description": "Google's compact model with tool calling and a long context.", "capability": 5, "active_params": 12 },
-    { "repo": "unsloth/gpt-oss-20b-GGUF", "name": "gpt-oss 20B", "description": "OpenAI's open model. Fast, reliable tool calling.", "capability": 5, "active_params": 3.6 },
-    { "repo": "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF", "name": "Devstral Small 2 24B", "description": "Mistral's model built for coding agents.", "capability": 7, "active_params": 24 },
-    { "repo": "unsloth/Qwen3.8-27B-GGUF", "name": "Qwen3.8 27B", "description": "Strong dense model for coding and reasoning.", "capability": 9, "active_params": 27 },
-    { "repo": "unsloth/GLM-4.7-Flash-GGUF", "name": "GLM-4.7 Flash", "description": "Fast mixture-of-experts model with good agentic coding.", "capability": 6, "active_params": 3 },
-    { "repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", "name": "Qwen3 Coder 30B-A3B", "description": "Coding specialist, fast because only 3B parameters are active.", "capability": 5, "active_params": 3.3 },
-    { "repo": "unsloth/Qwen3.6-35B-A3B-GGUF", "name": "Qwen3.6 35B-A3B", "description": "Newer fast mixture-of-experts model for coding agents.", "capability": 8, "active_params": 3 },
-    { "repo": "unsloth/Qwen3-Coder-Next-GGUF", "name": "Qwen3 Coder Next", "description": "Large coding specialist for 64 GB+ machines.", "capability": 8, "active_params": 3 },
-    { "repo": "unsloth/gpt-oss-120b-GGUF", "name": "gpt-oss 120B", "description": "OpenAI's large open model, for 96 GB+ machines.", "capability": 8, "active_params": 5.1 }
+    { "repo": "unsloth/Qwen3.5-4B-GGUF", "name": "Qwen3.5 4B", "description": "Small and quick. For light edits on machines with little memory.", "capability": 2, "active_params": 4, "sampling": { "temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5 } },
+    { "repo": "unsloth/Qwen3.5-9B-GGUF", "name": "Qwen3.5 9B", "description": "Good all-rounder for 16 GB machines.", "capability": 4, "active_params": 9, "sampling": { "temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5 } },
+    { "repo": "unsloth/gemma-4-12b-it-GGUF", "name": "Gemma 4 12B", "description": "Google's compact model with tool calling and a long context.", "capability": 5, "active_params": 12, "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 64 } },
+    { "repo": "unsloth/gpt-oss-20b-GGUF", "name": "gpt-oss 20B", "description": "OpenAI's open model. Fast, reliable tool calling.", "capability": 5, "active_params": 3.6, "sampling": { "temperature": 1.0 } },
+    { "repo": "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF", "name": "Devstral Small 2 24B", "description": "Mistral's model built for coding agents.", "capability": 7, "active_params": 24, "sampling": { "temperature": 0.15 } },
+    { "repo": "unsloth/Qwen3.8-27B-GGUF", "name": "Qwen3.8 27B", "description": "Strong dense model for coding and reasoning.", "capability": 9, "active_params": 27, "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 20 } },
+    { "repo": "unsloth/Inkling-2-Mini-GGUF", "name": "Inkling 2 Mini", "description": "Thinking Machines' looped mixture-of-experts model. Close to Qwen3.8 27B, and faster.", "capability": 8, "active_params": 5.4, "sampling": { "temperature": 1.0 }, "reasoning_budget": 16384 },
+    { "repo": "unsloth/GLM-4.7-Flash-GGUF", "name": "GLM-4.7 Flash", "description": "Fast mixture-of-experts model with good agentic coding.", "capability": 6, "active_params": 3, "sampling": { "temperature": 0.7, "min_p": 0.01 } },
+    { "repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", "name": "Qwen3 Coder 30B-A3B", "description": "Coding specialist, fast because only 3B parameters are active.", "capability": 5, "active_params": 3.3, "sampling": { "temperature": 0.7, "top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05 } },
+    { "repo": "unsloth/Qwen3.6-35B-A3B-GGUF", "name": "Qwen3.6 35B-A3B", "description": "Newer fast mixture-of-experts model for coding agents.", "capability": 8, "active_params": 3, "sampling": { "temperature": 0.6, "top_p": 0.95, "top_k": 20 } },
+    { "repo": "unsloth/Qwen3-Coder-Next-GGUF", "name": "Qwen3 Coder Next", "description": "Large coding specialist for 64 GB+ machines.", "capability": 8, "active_params": 3, "sampling": { "temperature": 1.0, "top_p": 0.95, "top_k": 40 } },
+    { "repo": "unsloth/gpt-oss-120b-GGUF", "name": "gpt-oss 120B", "description": "OpenAI's large open model, for 96 GB+ machines.", "capability": 8, "active_params": 5.1, "sampling": { "temperature": 1.0 } }
   ],
   "judge": { "repo": "ggml-org/vllm-d3-mini-GGUF", "name": "d3-mini", "description": "A decision model built on Qwen3.5 4B (Apache-2.0)." }
 }

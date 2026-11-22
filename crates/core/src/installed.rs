@@ -9,8 +9,9 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::CatalogModel;
-use crate::hub::Hub;
+use crate::hub::{self, Hub};
 use crate::paths::Paths;
+use crate::quant;
 
 const MANIFEST: &str = "manifest.json";
 
@@ -58,7 +59,7 @@ pub struct InstalledModel {
 impl InstalledModel {
     /// The file llama.cpp loads; it finds the other shards next to it.
     pub fn entry_path(&self) -> Option<PathBuf> {
-        self.model.quant.entry_file().map(|f| self.dir.join(&f.path))
+        self.model.quant.entry_file().map(|f| self.dir.join(quant::local_path(&f.path)))
     }
 }
 
@@ -163,10 +164,13 @@ pub async fn install_to(
     mut progress: impl FnMut(Progress),
 ) -> anyhow::Result<InstalledModel> {
     let dir = dir.to_path_buf();
+    if let Some(free) = available_space(&dir) {
+        check_space(&model.name, missing_bytes(&dir, model), free)?;
+    }
     let total = model.quant.size;
     let mut finished = 0u64;
     for file in &model.quant.files {
-        let dest = dir.join(&file.path);
+        let dest = dir.join(quant::local_path(&file.path));
         anyhow::ensure!(dest.starts_with(&dir) && !file.path.contains(".."), "unsafe file path {}", file.path);
         if std::fs::metadata(&dest).is_ok_and(|m| m.len() == file.size) {
             finished += file.size;
@@ -191,9 +195,81 @@ pub async fn install_to(
     Ok(installed)
 }
 
+/// Room a download must leave, so it never fills the disk to the last byte.
+const SPARE_DISK: u64 = 1 << 30;
+
+/// Bytes of `model` still to download into `dir`: files not there yet, less what earlier
+/// attempts left in `.part` files.
+fn missing_bytes(dir: &Path, model: &CatalogModel) -> u64 {
+    model
+        .quant
+        .files
+        .iter()
+        .map(|file| {
+            let dest = dir.join(quant::local_path(&file.path));
+            let have = match std::fs::metadata(&dest) {
+                Ok(m) if m.len() == file.size => file.size,
+                _ => std::fs::metadata(hub::part_path(&dest)).map_or(0, |m| m.len()),
+            };
+            file.size.saturating_sub(have)
+        })
+        .sum()
+}
+
+/// Refuses a download that wouldn't fit, before it starts rather than when the disk is full.
+fn check_space(name: &str, missing: u64, free: u64) -> anyhow::Result<()> {
+    if missing > 0 && missing + SPARE_DISK > free {
+        let gb = |bytes: u64| bytes as f64 / 1e9;
+        anyhow::bail!("Not enough disk space for {name}: it needs {:.1} GB more, and {:.1} GB is free", gb(missing + SPARE_DISK), gb(free));
+    }
+    Ok(())
+}
+
+/// Bytes free at `dir` (or the nearest folder above it that exists) for files the user asked
+/// for: on macOS this counts the purgeable space the system frees on demand, as Finder does,
+/// which `statvfs` leaves out. `None` where we can't tell.
+fn available_space(dir: &Path) -> Option<u64> {
+    let existing = dir.ancestors().find(|d| d.is_dir())?;
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_foundation::{NSNumber, NSString, NSURL, NSURLVolumeAvailableCapacityForImportantUsageKey};
+        let url = NSURL::fileURLWithPath(&NSString::from_str(existing.to_str()?));
+        let mut value = None;
+        // SAFETY: the key is a Foundation constant, and the value it names is an NSNumber.
+        unsafe { url.getResourceValue_forKey_error(&mut value, NSURLVolumeAvailableCapacityForImportantUsageKey) }.ok()?;
+        let number = value?.downcast::<NSNumber>().ok()?;
+        u64::try_from(number.longLongValue()).ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = existing;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checks_disk_space_for_what_is_left() {
+        let tmp = std::env::temp_dir().join(format!("superviser-space-{}", std::process::id()));
+        let model = crate::catalog::Catalog::bundled().models.remove(0);
+        let file = &model.quant.files[0];
+        assert_eq!(missing_bytes(&tmp, &model), model.quant.size);
+        let dest = tmp.join(quant::local_path(&file.path));
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(hub::part_path(&dest), vec![0u8; 1000]).unwrap();
+        assert_eq!(missing_bytes(&tmp, &model), model.quant.size - 1000);
+        std::fs::remove_dir_all(&tmp).unwrap();
+
+        assert!(check_space("m", 10 << 30, 12 << 30).is_ok());
+        let err = check_space("m", 10 << 30, 10 << 30).unwrap_err().to_string();
+        assert_eq!(err, "Not enough disk space for m: it needs 11.8 GB more, and 10.7 GB is free");
+        assert!(check_space("m", 0, 0).is_ok());
+        #[cfg(target_os = "macos")]
+        assert!(available_space(&std::env::temp_dir().join("not/there/yet")).is_some_and(|b| b > 0));
+    }
 
     #[test]
     fn aliases() {

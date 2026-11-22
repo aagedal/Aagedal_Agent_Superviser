@@ -50,7 +50,7 @@ pub fn config_path() -> Option<PathBuf> {
 
 /// The OpenCode the app runs: the one bundled with it, else one installed on `PATH`.
 pub fn binary() -> Option<PathBuf> {
-    crate::paths::bundled("opencode").or_else(|| which::which("opencode").ok())
+    crate::paths::bundled_in("opencode", "opencode").or_else(|| which::which("opencode").ok())
 }
 
 /// `opencode --version`, e.g. `v2.3.0`, of [`binary`].

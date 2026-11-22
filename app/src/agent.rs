@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use superviser_core::agent::tools::{self, Kind, Workspace};
 use superviser_core::agent::{Chat, system_prompt};
+use superviser_core::awake::Awake;
 use superviser_core::project::{Approvals, Folder, Project};
 use superviser_core::sandbox::{Isolation, seatbelt};
 use superviser_core::secrets;
@@ -103,6 +104,7 @@ pub fn send(handle: AppHandle, app: Arc<App>, project: &str, chat: Option<&str>,
     emit(&handle, Event::State { chat: &id, busy: true, error: None });
     emit(&handle, Event::Message { chat: &id, message: &message });
     tauri::async_runtime::spawn(async move {
+        let _awake = Awake::hold();
         let result = turn(&handle, &app, &project, &model.alias, &mut chat, stopped).await;
         app.chats.running.lock().unwrap().remove(&chat.id);
         emit(&handle, Event::State { chat: &chat.id, busy: false, error: result.err().map(|e| format!("{e:#}")) });

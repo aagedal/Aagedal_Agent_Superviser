@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
+use superviser_core::awake::Awake;
 use superviser_core::catalog::{self, Catalog, CatalogModel, Fit};
 use superviser_core::discover::{self, Discovery, Locations};
 use superviser_core::hardware::Hardware;
@@ -23,6 +24,22 @@ use superviser_guard::{CallEvent, GuardServer, Judge, JudgeOptions, ProjectRules
 pub const DEFAULT_GUARD_PORT: u16 = 8787;
 const MAX_EVENTS: usize = 200;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long the Mac stays awake after a model call through the guard: long enough for an agent
+/// in Terminal to run a command and call again.
+const AWAKE_AFTER_CALL: Duration = Duration::from_secs(5 * 60);
+
+/// Keeps the Mac awake for [`AWAKE_AFTER_CALL`] after it's dropped.
+struct AwakeAfter(Option<Awake>);
+
+impl Drop for AwakeAfter {
+    fn drop(&mut self) {
+        let awake = self.0.take();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(AWAKE_AFTER_CALL).await;
+            drop(awake);
+        });
+    }
+}
 /// Origins of the app's own webviews (macOS/Linux, Windows).
 const WEBVIEW_ORIGINS: &[&str] = &["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"];
 
@@ -311,6 +328,9 @@ impl App {
             log_file: log_file.clone(),
             prompt_cache: 0,
             decision: true,
+            sampling: None,
+            speculative: false,
+            reasoning_budget: None,
         };
         let mut server = LlamaServer::start(config).await?;
         if let Err(e) = server.wait_ready(LOAD_TIMEOUT).await {
@@ -369,6 +389,8 @@ impl App {
             cors_origins: WEBVIEW_ORIGINS.iter().map(|s| s.to_string()).collect(),
             // Set once the judge's server runs (`sync_judge`).
             judge: None,
+            // Agents run tools between model calls, so the Mac stays awake a while after each.
+            on_model_call: Some(Arc::new(|| Box::new(AwakeAfter(Some(Awake::hold()))))),
         };
         let server = GuardServer::start(listener, config, options).await?;
         tracing::info!("guard listening on {}", server.addr);
@@ -564,8 +586,9 @@ impl App {
         changed();
         tracing::info!("{}: {}k context, {} MiB for saved conversations", model.alias, fit.context / 1024, prompt_cache >> 20);
         let log_file = self.paths.logs().join(format!("llama-server-{}.log", model.alias));
+        let curated = self.catalog.curated(&model.model.repo);
         let started = async {
-            let config = ServerConfig {
+            let mut config = ServerConfig {
                 binary,
                 model_path: entry,
                 alias: model.alias.clone(),
@@ -575,13 +598,26 @@ impl App {
                 log_file: log_file.clone(),
                 prompt_cache,
                 decision: false,
+                sampling: curated.and_then(|m| m.sampling),
+                reasoning_budget: curated.and_then(|m| m.reasoning_budget),
+                speculative: true,
             };
-            let mut server = LlamaServer::start(config).await?;
-            if let Err(e) = server.wait_ready(LOAD_TIMEOUT).await {
-                server.stop().await;
-                return Err(e.context(format!("see {}", log_file.display())));
+            loop {
+                let mut server = LlamaServer::start(config.clone()).await?;
+                match server.wait_ready(LOAD_TIMEOUT).await {
+                    Ok(()) => break anyhow::Ok(server),
+                    // A model llama.cpp can't draft for may stop while loading: once more without.
+                    Err(e) if config.speculative && !server.is_running() => {
+                        tracing::warn!("{}: {e:#}; loading it again without speculative decoding", model.alias);
+                        config.speculative = false;
+                        config.port = runtime::free_port()?;
+                    }
+                    Err(e) => {
+                        server.stop().await;
+                        break Err(e.context(format!("see {}", log_file.display())));
+                    }
+                }
             }
-            anyhow::Ok(server)
         }
         .await;
         let set_state = |state: LoadState| {

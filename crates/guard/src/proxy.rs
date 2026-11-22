@@ -40,7 +40,13 @@ pub struct ProxyOptions {
     pub cors_origins: Vec<String>,
     /// Asked about suspicious calls; `None` only logs them.
     pub judge: Option<Judge>,
+    /// Called as a model call starts; what it returns is dropped once the response has been
+    /// sent in full (the app keeps the Mac awake with it).
+    pub on_model_call: Option<CallHook>,
 }
+
+/// See [`ProxyOptions::on_model_call`].
+pub type CallHook = Arc<dyn Fn() -> Box<dyn Send> + Send + Sync>;
 
 /// The model servers requests go to: by the model a request names, else the default.
 #[derive(Default)]
@@ -260,6 +266,8 @@ async fn forward_inner(state: &Arc<AppState>, request: Request) -> Response {
         }
     });
 
+    let busy = guard.as_ref().and(state.options.on_model_call.as_ref()).map(|hook| hook());
+
     let url = format!("{upstream}{path_and_query}");
     let mut upstream_request = state.client.request(parts.method.clone(), &url).body(body);
     for (name, value) in &parts.headers {
@@ -300,6 +308,7 @@ async fn forward_inner(state: &Arc<AppState>, request: Request) -> Response {
             let mut upstream = upstream_response.bytes_stream();
             let mut rewriter = SseRewriter::new(guard);
             Body::from_stream(async_stream::stream! {
+                let _busy = busy;
                 while let Some(chunk) = upstream.next().await {
                     match chunk {
                         Ok(chunk) => {
@@ -376,6 +385,7 @@ mod tests {
             upstream_api_key: Some("upstream-key".into()),
             cors_origins: vec!["tauri://localhost".into()],
             judge: None,
+            on_model_call: None,
         };
         let server = GuardServer::start(listener, Config::default(), options).await.unwrap();
         server.set_upstream(upstream);

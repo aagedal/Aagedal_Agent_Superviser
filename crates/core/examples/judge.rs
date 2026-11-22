@@ -50,6 +50,9 @@ async fn main() -> anyhow::Result<()> {
         log_file: dir.join("llama-server.log"),
         prompt_cache: 0,
         decision: true,
+        sampling: None,
+        speculative: false,
+        reasoning_budget: None,
     })
     .await?;
     server.wait_ready(Duration::from_secs(300)).await?;

@@ -209,6 +209,10 @@ impl Guard {
         self.config.block
     }
 
+    pub(crate) fn request(&self) -> &Value {
+        &self.request
+    }
+
     /// Reviews a complete call without logging it.
     pub async fn review(&mut self, name: &str, args: &str) -> Review {
         self.calls.push((name.to_string(), args.to_string()));

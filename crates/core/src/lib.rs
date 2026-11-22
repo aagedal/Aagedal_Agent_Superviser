@@ -3,6 +3,7 @@
 //! coding harnesses at the guard.
 
 pub mod agent;
+pub mod awake;
 pub mod catalog;
 pub mod discover;
 pub mod gguf;
