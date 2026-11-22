@@ -72,6 +72,14 @@
           <summary class="small muted">Details</summary>
           <div id="other-apps-list" class="calls"></div>
         </details>
+
+        <h2>Saved conversations</h2>
+        <p class="muted small">When a model is unloaded or the app quits, its last conversation is saved to disk, so an agent picking it up again doesn't wait for the model to read it all again. One per model, at most 10 GB in all and never more than a tenth of the free disk space; one not picked up for a week is deleted. Agents working in your projects can't read them.</p>
+        <div class="row">
+          <label class="check"><input type="checkbox" id="save-conversations"> Save conversations</label>
+          <button id="clear-conversations">Delete saved conversations</button>
+        </div>
+        <p class="small muted" id="conversations-summary"></p>
       </div>
     </section>
 

@@ -216,6 +216,35 @@ pub async fn set_use_other_apps(handle: AppHandle, app: State<'_, Arc<App>>, ena
     rescan_models(handle, app).await
 }
 
+#[derive(Serialize)]
+pub struct SavedConversations {
+    enabled: bool,
+    #[serde(flatten)]
+    summary: superviser_core::conversations::Summary,
+}
+
+fn saved_conversations_info(app: &App) -> SavedConversations {
+    SavedConversations { enabled: app.settings.lock().unwrap().save_conversations, summary: app.conversations.summary() }
+}
+
+/// Each model's last conversation on disk: whether it's kept, and what it takes.
+#[tauri::command]
+pub fn saved_conversations(app: State<'_, Arc<App>>) -> SavedConversations {
+    saved_conversations_info(&app)
+}
+
+#[tauri::command]
+pub fn set_save_conversations(app: State<'_, Arc<App>>, enabled: bool) -> Result<SavedConversations> {
+    app.set_save_conversations(enabled).map_err(err)?;
+    Ok(saved_conversations_info(&app))
+}
+
+#[tauri::command]
+pub fn clear_saved_conversations(app: State<'_, Arc<App>>) -> SavedConversations {
+    app.conversations.clear();
+    saved_conversations_info(&app)
+}
+
 #[tauri::command]
 pub async fn delete_model(handle: AppHandle, app: State<'_, Arc<App>>, id: String) -> Result<()> {
     if app.models().iter().any(|m| m.id == id && !matches!(m.state, LoadState::Failed { .. })) {
@@ -537,7 +566,18 @@ pub async fn acp_delete(handle: AppHandle, app: State<'_, Arc<App>>, project: St
     let project = self::project(&app, &project)?;
     let engine = app.engines.get(&handle, &app, &project).await.map_err(|e| format!("{e:#}"))?;
     engine.delete_session(&session).await.map_err(|e| format!("{e:#}"))?;
-    app.set_chat_model(&project.id, &session, None).map_err(err)
+    app.forget_chat(&project.id, &session).map_err(err)
+}
+
+/// A project's archived chats, of either engine.
+#[tauri::command]
+pub fn archived_chats(app: State<'_, Arc<App>>, project: String) -> Vec<String> {
+    app.archived_chats(&project)
+}
+
+#[tauri::command]
+pub fn set_chat_archived(app: State<'_, Arc<App>>, project: String, chat: String, archived: bool) -> Result<()> {
+    app.set_chat_archived(&project, &chat, archived).map_err(err)
 }
 
 /// The installed model a chat uses, if one was chosen for it.
@@ -673,7 +713,7 @@ pub fn chat_answer(app: State<'_, Arc<App>>, chat: String, call: String, allow: 
 pub fn chat_delete(app: State<'_, Arc<App>>, project: String, id: String) -> Result<()> {
     app.chats.stop(&id);
     Chat::delete(&app.paths, &project, &id).map_err(err)?;
-    app.set_chat_model(&project, &id, None).map_err(err)
+    app.forget_chat(&project, &id).map_err(err)
 }
 
 /// Opens the chat window on a project (the most recent one without `project`).

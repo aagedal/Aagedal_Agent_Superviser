@@ -53,6 +53,8 @@ async fn main() -> anyhow::Result<()> {
         sampling: None,
         speculative: false,
         reasoning_budget: None,
+        kv: superviser_core::catalog::KvType::F16,
+        slot_dir: None,
     })
     .await?;
     server.wait_ready(Duration::from_secs(300)).await?;

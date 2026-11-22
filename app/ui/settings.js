@@ -308,6 +308,7 @@ function setModelFilter(filter) {
   if (filter === "local") {
     renderInstalled();
     invoke("other_apps").then(renderOtherApps);
+    invoke("saved_conversations").then(renderConversations);
   }
 }
 for (const button of document.querySelectorAll("#model-filter button")) button.addEventListener("click", () => setModelFilter(button.dataset.filter));
@@ -432,6 +433,25 @@ $("rescan").addEventListener("click", async () => {
   $("rescan").disabled = false;
   await renderInstalled();
   renderOffers();
+});
+
+const diskGb = (bytes) => `${(bytes / 1e9).toFixed(1)} GB`;
+
+function renderConversations(info) {
+  $("save-conversations").checked = info.enabled;
+  $("clear-conversations").disabled = !info.count;
+  $("conversations-summary").textContent = !info.enabled
+    ? "Off."
+    : info.count
+      ? `${info.count} saved, ${diskGb(info.bytes)} of ${diskGb(info.limit)} allowed.`
+      : `None saved yet. Up to ${diskGb(info.limit)} allowed.`;
+}
+
+$("save-conversations").addEventListener("change", async (event) => {
+  renderConversations(await invoke("set_save_conversations", { enabled: event.target.checked }));
+});
+$("clear-conversations").addEventListener("click", async () => {
+  renderConversations(await invoke("clear_saved_conversations"));
 });
 
 // Loads a model beside the loaded ones; when memory is short, offers to unload the ones used longest ago.

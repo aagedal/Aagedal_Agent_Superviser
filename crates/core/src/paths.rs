@@ -11,17 +11,21 @@ pub const PROTECTED_NAMES: &[&str] = &["me.aagedal.AgentSuperviser", "AgentSuper
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub data: PathBuf,
+    /// What can be deleted at any time: `~/Library/Caches/<bundle id>` on macOS.
+    pub cache: PathBuf,
 }
 
 impl Paths {
     pub fn new() -> anyhow::Result<Self> {
         let dirs = directories::ProjectDirs::from("me", "aagedal", "AgentSuperviser")
             .context("no home directory to keep app data in")?;
-        Ok(Self::at(dirs.data_dir()))
+        Ok(Self { data: dirs.data_dir().to_path_buf(), cache: dirs.cache_dir().to_path_buf() })
     }
 
+    /// Everything under `data`, the cache too.
     pub fn at(data: impl Into<PathBuf>) -> Self {
-        Self { data: data.into() }
+        let data = data.into();
+        Self { cache: data.join("cache"), data }
     }
 
     pub fn models(&self) -> PathBuf {
@@ -64,6 +68,16 @@ impl Paths {
     /// Which model each chat uses.
     pub fn chat_models(&self) -> PathBuf {
         self.data.join("chat-models.json")
+    }
+
+    /// Chats put away out of the chat list.
+    pub fn archived_chats(&self) -> PathBuf {
+        self.data.join("archived-chats.json")
+    }
+
+    /// Each model's last conversation, saved by llama-server so it needn't be read again.
+    pub fn saved_conversations(&self) -> PathBuf {
+        self.cache.join("conversations")
     }
 
     pub fn settings(&self) -> PathBuf {

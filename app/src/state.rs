@@ -1,6 +1,6 @@
 //! The app's state and what it can do, independent of windows and menus.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -8,7 +8,8 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use superviser_core::awake::Awake;
-use superviser_core::catalog::{self, Catalog, CatalogModel, Fit};
+use superviser_core::catalog::{self, Catalog, CatalogModel, Fit, KvType};
+use superviser_core::conversations::{self, Conversations};
 use superviser_core::discover::{self, Discovery, Locations};
 use superviser_core::hardware::Hardware;
 use superviser_core::installed::{self, InstalledModel, Source};
@@ -63,6 +64,9 @@ pub struct Settings {
     pub projects: Vec<Project>,
     /// The first-run guide was finished or skipped.
     pub setup_done: bool,
+    /// Save each model's last conversation to disk when it's unloaded, and load it back when
+    /// the model starts again.
+    pub save_conversations: bool,
     /// Before projects: internet access for every folder, the folders opened, and how each
     /// was isolated. Read once to make projects of them, never written.
     #[serde(skip_serializing)]
@@ -85,6 +89,7 @@ impl Default for Settings {
             last_model: None,
             projects: Vec::new(),
             setup_done: false,
+            save_conversations: true,
             sandbox_network: Network::default(),
             recent_projects: Vec::new(),
             project_isolation: HashMap::new(),
@@ -150,6 +155,9 @@ pub struct Room {
 
 struct Running {
     server: LlamaServer,
+    model: CatalogModel,
+    /// What its conversation is saved with, if it may be.
+    key: Option<conversations::Key>,
 }
 
 /// Where the judge stands, for Settings.
@@ -187,6 +195,10 @@ pub struct App {
     /// The model each chat uses, by `project/chat`: switching a chat's model makes the next
     /// reply read the whole chat again, so each keeps its own.
     chat_models: Mutex<HashMap<String, String>>,
+    /// Archived chats, as `project/chat`: kept, but out of the chat list.
+    archived_chats: Mutex<BTreeSet<String>>,
+    /// Each model's last conversation, on disk.
+    pub conversations: Conversations,
 }
 
 impl App {
@@ -202,7 +214,15 @@ impl App {
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
         settings.migrate();
+        let conversations = Conversations::new(paths.saved_conversations());
+        if settings.save_conversations {
+            let pruning = Conversations::new(paths.saved_conversations());
+            std::thread::spawn(move || pruning.prune());
+        } else {
+            conversations.clear();
+        }
         Ok(Self {
+            conversations,
             hardware: Hardware::detect(),
             catalog: Catalog::bundled(),
             settings: Mutex::new(settings),
@@ -217,6 +237,7 @@ impl App {
             chats: crate::agent::Chats::default(),
             engines: crate::acp::Engines::default(),
             chat_models: Mutex::new(std::fs::read_to_string(paths.chat_models()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()),
+            archived_chats: Mutex::new(std::fs::read_to_string(paths.archived_chats()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()),
             paths,
         })
     }
@@ -331,6 +352,9 @@ impl App {
             sampling: None,
             speculative: false,
             reasoning_budget: None,
+            // The judge's threshold was set with a 16-bit cache.
+            kv: KvType::F16,
+            slot_dir: None,
         };
         let mut server = LlamaServer::start(config).await?;
         if let Err(e) = server.wait_ready(LOAD_TIMEOUT).await {
@@ -458,6 +482,7 @@ impl App {
         if model.source != Source::App {
             bail!("{} belongs to {}; remove it there.", model.model.name, model.source.label());
         }
+        self.conversations.forget(id);
         installed::remove(&self.paths, id)
     }
 
@@ -526,8 +551,12 @@ impl App {
 
     /// How `model` fits beside the loaded models.
     fn fit_beside(&self, models: &[LoadedModel], model: &CatalogModel, id: &str) -> Option<Fit> {
+        self.fit_beside_with(models, model, id, KvType::default())
+    }
+
+    fn fit_beside_with(&self, models: &[LoadedModel], model: &CatalogModel, id: &str, kv: KvType) -> Option<Fit> {
         let (used, _) = Self::used(models, id);
-        model.fit(self.model_hardware().model_budget.checked_sub(used)?)
+        model.fit_with(self.model_hardware().model_budget.checked_sub(used)?, kv)
     }
 
     /// Whether `id` can load now, else what to unload first.
@@ -556,7 +585,7 @@ impl App {
         let entry = model.entry_path().context("model has no entry file")?;
         secrets::upstream_api_key(&self.paths)?;
         // Check the room and claim it in one go, so two loads can't both take it.
-        let (fit, prompt_cache) = {
+        let (mut fit, mut prompt_cache) = {
             let mut models = self.models.lock().unwrap();
             if let Some(existing) = models.iter().find(|m| m.id == id) {
                 match existing.state {
@@ -587,6 +616,15 @@ impl App {
         tracing::info!("{}: {}k context, {} MiB for saved conversations", model.alias, fit.context / 1024, prompt_cache >> 20);
         let log_file = self.paths.logs().join(format!("llama-server-{}.log", model.alias));
         let curated = self.catalog.curated(&model.model.repo);
+        let save_conversations = self.settings.lock().unwrap().save_conversations;
+        let slot_dir = match save_conversations.then(|| self.conversations.prepare()) {
+            Some(Ok(dir)) => Some(dir.to_path_buf()),
+            Some(Err(e)) => {
+                tracing::warn!("saved conversations: {e}");
+                None
+            }
+            None => None,
+        };
         let started = async {
             let mut config = ServerConfig {
                 binary,
@@ -601,6 +639,8 @@ impl App {
                 sampling: curated.and_then(|m| m.sampling),
                 reasoning_budget: curated.and_then(|m| m.reasoning_budget),
                 speculative: true,
+                kv: fit.kv,
+                slot_dir: slot_dir.clone(),
             };
             loop {
                 let mut server = LlamaServer::start(config.clone()).await?;
@@ -610,6 +650,23 @@ impl App {
                     Err(e) if config.speculative && !server.is_running() => {
                         tracing::warn!("{}: {e:#}; loading it again without speculative decoding", model.alias);
                         config.speculative = false;
+                        config.port = runtime::free_port()?;
+                    }
+                    // Nor one whose attention can't use an 8-bit cache: with a 16-bit one, if it fits.
+                    Err(e) if config.kv != KvType::F16 && !server.is_running() => {
+                        let mut models = self.models.lock().unwrap();
+                        let Some(f16) = self.fit_beside_with(&models, &model.model, id, KvType::F16) else {
+                            break Err(e.context(format!("{} needs a 16-bit context cache here, which doesn't fit beside the loaded models", model.model.name)));
+                        };
+                        tracing::warn!("{}: {e:#}; loading it again with a 16-bit cache at {}k context", model.alias, f16.context / 1024);
+                        let (_, ram_used) = Self::used(&models, id);
+                        fit = f16;
+                        prompt_cache = model.model.prompt_cache(&fit, self.model_hardware().ram_budget.saturating_sub(ram_used));
+                        if let Some(m) = models.iter_mut().find(|m| m.id == id) {
+                            (m.memory, m.ram) = (fit.required, fit.required + prompt_cache);
+                        }
+                        drop(models);
+                        (config.kv, config.context, config.prompt_cache, config.speculative) = (fit.kv, fit.context, prompt_cache, true);
                         config.port = runtime::free_port()?;
                     }
                     Err(e) => {
@@ -634,7 +691,13 @@ impl App {
                     bail!("{} was unloaded while it loaded", model.model.name);
                 }
                 self.remember_pid(&model.alias, server.pid());
-                self.running.lock().await.insert(id.to_string(), Running { server });
+                let key = slot_dir.as_ref().and_then(|_| conversations::Key::of(&model.entry_path()?, fit.kv, fit.context));
+                if let Some(key) = &key
+                    && let Some(tokens) = self.conversations.restore(&server, id, key).await
+                {
+                    tracing::info!("{}: picked up its last conversation ({tokens} tokens)", model.alias);
+                }
+                self.running.lock().await.insert(id.to_string(), Running { server, model: model.model.clone(), key });
                 set_state(LoadState::Running { context: fit.context });
                 self.sync_upstreams().await;
                 changed();
@@ -658,18 +721,42 @@ impl App {
 
     /// Unloads `id` (or, with `None`, every model), freeing its memory.
     pub async fn unload_model(&self, id: Option<&str>) {
-        let stopping: Vec<Running> = {
+        let stopping: Vec<(String, Running)> = {
             let mut running = self.running.lock().await;
             let ids: Vec<String> = running.keys().filter(|k| id.is_none_or(|id| id == k.as_str())).cloned().collect();
-            ids.iter().filter_map(|k| running.remove(k)).collect()
+            ids.into_iter().filter_map(|k| running.remove(&k).map(|r| (k, r))).collect()
         };
         self.models.lock().unwrap().retain(|m| id.is_some_and(|id| id != m.id));
-        for mut running in stopping {
+        for (model_id, mut running) in stopping {
+            self.save_conversation(&model_id, &running).await;
             self.remember_pid(&running.server.alias, None);
             running.server.stop().await;
         }
         self.sync_upstreams().await;
         self.sync_judge().await;
+    }
+
+    /// Saves a model's conversation before it stops, if conversations are saved.
+    async fn save_conversation(&self, id: &str, running: &Running) {
+        let Some(key) = &running.key else { return };
+        if !self.settings.lock().unwrap().save_conversations {
+            return;
+        }
+        match self.conversations.save(&running.server, id, key, |tokens| running.model.saved_bytes(tokens, key.kv)).await {
+            Ok(Some(saved)) => tracing::info!("{}: saved its conversation ({} tokens, {} MB)", running.server.alias, saved.tokens, saved.bytes / 1_000_000),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("{}: saving its conversation: {e:#}", running.server.alias),
+        }
+    }
+
+    /// Turns saving conversations on or off; off deletes the saved ones.
+    pub fn set_save_conversations(&self, enabled: bool) -> anyhow::Result<()> {
+        self.settings.lock().unwrap().save_conversations = enabled;
+        self.save_settings()?;
+        if !enabled {
+            self.conversations.clear();
+        }
+        Ok(())
     }
 
     /// Records (or with `None` forgets) a model server's pid in `run/`, for [`runtime::stop_leftovers`].
@@ -730,6 +817,29 @@ impl App {
         Ok(())
     }
 
+    /// A project's archived chats.
+    pub fn archived_chats(&self, project: &str) -> Vec<String> {
+        let prefix = format!("{project}/");
+        self.archived_chats.lock().unwrap().iter().filter_map(|key| key.strip_prefix(&prefix).map(str::to_string)).collect()
+    }
+
+    /// Archives a chat, or puts it back in the list.
+    pub fn set_chat_archived(&self, project: &str, chat: &str, archived: bool) -> anyhow::Result<()> {
+        let mut chats = self.archived_chats.lock().unwrap();
+        let key = format!("{project}/{chat}");
+        let changed = if archived { chats.insert(key) } else { chats.remove(&key) };
+        if changed {
+            superviser_core::paths::write_private(&self.paths.archived_chats(), serde_json::to_string(&*chats)?.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Forgets what the app keeps about a deleted chat.
+    pub fn forget_chat(&self, project: &str, chat: &str) -> anyhow::Result<()> {
+        self.set_chat_model(project, chat, None)?;
+        self.set_chat_archived(project, chat, false)
+    }
+
     pub fn project(&self, id: &str) -> Option<Project> {
         self.settings.lock().unwrap().projects.iter().find(|p| p.id == id).cloned()
     }
@@ -757,6 +867,9 @@ impl App {
         self.settings.lock().unwrap().projects.retain(|p| p.id != id);
         superviser_core::agent::Chat::delete_all(&self.paths, id);
         self.chat_models.lock().unwrap().retain(|key, _| !key.starts_with(&format!("{id}/")));
+        for chat in self.archived_chats(id) {
+            self.set_chat_archived(id, &chat, false)?;
+        }
         self.save_settings()?;
         self.sync_projects();
         Ok(())
@@ -803,7 +916,8 @@ impl App {
     pub fn shutdown(&self) {
         self.engines.stop_all();
         if let Ok(mut running) = self.running.try_lock() {
-            for (_, mut running) in running.drain() {
+            for (id, mut running) in running.drain() {
+                tauri::async_runtime::block_on(self.save_conversation(&id, &running));
                 self.remember_pid(&running.server.alias, None);
                 tauri::async_runtime::block_on(running.server.stop());
             }
