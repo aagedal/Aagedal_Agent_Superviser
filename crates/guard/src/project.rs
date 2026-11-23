@@ -18,7 +18,38 @@ pub struct ProjectRules {
 }
 
 /// Argument keys that hold a shell command.
-const COMMAND_KEYS: &[&str] = &["command", "cmd", "script"];
+const COMMAND_KEYS: &[&str] = &["command", "cmd", "script", "shell_command", "bash", "commands", "chars", "code"];
+
+fn shell_quote_word(word: &str) -> String {
+    if word.is_empty() {
+        return "''".into();
+    }
+    if word.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_' | b':' | b'=' | b'@')) {
+        return word.to_string();
+    }
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
+fn contains_word_ci(text: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let hay = text.to_ascii_lowercase();
+    let pat = needle.to_ascii_lowercase();
+    let bytes = hay.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = hay[from..].find(&pat) {
+        let start = from + pos;
+        let end = start + pat.len();
+        let before_ok = start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_' || bytes[start - 1] == b'-');
+        let after_ok = end == bytes.len() || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'-');
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
 
 impl ProjectRules {
     /// Why the call breaks this project's rules, if it does.
@@ -33,12 +64,28 @@ impl ProjectRules {
         for key in COMMAND_KEYS {
             let text = match args.get(*key) {
                 Some(Value::String(text)) => text.clone(),
-                Some(Value::Array(words)) => words.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+                Some(Value::Array(words)) => {
+                    let strs: Vec<&str> = words.iter().filter_map(Value::as_str).collect();
+                    if let Some(first) = strs.first() {
+                        let base = first.rsplit('/').next().unwrap_or(first);
+                        if self.blocked_programs.iter().any(|p| p.eq_ignore_ascii_case(base)) {
+                            return Some(format!("`{base}` is blocked for project {}", self.name));
+                        }
+                    }
+                    strs.into_iter().map(shell_quote_word).collect::<Vec<_>>().join(" ")
+                }
                 _ => continue,
             };
             // Nested commands (`sh -c '…'`, substitutions) are listed too.
             let script = shell::parse(&text);
-            if let Some(program) = script.commands().filter_map(|c| c.name()).find(|n| self.blocked_programs.iter().any(|p| p == n)) {
+            if let Some(program) = script.commands().filter_map(|c| c.name()).find(|n| self.blocked_programs.iter().any(|p| p.eq_ignore_ascii_case(n))) {
+                return Some(format!("`{program}` is blocked for project {}", self.name));
+            }
+            // If shell parsing bailed on an unsupported construct (e.g. `f() { ... }` or `case`),
+            // fall back to a word-boundary check so blocked programs don't fail open.
+            if !script.complete
+                && let Some(program) = self.blocked_programs.iter().find(|p| contains_word_ci(&text, p))
+            {
                 return Some(format!("`{program}` is blocked for project {}", self.name));
             }
         }
@@ -79,6 +126,11 @@ mod tests {
         // A program's name as an argument is not running it.
         assert_eq!(check("grep ssh notes.txt"), None);
         assert!(rules().check("exec_command", r#"{"cmd": ["bash", "-lc", "ssh host"]}"#).is_some());
+        // Case-insensitive match and fallback when shell parsing encounters unsupported constructs.
+        assert!(check("SSH host uptime").is_some());
+        assert!(check("f() { ssh host; }; f").is_some());
+        assert!(check("case x in x) ssh host;; esac").is_some());
+        assert!(rules().check("exec_command", r#"{"cmd": ["bash", "-lc", "echo it's; ssh host"]}"#).is_some());
     }
 
     #[test]

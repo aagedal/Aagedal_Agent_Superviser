@@ -43,6 +43,8 @@ const HIDDEN_IN_HOME: &[&str] = &[
     ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker/config.json", ".netrc", ".npmrc", ".pypirc", ".git-credentials",
     ".config/git/credentials", ".config/gh", ".config/gcloud", ".config/hub", ".terraform.d/credentials.tfrc.json",
     ".cache/huggingface/token", ".huggingface/token", ".zsh_history", ".bash_history", ".python_history", ".node_repl_history",
+    // Shell startup files often export API keys and cloud credentials.
+    ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".bashrc", ".bash_profile", ".bash_login", ".profile", ".config/fish/config.fish",
     // Other agents' sessions and settings.
     ".claude", ".claude.json", ".codex", ".cursor", ".gemini", ".openhands",
     // Keychains, cookies, mail and messages, browser profiles.
@@ -88,13 +90,24 @@ impl Policy {
     /// The default policy for `project`: the app's state hidden except the guard key.
     pub fn new(project: &Path, paths: &Paths, network: Network) -> anyhow::Result<Self> {
         let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()).ok_or_else(|| anyhow::anyhow!("no home folder"))?;
-        let temp = std::env::temp_dir();
-        let temp_root = real(&temp).parent().map(Path::to_path_buf).unwrap_or(real(&temp));
+        let temp = real(&std::env::temp_dir());
+        // Only climb to the per-user root for macOS's `/private/var/folders/.../T` dir;
+        // never climb out of `/private/tmp` (to `/private`) or a custom `~/tmp` (to `$HOME`).
+        let temp_root = if temp.starts_with("/private/var/folders") && temp.file_name() == Some(std::ffi::OsStr::new("T")) {
+            temp.parent().map(Path::to_path_buf).unwrap_or(temp)
+        } else {
+            temp
+        };
         let mut policy = Self::for_home(project, &home, &temp_root, network);
         policy.hidden.push(real(&paths.data));
         // Under Library/Caches, which tools may write: saved conversations hold other
         // projects' chats, and one planted there would be read as a model's context.
         policy.hidden.push(real(&paths.cache));
+        // Protect the VM Unix socket even if it fell back into `$TMPDIR`.
+        let socket = real(&paths.guard_socket());
+        if !policy.hidden.contains(&socket) {
+            policy.hidden.push(socket);
+        }
         policy.readable.push(real(&paths.local_api_key()));
         Ok(policy)
     }
@@ -144,14 +157,31 @@ impl Policy {
             "\n;; Ways to start processes outside the sandbox, and the keychain CLI.\n(deny process-exec{})\n(deny appleevent-send)\n(deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\"))\n",
             literals(&blocked)
         ));
-        let mut sockets = vec![PathBuf::from("/private/var/run/docker.sock")];
-        sockets.extend(DOCKER_SOCKETS_IN_HOME.iter().map(|p| self.home.join(p)));
+        let mut sockets: Vec<PathBuf> = Vec::new();
+        for candidate in std::iter::once(PathBuf::from("/private/var/run/docker.sock"))
+            .chain(std::iter::once(PathBuf::from("/var/run/docker.sock")))
+            .chain(DOCKER_SOCKETS_IN_HOME.iter().map(|p| self.home.join(p)))
+        {
+            for resolved in [candidate.clone(), real(&candidate)] {
+                if !sockets.contains(&resolved) {
+                    sockets.push(resolved);
+                }
+            }
+        }
         out.push_str(&format!(
             "\n;; Docker's daemon can run a container that mounts anything.\n(deny network-outbound{})\n",
             sockets.iter().map(|p| format!("\n  (remote unix-socket (path-literal {}))", path(p))).collect::<String>()
         ));
         if self.network == Network::LocalOnly {
-            out.push_str("\n;; Only this machine.\n(deny network-outbound (remote ip \"*:*\"))\n(allow network-outbound (remote ip \"localhost:*\"))\n");
+            out.push_str(
+                "\n;; Only this machine.\n\
+                 (deny network-outbound (remote ip \"*:*\"))\n\
+                 (allow network-outbound (remote ip \"localhost:*\"))\n\
+                 (deny network-bind (local ip \"*:*\"))\n\
+                 (allow network-bind (local ip \"localhost:*\"))\n\
+                 (deny network-inbound (local ip \"*:*\"))\n\
+                 (allow network-inbound (local ip \"localhost:*\"))\n",
+            );
         }
         out
     }
@@ -164,6 +194,7 @@ pub const KEPT_ENVIRONMENT: &[&str] = &["HOME", "USER", "LOGNAME", "SHELL", "PAT
 /// Writes the profile for a project (its writable folders, blocked programs and network)
 /// as `sandbox/<stem>.sb`, and returns its path.
 pub fn write_project_profile(paths: &Paths, main: &Path, related: &[Folder], network: Network, blocked_programs: &[String], stem: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(!stem.is_empty() && stem.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')), "bad sandbox profile stem");
     let mut policy = Policy::new(main, paths, network)?;
     policy.write_also(related.iter().filter(|f| f.writable).map(|f| f.path.clone()));
     policy.block_programs(blocked_programs);
@@ -178,8 +209,9 @@ pub fn login_path() -> String {
     static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
         let shell = std::env::var("SHELL").ok().filter(|s| s.starts_with('/')).unwrap_or_else(|| "/bin/zsh".into());
+        let print_path = if shell.ends_with("/fish") { "string join : $PATH" } else { "printf %s \"$PATH\"" };
         std::process::Command::new(shell)
-            .args(["-l", "-c", "printf %s \"$PATH\""])
+            .args(["-l", "-c", print_path])
             .stdin(std::process::Stdio::null())
             .output()
             .ok()
@@ -193,7 +225,7 @@ pub fn login_path() -> String {
 /// A shell running `script` in `profile`, from `cwd`, with the same reduced environment
 /// OpenCode gets (and the login shell's `PATH`). Its errors go to its output.
 pub fn shell(profile: &Path, cwd: &Path, script: &str) -> std::process::Command {
-    sandboxed(profile, cwd, Path::new("/bin/zsh"), &["-c", &format!("exec 2>&1\n{script}")])
+    sandboxed(profile, cwd, Path::new("/bin/zsh"), &["-f", "-c", &format!("exec 2>&1\n{script}")])
 }
 
 /// `program` with `args` in `profile`, from `cwd`, with only [`KEPT_ENVIRONMENT`] and the
@@ -228,8 +260,9 @@ fn program_paths(name: &str) -> Vec<PathBuf> {
         return Vec::new();
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
+    let login = login_path();
     let mut found: Vec<PathBuf> = Vec::new();
-    for dir in std::env::split_paths(&path).chain(PROGRAM_DIRS.iter().map(PathBuf::from)) {
+    for dir in std::env::split_paths(&path).chain(std::env::split_paths(&login)).chain(PROGRAM_DIRS.iter().map(PathBuf::from)) {
         let candidate = dir.join(name);
         if candidate.is_file() {
             for p in [candidate.clone(), real(&candidate)] {
@@ -285,9 +318,14 @@ impl Backend for Seatbelt {
         let opencode = crate::opencode::binary().ok_or_else(|| anyhow::anyhow!("OpenCode was not found; install it from opencode.ai"))?;
         let profile = write_project_profile(request.paths, request.project, request.related, request.network, request.blocked_programs, stem)?;
         // The project's rules, and its path on the guard: OpenCode's global config already
-        // has our provider, so only its address changes.
+        // has our provider, so only its address changes (matching its 1.x or 2.x key style).
         let mut config = request.opencode.clone();
-        config["provider"] = serde_json::json!({ PROVIDER_ID: { "options": { "baseURL": format!("{}{}/v1", request.guard_url, request.guard_path) } } });
+        let base_url = format!("{}{}/v1", request.guard_url, request.guard_path);
+        if crate::opencode::global_uses_v2_keys() {
+            config["providers"] = serde_json::json!({ PROVIDER_ID: { "settings": { "baseURL": base_url } } });
+        } else {
+            config["provider"] = serde_json::json!({ PROVIDER_ID: { "options": { "baseURL": base_url } } });
+        }
         let folders = if request.related.iter().any(|f| f.writable) { "the project's folders" } else { "this folder" };
         Ok(Prepared {
             banner: vec![
@@ -311,7 +349,11 @@ mod tests {
         assert!(profile.contains("(subpath \"/Users/a/code/app\")"));
         assert!(profile.contains("(subpath \"/Users/a/.ssh\")"));
         assert!(profile.contains("(literal \"/usr/bin/open\")"));
+        assert!(profile.contains("(subpath \"/Users/a/.zshrc\")"));
+        assert!(profile.contains("(subpath \"/Users/a/.zshenv\")"));
         assert!(profile.contains("(allow network-outbound (remote ip \"localhost:*\"))"));
+        assert!(profile.contains("(deny network-bind (local ip \"*:*\"))"));
+        assert!(profile.contains("(deny network-inbound (local ip \"*:*\"))"));
         // Hidden paths come after the writable ones, so they win.
         assert!(profile.find("(deny file-read* file-write*").unwrap() > profile.find("(allow file-write*").unwrap());
         assert!(!Policy::for_home(Path::new("/p"), Path::new("/h"), Path::new("/t"), Network::Internet).profile().contains("remote ip"));

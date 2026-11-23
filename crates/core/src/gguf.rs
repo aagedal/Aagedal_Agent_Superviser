@@ -210,18 +210,25 @@ impl GgufInfo {
     /// (gpt-oss, whose alternating layers we know, excepted). Recurrent layers (hybrid models)
     /// keep a small fixed-size state instead and are skipped.
     pub fn kv_cache(&self) -> Option<KvCache> {
+        const MAX_LAYERS: u64 = 4096;
+        const MAX_LOOP_COUNT: u64 = 64;
+        const F16: u64 = 2;
+
         let layers = self.int("block_count")?;
+        if layers == 0 || layers > MAX_LAYERS {
+            return None;
+        }
         let heads = self.int("attention.head_count").or_else(|| {
             self.int_arrays.get("attention.head_count").and_then(|v| v.iter().copied().max())
         })?;
         let embd = self.int("embedding_length")?;
-        const F16: u64 = 2;
 
         // Multi-head latent attention (DeepSeek-style): the compressed latent plus the rope
         // part as K, and the latent again as V (counted in case it is kept separately).
         if let Some(rank) = self.int("attention.kv_lora_rank") {
             let rope = self.int("rope.dimension_count").unwrap_or(64);
-            return Some(KvCache { per_token: layers * (2 * rank + rope) * F16, fixed: 0 });
+            let per_layer = rank.checked_mul(2)?.checked_add(rope)?.checked_mul(F16)?;
+            return Some(KvCache { per_token: layers.checked_mul(per_layer)?, fixed: 0 });
         }
 
         let head_dim = embd / heads.max(1);
@@ -229,25 +236,40 @@ impl GgufInfo {
         let value_len = self.int("attention.value_length").unwrap_or(head_dim);
         let key_len_swa = self.int("attention.key_length_swa").unwrap_or(key_len);
         let value_len_swa = self.int("attention.value_length_swa").unwrap_or(value_len);
-        let window_cells = self.int("attention.sliding_window").map(|w| w + SWA_BATCH);
+        let window_cells = match self.int("attention.sliding_window") {
+            Some(w) => Some(w.checked_add(SWA_BATCH)?),
+            None => None,
+        };
         let pattern = self.int_arrays.get("attention.sliding_window_pattern");
         let per_layer_heads: Vec<u64> = match self.int_arrays.get("attention.head_count_kv") {
-            Some(per_layer) => per_layer.clone(),
+            Some(per_layer) => {
+                if per_layer.len() > MAX_LAYERS as usize {
+                    return None;
+                }
+                per_layer.clone()
+            }
             None => vec![self.int("attention.head_count_kv").unwrap_or(heads); layers as usize],
         };
         // Looped models (inkling2_loop) run layers `loop.start..loop.end` `loop.count` times,
         // and llama.cpp keeps a cache for each pass.
         let mut slots: Vec<usize> = (0..per_layer_heads.len()).collect();
         if let (Some(start), Some(end), Some(count)) = (self.int("loop.start"), self.int("loop.end"), self.int("loop.count")) {
-            let core = start as usize..(end as usize).min(per_layer_heads.len());
-            for _ in 1..count {
-                slots.extend(core.clone());
+            if count > MAX_LOOP_COUNT {
+                return None;
+            }
+            let start = usize::try_from(start).ok()?;
+            let end = usize::try_from(end).ok()?.min(per_layer_heads.len());
+            if start < end {
+                let core = start..end;
+                for _ in 1..count {
+                    slots.extend(core.clone());
+                }
             }
         }
         let interval = self.int("full_attention_interval");
         let mut cache = KvCache::default();
         for index in slots {
-            let kv_heads = &per_layer_heads[index];
+            let kv_heads = per_layer_heads[index];
             if interval.is_some_and(|n| n > 0 && !(index as u64 + 1).is_multiple_of(n)) {
                 continue;
             }
@@ -257,8 +279,14 @@ impl GgufInfo {
                 None => self.arch == "gpt-oss" && index % 2 == 0,
             };
             match window_cells.filter(|_| sliding) {
-                Some(cells) => cache.fixed += kv_heads * (key_len_swa + value_len_swa) * F16 * cells,
-                None => cache.per_token += kv_heads * (key_len + value_len) * F16,
+                Some(cells) => {
+                    let delta = kv_heads.checked_mul(key_len_swa.checked_add(value_len_swa)?)?.checked_mul(F16)?.checked_mul(cells)?;
+                    cache.fixed = cache.fixed.checked_add(delta)?;
+                }
+                None => {
+                    let delta = kv_heads.checked_mul(key_len.checked_add(value_len)?)?.checked_mul(F16)?;
+                    cache.per_token = cache.per_token.checked_add(delta)?;
+                }
             }
         }
         Some(cache)
@@ -410,5 +438,27 @@ pub(crate) mod tests {
         let data = header("llama", &[("block_count", 32)], &[]);
         assert_eq!(parse(&data[..30]), Err(GgufError::NeedMore));
         assert_eq!(parse(b"nope"), Err(GgufError::NotGguf));
+    }
+
+    #[test]
+    fn malicious_headers_do_not_oom_or_overflow() {
+        let huge_layers = header("llama", &[("block_count", u64::MAX), ("embedding_length", 4096), ("attention.head_count", 32)], &[]);
+        assert_eq!(parse(&huge_layers).unwrap().kv_cache(), None);
+
+        let huge_loop = header(
+            "inkling2_loop",
+            &[("block_count", 8), ("embedding_length", 512), ("attention.head_count", 8), ("loop.start", 0), ("loop.end", 4), ("loop.count", u64::MAX)],
+            &[],
+        );
+        assert_eq!(parse(&huge_loop).unwrap().kv_cache(), None);
+
+        let mut overflow = parse(&header(
+            "llama",
+            &[("block_count", 32), ("embedding_length", 4096), ("attention.head_count", 32)],
+            &[],
+        ))
+        .unwrap();
+        overflow.ints.insert("attention.key_length".into(), u64::MAX);
+        assert_eq!(overflow.kv_cache(), None);
     }
 }

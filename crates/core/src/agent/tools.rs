@@ -18,6 +18,7 @@ const MAX_READ_LINES: usize = 2000;
 const MAX_LINE: usize = 2000;
 const MAX_MATCHES: usize = 200;
 const MAX_LISTED: usize = 500;
+const MAX_READ_FILE: u64 = 16 << 20;
 const MAX_SEARCHED_FILE: u64 = 2 << 20;
 /// Bytes of command output kept from its start and its end.
 const OUTPUT_HEAD: usize = 64 << 10;
@@ -172,6 +173,13 @@ impl Workspace {
         if path.is_dir() {
             return self.list(&path);
         }
+        let meta = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", self.show(&path)))?;
+        if !meta.is_file() {
+            return Err(format!("{} is not a regular file", self.show(&path)));
+        }
+        if meta.len() > MAX_READ_FILE {
+            return Err(format!("{} is too large to read ({} bytes)", self.show(&path), meta.len()));
+        }
         let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", self.show(&path)))?;
         if bytes[..bytes.len().min(8000)].contains(&0) {
             return Ok(format!("{} is a binary file ({} bytes).", self.show(&path), bytes.len()));
@@ -279,6 +287,9 @@ impl Workspace {
     fn write(&self, args: &Value) -> Result<String, String> {
         let path = self.resolve(str_arg(args, "path")?, Access::Write)?;
         let content = str_arg(args, "content")?;
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("{} is a symlink", self.show(&path)));
+        }
         let existed = path.exists();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", self.show(parent)))?;
@@ -382,21 +393,60 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
 }
 
 /// `path` with symlinks resolved: its nearest existing ancestor resolved, the rest added.
-/// `None` when the rest climbs with `..`.
+/// Dangling symlinks are followed iteratively so a link inside the project cannot point
+/// outside it; symlink loops and unresolved `..` climbs return `None`.
 fn real_path(path: &Path) -> Option<PathBuf> {
-    let mut existing = path.to_path_buf();
-    let mut rest = Vec::new();
-    loop {
-        if let Ok(resolved) = std::fs::canonicalize(&existing) {
-            return Some(rest.into_iter().rev().fold(resolved, |p: PathBuf, part| p.join(part)));
+    const MAX_SYMLINKS: usize = 40;
+    let mut current = path.to_path_buf();
+    let mut hops = 0usize;
+    'resolve: loop {
+        let mut existing = current.clone();
+        let mut rest = Vec::new();
+        loop {
+            if let Ok(resolved) = std::fs::canonicalize(&existing) {
+                return Some(rest.into_iter().rev().fold(resolved, |p: PathBuf, part| p.join(part)));
+            }
+            if std::fs::symlink_metadata(&existing).is_ok_and(|m| m.file_type().is_symlink()) {
+                hops += 1;
+                if hops > MAX_SYMLINKS {
+                    return None;
+                }
+                let target = std::fs::read_link(&existing).ok()?;
+                let base = if target.is_absolute() {
+                    target
+                } else {
+                    let parent = existing.parent()?;
+                    let resolved_parent = std::fs::canonicalize(parent).ok()?;
+                    lexical_join(&resolved_parent, &target)?
+                };
+                current = rest.into_iter().rev().fold(base, |p: PathBuf, part| p.join(part));
+                continue 'resolve;
+            }
+            match existing.components().next_back()? {
+                std::path::Component::Normal(name) => rest.push(name.to_owned()),
+                std::path::Component::CurDir => {}
+                _ => return None,
+            }
+            existing = existing.parent()?.to_path_buf();
         }
-        match existing.components().next_back()? {
-            std::path::Component::Normal(name) => rest.push(name.to_owned()),
+    }
+}
+
+fn lexical_join(base: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut out = base.to_path_buf();
+    for component in rel.components() {
+        match component {
             std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Normal(part) => out.push(part),
             _ => return None,
         }
-        existing = existing.parent()?.to_path_buf();
     }
+    Some(out)
 }
 
 /// `text` cut to about `max` characters, keeping its start and end.
@@ -522,5 +572,33 @@ mod tests {
         let text = "a".repeat(100) + &"b".repeat(100);
         let clipped = clip(&text, 30);
         assert!(clipped.starts_with("aaaaaaaaaaaaaaaaaaaa\n…") && clipped.ends_with("bbbbbbbbbb"), "{clipped}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_symlinks_cannot_escape_project_on_write() {
+        let (root, ws) = workspace("symlink-escape");
+        let outside = root.join("outside-new.txt");
+        let abs_link = root.join("app/abs-link");
+        let rel_link = root.join("app/rel-link");
+        let loop_a = root.join("app/loop-a");
+        let loop_b = root.join("app/loop-b");
+        std::os::unix::fs::symlink(&outside, &abs_link).unwrap();
+        std::os::unix::fs::symlink("../outside-rel.txt", &rel_link).unwrap();
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+
+        let err_abs = run(&ws, "write", json!({"path": "abs-link", "content": "pwn"})).await;
+        assert!(err_abs.starts_with("Error:"), "{err_abs}");
+        assert!(!outside.exists());
+
+        let err_rel = run(&ws, "write", json!({"path": "rel-link", "content": "pwn"})).await;
+        assert!(err_rel.starts_with("Error:"), "{err_rel}");
+        assert!(!root.join("outside-rel.txt").exists());
+
+        let err_loop = run(&ws, "write", json!({"path": "loop-a", "content": "pwn"})).await;
+        assert!(err_loop.starts_with("Error:"), "{err_loop}");
+
+        std::fs::remove_dir_all(root).ok();
     }
 }

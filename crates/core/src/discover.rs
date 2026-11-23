@@ -334,6 +334,9 @@ fn scan_ollama(root: &Path, candidates: &mut Vec<Candidate>) {
                 continue;
             };
             let blob = digest.replace(':', "-");
+            if blob.is_empty() || blob == "." || blob == ".." || blob.contains('/') || blob.contains('\\') {
+                continue;
+            }
             let name = match (registry.as_str(), namespace.as_str()) {
                 ("registry.ollama.ai", "library") => format!("{model}:{tag}"),
                 ("registry.ollama.ai", _) => format!("{namespace}/{model}:{tag}"),

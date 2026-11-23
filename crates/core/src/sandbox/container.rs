@@ -177,7 +177,7 @@ impl Backend for LinuxVm {
         write_private(&config, opencode::apply("", &setup)?.as_bytes())?;
         let c = shell_quote(&vm.container.display().to_string());
         let quoted = |args: &[String]| args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
-        let name = vm.name(Use::Terminal);
+        let name = shell_quote(&vm.name(Use::Terminal));
         let command = format!(
             "{c} system start --enable-kernel-install >/dev/null || exit 1\n\
              if ! {c} image inspect {image} >/dev/null 2>&1; then\n\
@@ -242,6 +242,7 @@ impl Vm {
     /// recipe and the key OpenCode sends the guard. `request.opencode` is passed in
     /// `OPENCODE_CONFIG_CONTENT`.
     pub fn new(request: &Request, stem: &str, purpose: Use) -> anyhow::Result<Self> {
+        anyhow::ensure!(!stem.is_empty() && stem.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')), "bad VM stem");
         for folder in std::iter::once(request.project).chain(request.related.iter().map(|f| f.path.as_path())) {
             let path = folder.display().to_string();
             anyhow::ensure!(!path.contains(':') && !path.contains(','), "the Linux VM can't share {path}: its path has ':' or ','");
@@ -272,7 +273,12 @@ impl Vm {
         let mut options: Vec<String> = ["--rm", "--ssh", "--network", &network, "--cpus", &cpus.to_string(), "--memory", &format!("{memory_gib}G")]
             .map(String::from)
             .into();
-        options.extend(["--env".into(), format!("OPENCODE_CONFIG_CONTENT={}", request.opencode)]);
+        // The VM doesn't mount the host's global opencode.json, so never pass host MCP entries into it.
+        let mut opencode_cfg = request.opencode.clone();
+        if let Some(obj) = opencode_cfg.as_object_mut() {
+            obj.remove("mcp");
+        }
+        options.extend(["--env".into(), format!("OPENCODE_CONFIG_CONTENT={opencode_cfg}")]);
         options.extend(["--volume".into(), format!("{}:{WORKSPACE}", request.project.display())]);
         for (folder, target) in vm_folders(request.related) {
             let readonly = if folder.writable { "" } else { ",readonly" };
@@ -337,12 +343,19 @@ pub fn stop_chat_leftovers() {
 }
 
 /// The Mac path of `path` as the VM sees it: under `/workspace` (the main folder) or a
-/// related folder's place under `/folders`. `None` for other paths.
+/// related folder's place under `/folders`. `None` for other paths or traversal attempts.
 pub fn host_path(main: &Path, related: &[Folder], path: &Path) -> Option<PathBuf> {
+    let safe_rest = |rest: &Path| {
+        rest.components()
+            .all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir))
+    };
     if let Ok(rest) = path.strip_prefix(WORKSPACE) {
-        return Some(main.join(rest));
+        return safe_rest(rest).then(|| main.join(rest));
     }
-    vm_folders(related).into_iter().find_map(|(folder, target)| Some(folder.path.join(path.strip_prefix(&target).ok()?)))
+    vm_folders(related).into_iter().find_map(|(folder, target)| {
+        let rest = path.strip_prefix(&target).ok()?;
+        safe_rest(rest).then(|| folder.path.join(rest))
+    })
 }
 
 /// Where the project's folders appear in the VM, main first.
@@ -439,6 +452,8 @@ mod tests {
         assert_eq!(host("/folders/docs/a.md"), Some(PathBuf::from("/a/docs/a.md")));
         assert_eq!(host("/folders/docs-2/b.md"), Some(PathBuf::from("/b/docs/b.md")));
         assert_eq!(host("/workspaces/x"), None);
+        assert_eq!(host("/workspace/../../etc/passwd"), None);
+        assert_eq!(host("/folders/docs/../secret"), None);
         assert_eq!(host("/etc/passwd"), None);
         assert_eq!(vm_paths(&related), ("/workspace".into(), vec!["/folders/docs".into(), "/folders/docs-2".into()]));
     }

@@ -160,23 +160,34 @@ pub struct Installed {
     pub restarted_service: bool,
 }
 
+/// Whether the user's global OpenCode config uses 2.x top-level `providers` keys.
+pub fn global_uses_v2_keys() -> bool {
+    let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) else { return false };
+    jsonc_parser::parse_to_serde_value::<Value>(&text, &ParseOptions::default())
+        .ok()
+        .is_some_and(|v| v.get("providers").is_some())
+}
+
 /// Writes the setup into the global config (after a `.bak` copy) and, on OpenCode 2.x,
 /// restarts its background service so the change applies to the next session.
 pub fn install(setup: &Setup) -> anyhow::Result<Installed> {
     let path = config_path().context("no home directory")?;
-    let original = std::fs::read_to_string(&path).unwrap_or_default();
-    let updated = apply(&original, setup).with_context(|| format!("updating {}", path.display()))?;
-    let backup = if original.is_empty() {
-        None
-    } else {
-        let backup = path.with_extension(format!("{}.bak", path.extension().and_then(|e| e.to_str()).unwrap_or("json")));
-        std::fs::write(&backup, &original)?;
-        Some(backup)
+    let original = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let updated = apply(&original, setup).with_context(|| format!("updating {}", path.display()))?;
+    let mut backup = None;
     if updated != original {
+        if !original.is_empty() {
+            let bak = path.with_extension(format!("{}.bak", path.extension().and_then(|e| e.to_str()).unwrap_or("json")));
+            crate::paths::write_private(&bak, original.as_bytes())?;
+            backup = Some(bak);
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::write(&path, updated)?;
     }
     let version = version();
@@ -217,12 +228,21 @@ pub fn parse_mcp(text: &str) -> Vec<McpServer> {
         .collect()
 }
 
+/// Credential-bearing fields stripped from disabled MCP server entries so secrets from the
+/// host config are never copied into `OPENCODE_CONFIG_CONTENT`, launch scripts or VMs.
+const SENSITIVE_MCP_KEYS: &[&str] = &["environment", "env", "headers", "oauth", "auth", "token", "apiKey", "api_key", "secret", "password"];
+
 /// Config (for `OPENCODE_CONFIG_CONTENT`) that turns `servers` off. OpenCode drops partial
-/// entries, so each is repeated whole with the switch flipped.
+/// entries, so each keeps its structural fields (without credentials) with the switch flipped.
 pub fn mcp_off<'a>(servers: impl IntoIterator<Item = &'a McpServer>) -> Value {
     let (mut v1, mut v2) = (serde_json::Map::new(), serde_json::Map::new());
     for server in servers {
         let mut entry = server.entry.clone();
+        if let Some(map) = entry.as_object_mut() {
+            for key in SENSITIVE_MCP_KEYS {
+                map.remove(*key);
+            }
+        }
         if server.v2 {
             entry["disabled"] = Value::Bool(true);
             v2.insert(server.name.clone(), entry);
@@ -300,10 +320,10 @@ mod tests {
     #[test]
     fn reads_and_turns_off_mcp_servers() {
         let v1 = parse_mcp(r#"{ // comment
-            "mcp": { "media": { "type": "local", "command": ["/x"], "enabled": true } } }"#);
+            "mcp": { "media": { "type": "local", "command": ["/x"], "environment": { "SECRET": "s3cr3t" }, "enabled": true } } }"#);
         assert_eq!(v1.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["media"]);
         assert_eq!(mcp_off(&v1), json!({ "media": { "type": "local", "command": ["/x"], "enabled": false } }));
-        let v2 = parse_mcp(r#"{ "mcp": { "servers": { "docs": { "type": "remote", "url": "https://x" } } } }"#);
+        let v2 = parse_mcp(r#"{ "mcp": { "servers": { "docs": { "type": "remote", "url": "https://x", "headers": { "Authorization": "Bearer secret" } } } } }"#);
         assert_eq!(mcp_off(&v2), json!({ "servers": { "docs": { "type": "remote", "url": "https://x", "disabled": true } } }));
         assert!(parse_mcp("{}").is_empty() && parse_mcp("not json").is_empty());
     }

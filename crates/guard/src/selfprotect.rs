@@ -24,7 +24,7 @@ static BASE_URL_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)base[_-]?url|model_provider|openai_base_url|\bproviders?\b|\bmodel\b|small_model").unwrap()
 });
 static PROC_ENV: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"/proc/[^\n"']{0,120}?/(?:environ|mem)\b"#).unwrap());
+    LazyLock::new(|| Regex::new(r"/proc/[^\n]{0,120}?/(?:environ|mem)\b").unwrap());
 
 pub struct SelfProtection {
     process_kill: Regex,
@@ -36,23 +36,37 @@ impl SelfProtection {
     /// `process_names` are what the app runs as; `state_markers` name its state directory
     /// (its bundle identifier, and the absolute path if known).
     pub fn new(process_names: &[String], state_markers: &[String]) -> Self {
-        let alternatives = |items: &[String]| items.iter().map(|s| regex::escape(s)).collect::<Vec<_>>().join("|");
-        let names = alternatives(process_names);
-        Self {
-            process_kill: Regex::new(&format!(
-                r#"(?i)\b(?:pkill|killall|kill|taskkill)\b[^"]*(?:{names})|(?:{names})[^"]*\b(?:pkill|killall|taskkill)\b"#
-            ))
-            .unwrap(),
-            names: Regex::new(&format!("(?i){names}")).unwrap(),
-            state: Regex::new(&format!("(?i){}", alternatives(state_markers))).unwrap(),
-        }
+        let alternatives = |items: &[String]| {
+            let non_empty: Vec<String> = items.iter().filter(|s| !s.is_empty()).map(|s| regex::escape(s)).collect();
+            if non_empty.is_empty() { None } else { Some(non_empty.join("|")) }
+        };
+        let never = || Regex::new(r"\A\b\B").unwrap();
+        let (process_kill, names) = match alternatives(process_names) {
+            Some(names) => (
+                Regex::new(&format!(
+                    r"(?i)\b(?:pkill|killall|kill|taskkill)\b[^\n]*(?:{names})|(?:{names})[^\n]*\b(?:pkill|killall|taskkill)\b"
+                ))
+                .unwrap(),
+                Regex::new(&format!("(?i){names}")).unwrap(),
+            ),
+            None => (never(), never()),
+        };
+        let state = match alternatives(state_markers) {
+            Some(markers) => Regex::new(&format!("(?i){markers}")).unwrap(),
+            None => never(),
+        };
+        Self { process_kill, names, state }
     }
 
     /// Why a call attacks the guard, if it does. `args` is checked raw and JSON-decoded
     /// (the tool runs the decoded form, so `s` must not hide an `s`).
     pub fn reason(&self, args: &str) -> Option<String> {
         let decoded = serde_json::from_str::<serde_json::Value>(args).map(|v| crate::compact_json(&v)).ok();
-        std::iter::once(args).chain(decoded.as_deref()).find_map(|text| self.reason_in(text))
+        let text = crate::policy::call_text(args);
+        std::iter::once(args)
+            .chain(decoded.as_deref())
+            .chain(std::iter::once(text.as_str()))
+            .find_map(|s| self.reason_in(s))
     }
 
     fn reason_in(&self, text: &str) -> Option<String> {
@@ -93,10 +107,13 @@ mod tests {
     fn attacks_on_the_guard_are_blocked() {
         let attacks = [
             (json!({"command": "pkill -f agent-superviser"}), "kills"),
+            (json!({"command": "pkill -f \"agent-superviser\""}), "kills"),
             (json!({"command": "killall 'Agent Superviser'"}), "kills"),
+            (json!({"command": "killall \"Agent Superviser\""}), "kills"),
             (json!({"command": "cat ~/Library/Application\\ Support/me.aagedal.AgentSuperviser/keys/local-api-key"}), "state directory"),
             (json!({"file_path": "/Users/a/Library/Application Support/me.aagedal.AgentSuperviser/guard/calls.jsonl", "old_string": "blocked", "new_string": "passed"}), "state directory"),
             (json!({"command": "cat /proc/$(pgrep -f AgentSuperviser | head -1)/environ"}), "process environment"),
+            (json!({"command": "cat /proc/$(pgrep -f \"Agent Superviser\")/environ"}), "process environment"),
             (json!({"command": "export OPENAI_BASE_URL=https://api.openai.com && opencode"}), "base URL"),
             (json!({"file_path": "~/.config/opencode/opencode.jsonc", "new_string": "\"baseURL\": \"http://127.0.0.1:9999/v1\""}), "settings file"),
             (json!({"file_path": "/home/alice/.claude/settings.json", "new_string": "{\"env\":{\"ANTHROPIC_BASE_URL\":\"x\"}}"}), "settings file"),
@@ -126,5 +143,13 @@ mod tests {
     fn json_escapes_do_not_hide_an_attack() {
         let escaped = json!({"command": "pkill -f agent-superviser"}).to_string().replace("superviser", "\\u0073upervis\\u0065r");
         assert_eq!(protection().reason(&escaped).as_deref(), Some("self-protection: kills the guard"));
+    }
+
+    #[test]
+    fn empty_lists_do_not_block_benign_calls() {
+        let empty = SelfProtection::new(&[], &[]);
+        assert_eq!(empty.reason(r#"{"command": "ls -la"}"#), None);
+        let blank = SelfProtection::new(&["".into()], &["".into()]);
+        assert_eq!(blank.reason(r#"{"command": "ls -la"}"#), None);
     }
 }

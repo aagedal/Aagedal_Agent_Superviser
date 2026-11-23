@@ -156,14 +156,29 @@ const MAX_TASK: usize = 6000;
 /// generic in most harnesses), tool results or agent turns. Keeps the end when long, as the
 /// latest ask matters most.
 pub(crate) fn task_text(request: &Value) -> String {
-    let Some(messages) = request.get("messages").and_then(Value::as_array) else { return String::new() };
-    let text = messages
-        .iter()
-        .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-        .map(|m| content_text(m.get("content")))
-        .filter(|t| !t.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let text = if let Some(messages) = request.get("messages").and_then(Value::as_array) {
+        messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .map(|m| content_text(m.get("content")))
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    } else if let Some(input) = request.get("input") {
+        match input {
+            Value::String(s) => s.clone(),
+            Value::Array(items) => items
+                .iter()
+                .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                .map(|m| content_text(m.get("content")))
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            _ => String::new(),
+        }
+    } else {
+        return String::new();
+    };
     let length = text.chars().count();
     if length <= MAX_TASK {
         return text;
@@ -257,7 +272,10 @@ impl Guard {
         let mut verdict = review.verdict();
         if let Some(reason) = &review.reason {
             self.flagged.push(Blocked { name: name.to_string(), reason: reason.clone() });
-            if !self.config.block {
+            if self.config.block {
+                // A blocked call never runs; keep it out of scanner trace context for later calls.
+                self.calls.pop();
+            } else {
                 verdict = Verdict::Flagged;
             }
         }

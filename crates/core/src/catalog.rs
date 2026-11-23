@@ -114,7 +114,7 @@ impl KvType {
     /// What `f16` bytes of cache take in this type.
     pub fn bytes(self, f16: u64) -> u64 {
         match self {
-            Self::Q8 => f16 * 17 / 32,
+            Self::Q8 => ((u128::from(f16) * 17) / 32).min(u128::from(u64::MAX)) as u64,
             Self::F16 => f16,
         }
     }
@@ -261,26 +261,30 @@ impl CatalogModel {
     }
 
     pub fn fit_with(&self, budget: u64, kv: KvType) -> Option<Fit> {
-        fit(self.quant.size + kv.bytes(self.kv_fixed_bytes), self.kv_bytes_per_token, self.context_length, budget, kv)
+        fit(self.quant.size.saturating_add(kv.bytes(self.kv_fixed_bytes)), self.kv_bytes_per_token, self.context_length, budget, kv)
     }
 
     /// About what a conversation of `tokens` takes saved to disk: its KV cells and the
     /// sliding-window layers' cache.
     pub fn saved_bytes(&self, tokens: u64, kv: KvType) -> u64 {
-        kv.bytes(self.kv_bytes_per_token.unwrap_or(FALLBACK_KV_PER_TOKEN) * tokens + self.kv_fixed_bytes)
+        let variable = self.kv_bytes_per_token.unwrap_or(FALLBACK_KV_PER_TOKEN).saturating_mul(tokens);
+        kv.bytes(variable.saturating_add(self.kv_fixed_bytes))
     }
 
     /// Memory the judge takes while it runs beside a model.
     pub fn judge_required(&self) -> u64 {
-        self.quant.size + JUDGE_BUFFERS
+        self.quant.size.saturating_add(JUDGE_BUFFERS)
     }
 
     /// RAM llama-server may keep saved conversations in: enough for one at full context, so
     /// the agent's survives a short request in between, but never more than the model leaves
     /// free of `ram_budget`. With less, a long conversation is read again after one.
     pub fn prompt_cache(&self, fit: &Fit, ram_budget: u64) -> u64 {
-        let per_token = fit.kv.bytes(self.kv_bytes_per_token.unwrap_or(FALLBACK_KV_PER_TOKEN)) + SAVED_BYTES_PER_TOKEN;
-        let conversation = per_token * fit.context + fit.kv.bytes(self.kv_fixed_bytes) + SAVED_EXTRA_BYTES;
+        let per_token = fit.kv.bytes(self.kv_bytes_per_token.unwrap_or(FALLBACK_KV_PER_TOKEN)).saturating_add(SAVED_BYTES_PER_TOKEN);
+        let conversation = per_token
+            .saturating_mul(fit.context)
+            .saturating_add(fit.kv.bytes(self.kv_fixed_bytes))
+            .saturating_add(SAVED_EXTRA_BYTES);
         conversation.min(ram_budget.saturating_sub(fit.required))
     }
 
@@ -325,13 +329,13 @@ impl CatalogModel {
 pub fn fit(weights: u64, kv_per_token: Option<u64>, model_context: Option<u64>, budget: u64, kv_type: KvType) -> Option<Fit> {
     let kv = kv_type.bytes(kv_per_token.unwrap_or(FALLBACK_KV_PER_TOKEN));
     // Compute buffers grow with the model; half a GiB covers the small ones.
-    let overhead = (512 << 20) + weights / 32;
+    let overhead = (512u64 << 20).saturating_add(weights / 32);
     let max_context = model_context.unwrap_or(MIN_CONTEXT);
     if max_context < MIN_CONTEXT {
         return None;
     }
     CONTEXTS.iter().map(|&c| c.min(max_context)).find_map(|context| {
-        let required = weights + kv * context + overhead;
+        let required = weights.checked_add(kv.checked_mul(context)?)?.checked_add(overhead)?;
         (required <= budget).then_some(Fit { context, required, kv: kv_type })
     })
 }

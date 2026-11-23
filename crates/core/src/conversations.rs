@@ -206,20 +206,21 @@ impl Conversations {
         let known: Vec<String> = saved.iter().flat_map(|m| [Self::file_name(&m.id), format!("{}.json", stem(&m.id))]).collect();
         for entry in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            // Another model's save in progress.
-            let saving = name.ends_with("-saving.bin") && entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age < SAVING_AGE));
-            if !saving && !known.contains(&name) {
+            // Another model's save or atomic metadata write in progress.
+            let in_progress = (name.ends_with("-saving.bin") || name.ends_with(".tmp"))
+                && entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age < SAVING_AGE));
+            if !in_progress && !known.contains(&name) {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
         let limit = self.limit();
-        let mut total: u64 = saved.iter().map(|m| m.bytes).sum();
+        let mut total: u64 = saved.iter().fold(0u64, |acc, m| acc.saturating_add(m.bytes));
         for old in saved {
             if total <= limit {
                 break;
             }
             self.remove(&old.id);
-            total -= old.bytes;
+            total = total.saturating_sub(old.bytes);
         }
     }
 

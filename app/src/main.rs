@@ -447,7 +447,8 @@ pub fn open_window_at(handle: &AppHandle, name: &str, tab: &str) -> tauri::Resul
     if let Some(window) = handle.get_webview_window(name) {
         if !tab.is_empty() {
             let call = if name == "chat" { "openProject" } else { "showTab" };
-            window.eval(format!("{call}({tab:?})"))?;
+            let arg = serde_json::to_string(tab).unwrap_or_else(|_| "\"\"".into());
+            window.eval(format!("{call}({arg})"))?;
         }
         window.show()?;
         return window.set_focus();

