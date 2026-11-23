@@ -90,6 +90,7 @@ impl Hub {
         let client = reqwest::Client::builder()
             .user_agent(concat!("agent-superviser/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(std::time::Duration::from_secs(15))
+            .read_timeout(std::time::Duration::from_secs(60))
             .build()
             .expect("HTTP client");
         Self { client, endpoint: ENDPOINT.to_string(), token: token.filter(|t| !t.is_empty()) }
@@ -168,6 +169,9 @@ impl Hub {
         if let Ok(mut existing) = tokio::fs::File::open(&part).await {
             let mut buf = vec![0u8; 1 << 20];
             loop {
+                if cancel.load(Ordering::Relaxed) {
+                    bail!("download cancelled");
+                }
                 let n = existing.read(&mut buf).await?;
                 if n == 0 {
                     break;
@@ -184,6 +188,9 @@ impl Hub {
         progress(have);
 
         if have < file.size {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("download cancelled");
+            }
             let url = self.file_url(repo, revision, &file.path);
             let mut request = self.get(&url);
             if have > 0 {
@@ -203,15 +210,34 @@ impl Hub {
                 .open(&part)
                 .await?;
             let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
+            let mut last_chunk = tokio::time::Instant::now();
+            loop {
                 if cancel.load(Ordering::Relaxed) {
                     out.flush().await?;
                     bail!("download cancelled");
                 }
+                let next = match tokio::time::timeout(std::time::Duration::from_millis(500), stream.next()).await {
+                    Ok(item) => item,
+                    Err(_) => {
+                        if last_chunk.elapsed() >= std::time::Duration::from_secs(60) {
+                            out.flush().await?;
+                            bail!("{} stalled for 60s", file.path);
+                        }
+                        continue;
+                    }
+                };
+                let Some(chunk) = next else { break };
+                last_chunk = tokio::time::Instant::now();
                 let chunk = chunk?;
+                let next_have = have.saturating_add(chunk.len() as u64);
+                if next_have > file.size {
+                    out.flush().await?;
+                    tokio::fs::remove_file(&part).await.ok();
+                    bail!("{} exceeded expected size ({} bytes)", file.path, file.size);
+                }
                 hasher.update(&chunk);
                 out.write_all(&chunk).await?;
-                have += chunk.len() as u64;
+                have = next_have;
                 progress(have);
             }
             out.flush().await?;

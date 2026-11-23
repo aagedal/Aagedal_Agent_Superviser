@@ -332,22 +332,29 @@ impl Workspace {
         let mut child = tokio::process::Command::from(std_command)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("couldn't start the shell: {e}"))?;
         let mut stdout = child.stdout.take().expect("piped");
+        let mut stderr = child.stderr.take().expect("piped");
         let pid = child.id();
+        struct GroupGuard(Option<u32>);
+        impl Drop for GroupGuard {
+            fn drop(&mut self) {
+                if let Some(pid) = self.0 {
+                    let _ = std::process::Command::new("/bin/kill").args(["-KILL", &format!("-{pid}")]).status();
+                }
+            }
+        }
+        let mut group_guard = GroupGuard(pid);
         let collect = async {
             let mut head = Vec::new();
             let mut tail = VecDeque::new();
             let mut total = 0usize;
-            let mut chunk = [0u8; 8192];
-            while let Ok(n) = stdout.read(&mut chunk).await {
-                if n == 0 {
-                    break;
-                }
-                total += n;
-                for &byte in &chunk[..n] {
+            let mut push = |bytes: &[u8]| {
+                total += bytes.len();
+                for &byte in bytes {
                     if head.len() < OUTPUT_HEAD {
                         head.push(byte);
                     } else {
@@ -357,20 +364,32 @@ impl Workspace {
                         }
                     }
                 }
+            };
+            let mut out_buf = [0u8; 8192];
+            let mut err_buf = [0u8; 8192];
+            let (mut out_done, mut err_done) = (false, false);
+            while !(out_done && err_done) {
+                tokio::select! {
+                    res = stdout.read(&mut out_buf), if !out_done => match res {
+                        Ok(0) | Err(_) => out_done = true,
+                        Ok(n) => push(&out_buf[..n]),
+                    },
+                    res = stderr.read(&mut err_buf), if !err_done => match res {
+                        Ok(0) | Err(_) => err_done = true,
+                        Ok(n) => push(&err_buf[..n]),
+                    },
+                }
             }
             let status = child.wait().await;
             (head, tail, total, status)
         };
-        let stopped = |why: &str| {
-            if let Some(pid) = pid {
-                let _ = std::process::Command::new("/bin/kill").args(["-KILL", &format!("-{pid}")]).status();
-            }
-            why.to_string()
-        };
         let (head, tail, total, status) = tokio::select! {
-            done = collect => done,
-            _ = tokio::time::sleep(Duration::from_secs(timeout)) => return Err(stopped(&format!("the command was stopped after {timeout} s"))),
-            _ = cancel.wait_for(|c| *c) => return Err(stopped("the user stopped the command")),
+            done = collect => {
+                group_guard.0 = None;
+                done
+            }
+            _ = tokio::time::sleep(Duration::from_secs(timeout)) => return Err(format!("the command was stopped after {timeout} s")),
+            _ = cancel.wait_for(|c| *c) => return Err("the user stopped the command".to_string()),
         };
         let mut output = String::from_utf8_lossy(&head).into_owned();
         if !tail.is_empty() {

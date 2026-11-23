@@ -205,6 +205,7 @@ fn checked_folder(path: &Path) -> anyhow::Result<PathBuf> {
 /// Opens OpenCode for a project in a new Terminal window, isolated as the project says.
 pub fn launch(paths: &Paths, launch: &Launch) -> anyhow::Result<Launched> {
     let project = launch.project;
+    anyhow::ensure!(!project.folders.is_empty(), "project has no folders");
     let main = checked_folder(project.main())?;
     let related = project
         .related()

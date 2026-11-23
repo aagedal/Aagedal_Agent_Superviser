@@ -30,10 +30,10 @@ use crate::project::Folder;
 
 const CONTAINERFILE: &str = include_str!("Containerfile");
 /// Bumped whenever `Containerfile` changes, so images are rebuilt.
-const RECIPE: u32 = 3;
+const RECIPE: u32 = 4;
 const IMAGE: &str = "agent-superviser/opencode";
 /// The OpenCode version used when the host's can't be read.
-const DEFAULT_OPENCODE: &str = "2.3.0";
+const DEFAULT_OPENCODE: &str = "2.3.2";
 /// The host-only network used when internet is off.
 const LOCAL_NETWORK: &str = "superviser-local";
 const HOME: &str = "/home/agent";
@@ -258,11 +258,10 @@ impl Vm {
         let image = format!("{IMAGE}:{version}-{RECIPE}");
 
         let dir = sandbox.join(format!("vm-{stem}"));
-        let config = dir.join("config");
-        let state = dir.join(match purpose {
-            Use::Terminal => "state",
-            Use::Chat => "chat-state",
-        });
+        let (config, state) = match purpose {
+            Use::Terminal => (dir.join("config"), dir.join("state")),
+            Use::Chat => (dir.join("chat-config"), dir.join("chat-state")),
+        };
         let key = secrets::local_api_key(request.paths)?;
         write_private(&config.join("guard-key"), key.as_bytes())?;
         crate::paths::private_dir(&state)?;

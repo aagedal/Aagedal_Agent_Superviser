@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -46,7 +46,10 @@ enum Event {
 /// The running engines, by project id.
 #[derive(Default)]
 pub struct Engines {
-    running: tokio::sync::Mutex<HashMap<String, Arc<Engine>>>,
+    /// Sync mutex (never held across `.await`) so `running()` and `stop_all()` never block on VM builds.
+    running: Mutex<HashMap<String, Arc<Engine>>>,
+    /// Per-project startup gate so starting/building one project never blocks other projects.
+    starting: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 pub struct Engine {
@@ -68,43 +71,72 @@ pub struct Engine {
     cwd: String,
     folders: Vec<String>,
     alive: AtomicBool,
-    pid: Option<u32>,
+    /// Child process group id while running, `0` once reaped.
+    pid: AtomicU32,
     /// The VM it runs in (`container` and the VM's name), stopped with it.
     vm: Option<(PathBuf, String)>,
 }
 
 impl Engines {
+    fn gate(&self, project: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.starting
+            .lock()
+            .unwrap()
+            .entry(project.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// The engine for `project`, started (or restarted, when its settings or the model changed
     /// and it's idle) as needed.
     pub async fn get(&self, handle: &AppHandle, app: &App, project: &Project) -> anyhow::Result<Arc<Engine>> {
         let launch = Launch::new(app, project)?;
-        let mut running = self.running.lock().await;
-        if let Some(engine) = running.get(&project.id)
+        if let Some(engine) = self.running.lock().unwrap().get(&project.id).cloned()
             && engine.alive.load(Ordering::SeqCst)
             && (engine.fingerprint == launch.fingerprint || !engine.busy.lock().unwrap().is_empty())
         {
-            return Ok(engine.clone());
+            return Ok(engine);
         }
-        if let Some(old) = running.remove(&project.id) {
-            old.stop();
+        let gate = self.gate(&project.id);
+        let _guard = gate.lock().await;
+        // Re-check after acquiring this project's startup gate.
+        if let Some(engine) = self.running.lock().unwrap().get(&project.id).cloned()
+            && engine.alive.load(Ordering::SeqCst)
+            && (engine.fingerprint == launch.fingerprint || !engine.busy.lock().unwrap().is_empty())
+        {
+            return Ok(engine);
+        }
+        let old = self.running.lock().unwrap().remove(&project.id);
+        if let Some(old) = old
+            && let Some(vm_stop) = old.stop()
+        {
+            // Wait for the old VM with the same name to finish stopping before starting the replacement.
+            let _ = tauri::async_runtime::spawn_blocking(move || vm_stop.join()).await;
         }
         let engine = Engine::start(handle.clone(), app, project, launch).await?;
-        running.insert(project.id.clone(), engine.clone());
+        self.running.lock().unwrap().insert(project.id.clone(), engine.clone());
         Ok(engine)
     }
 
     /// The engine for a project if one runs.
     pub async fn running(&self, project: &str) -> Option<Arc<Engine>> {
-        self.running.lock().await.get(project).filter(|e| e.alive.load(Ordering::SeqCst)).cloned()
+        self.running.lock().unwrap().get(project).filter(|e| e.alive.load(Ordering::SeqCst)).cloned()
+    }
+
+    /// Stops one project's engine (e.g. when the project is deleted).
+    pub fn stop(&self, project: &str) {
+        if let Some(engine) = self.running.lock().unwrap().remove(project) {
+            let _ = engine.stop();
+        }
+        self.starting.lock().unwrap().remove(project);
     }
 
     /// Stops every engine (when the app quits), waiting for their VMs to stop.
     pub fn stop_all(&self) {
-        if let Ok(mut running) = self.running.try_lock() {
-            let stopping: Vec<_> = running.drain().filter_map(|(_, engine)| engine.stop()).collect();
-            for vm in stopping {
-                let _ = vm.join();
-            }
+        let engines: Vec<Arc<Engine>> = self.running.lock().unwrap().drain().map(|(_, e)| e).collect();
+        let stopping: Vec<_> = engines.into_iter().filter_map(|engine| engine.stop()).collect();
+        for vm in stopping {
+            let _ = vm.join();
         }
     }
 }
@@ -123,7 +155,7 @@ impl Launch {
         let guard = app.guard_url().context("the guard is not running")?;
         let main = std::fs::canonicalize(project.main()).with_context(|| format!("{} is gone", project.main().display()))?;
         let related: Vec<Folder> = project.related().iter().filter_map(|f| Some(Folder { path: std::fs::canonicalize(&f.path).ok()?, writable: f.writable })).collect();
-        secrets::local_api_key(&app.paths)?;
+        let api_key = secrets::local_api_key(&app.paths)?;
         // Every model a chat might use, so a session's recorded model always resolves.
         let models = app
             .installed()
@@ -145,7 +177,7 @@ impl Launch {
             config.extend(ours);
         }
         let binary = opencode::binary();
-        let fingerprint = json!({ "project": project, "config": config, "binary": binary }).to_string();
+        let fingerprint = json!({ "project": project, "config": config, "binary": binary, "key": api_key }).to_string();
         Ok(Self { config, fingerprint, main, related })
     }
 
@@ -160,6 +192,7 @@ impl Launch {
     /// The command that starts OpenCode, isolated as the project says, and the VM it runs
     /// in, if one. A VM's first start builds its image, which takes a few minutes.
     async fn command(&self, handle: &AppHandle, app: &App, project: &Project) -> anyhow::Result<(std::process::Command, Option<(PathBuf, String)>)> {
+        std::fs::create_dir_all(app.paths.logs())?;
         let log = std::fs::OpenOptions::new().create(true).append(true).open(app.paths.logs().join("opencode-acp.log"))?;
         let (mut command, vm) = match project.isolation {
             Isolation::MacosSandbox => {
@@ -237,7 +270,7 @@ impl Engine {
             asks: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashSet::new()),
             alive: AtomicBool::new(true),
-            pid: child.id(),
+            pid: AtomicU32::new(child.id().unwrap_or(0)),
             vm,
         });
         let reader = engine.clone();
@@ -254,21 +287,29 @@ impl Engine {
             for (_, waiting) in reader.pending.lock().unwrap().drain() {
                 let _ = waiting.send(Err("OpenCode stopped; see the opencode-acp log".into()));
             }
+            reader.asks.lock().unwrap().clear();
             let _ = child.wait().await;
+            reader.pid.store(0, Ordering::SeqCst);
         });
         let init = json!({
             "protocolVersion": PROTOCOL_VERSION,
             "clientCapabilities": {},
             "clientInfo": { "name": "Agent Superviser", "version": env!("CARGO_PKG_VERSION") },
         });
-        engine.request("initialize", init, Some(REQUEST_TIMEOUT)).await.context("OpenCode didn't start")?;
+        if let Err(e) = engine.request("initialize", init, Some(REQUEST_TIMEOUT)).await.context("OpenCode didn't start") {
+            if let Some(vm_stop) = engine.stop() {
+                let _ = tauri::async_runtime::spawn_blocking(move || vm_stop.join()).await;
+            }
+            return Err(e);
+        }
         Ok(engine)
     }
 
     /// Stops OpenCode, and its VM in the background (join to wait for it).
     fn stop(&self) -> Option<std::thread::JoinHandle<()>> {
         self.alive.store(false, Ordering::SeqCst);
-        if let Some(pid) = self.pid {
+        let pid = self.pid.swap(0, Ordering::SeqCst);
+        if pid != 0 {
             let _ = std::process::Command::new("/bin/kill").args(["-TERM", &format!("-{pid}")]).status();
         }
         let (container, name) = self.vm.clone()?;
@@ -287,9 +328,18 @@ impl Engine {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })).await?;
+        if let Err(e) = self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })).await {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(e);
+        }
         let answer = match timeout {
-            Some(limit) => tokio::time::timeout(limit, rx).await.map_err(|_| anyhow::anyhow!("OpenCode didn't answer {method} in time"))?,
+            Some(limit) => match tokio::time::timeout(limit, rx).await {
+                Ok(answer) => answer,
+                Err(_) => {
+                    self.pending.lock().unwrap().remove(&id);
+                    bail!("OpenCode didn't answer {method} in time");
+                }
+            },
             None => rx.await,
         };
         answer.map_err(|_| anyhow::anyhow!("OpenCode stopped"))?.map_err(|e| anyhow::anyhow!("{e}"))

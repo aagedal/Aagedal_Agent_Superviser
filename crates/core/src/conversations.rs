@@ -256,11 +256,14 @@ impl Conversations {
                 return Err(e);
             }
         };
-        std::fs::rename(&temp, self.dir.join(Self::file_name(id)))?;
-        let meta = Meta { id: id.to_string(), key: key.clone(), tokens: saved.tokens, bytes: saved.bytes, used: now() };
+        let final_path = self.dir.join(Self::file_name(id));
+        let disk_bytes = std::fs::metadata(&temp).map(|m| m.len()).unwrap_or(0);
+        let bytes = if saved.bytes > 0 { saved.bytes } else { disk_bytes };
+        std::fs::rename(&temp, &final_path)?;
+        let meta = Meta { id: id.to_string(), key: key.clone(), tokens: saved.tokens, bytes, used: now() };
         Self::write_meta(&self.meta_path(id), &meta)?;
         self.prune();
-        Ok(Some(saved))
+        Ok(Some(Saved { tokens: saved.tokens, bytes }))
     }
 
     /// Loads `id`'s conversation into `server` if one was saved with `key`; returns its tokens.

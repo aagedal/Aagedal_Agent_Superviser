@@ -2,7 +2,7 @@
 //! project's path so the project's rules apply, runs the tool calls that come back (asking
 //! the user first when the project says to), and tells the chat window as it goes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,8 +31,10 @@ const NOT_RUN: &str = "Not run: the user stopped the agent.";
 /// Turns in progress and calls waiting for the user.
 #[derive(Default)]
 pub struct Chats {
-    /// By chat id; sending `true` stops the turn.
-    running: Mutex<HashMap<String, watch::Sender<bool>>>,
+    /// By chat id: (project id, sender where `true` stops the turn).
+    running: Mutex<HashMap<String, (String, watch::Sender<bool>)>>,
+    /// Chats deleted while a turn was stopping, so the exiting turn never recreates their file.
+    deleted: Mutex<HashSet<String>>,
     /// By `chat:call`.
     approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
 }
@@ -43,9 +45,41 @@ impl Chats {
     }
 
     pub fn stop(&self, chat: &str) {
-        if let Some(stop) = self.running.lock().unwrap().get(chat) {
+        if let Some((_, stop)) = self.running.lock().unwrap().get(chat) {
             let _ = stop.send(true);
         }
+    }
+
+    /// Stops `chat` and marks it deleted so an active turn won't save its file back to disk.
+    pub fn stop_and_delete(&self, chat: &str) {
+        let running = self.running.lock().unwrap();
+        if let Some((_, stop)) = running.get(chat) {
+            self.deleted.lock().unwrap().insert(chat.to_string());
+            let _ = stop.send(true);
+        }
+    }
+
+    /// Stops every active turn for `project` and marks them deleted.
+    pub fn stop_project(&self, project: &str) {
+        let running = self.running.lock().unwrap();
+        let mut deleted = self.deleted.lock().unwrap();
+        for (chat, (proj, stop)) in running.iter() {
+            if proj == project {
+                deleted.insert(chat.clone());
+                let _ = stop.send(true);
+            }
+        }
+    }
+
+    /// Stops every active turn (when the app quits).
+    pub fn stop_all(&self) {
+        for (_, stop) in self.running.lock().unwrap().values() {
+            let _ = stop.send(true);
+        }
+    }
+
+    fn is_deleted(&self, chat: &str) -> bool {
+        self.deleted.lock().unwrap().contains(chat)
     }
 
     pub fn answer(&self, chat: &str, call: &str, allow: bool) {
@@ -92,8 +126,9 @@ pub fn send(handle: AppHandle, app: Arc<App>, project: &str, chat: Option<&str>,
         if running.contains_key(&chat.id) {
             bail!("The agent is still working on this chat.");
         }
-        running.insert(chat.id.clone(), stop);
+        running.insert(chat.id.clone(), (project.id.clone(), stop));
     }
+    app.chats.deleted.lock().unwrap().remove(&chat.id);
     let message = json!({ "role": "user", "content": text });
     chat.messages.push(message.clone());
     if let Err(e) = chat.save(&app.paths) {
@@ -103,10 +138,15 @@ pub fn send(handle: AppHandle, app: Arc<App>, project: &str, chat: Option<&str>,
     let id = chat.id.clone();
     emit(&handle, Event::State { chat: &id, busy: true, error: None });
     emit(&handle, Event::Message { chat: &id, message: &message });
+    let sync_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        sync_app.sync_upstreams().await;
+    });
     tauri::async_runtime::spawn(async move {
         let _awake = Awake::hold();
         let result = turn(&handle, &app, &project, &model.alias, &mut chat, stopped).await;
         app.chats.running.lock().unwrap().remove(&chat.id);
+        app.chats.deleted.lock().unwrap().remove(&chat.id);
         emit(&handle, Event::State { chat: &chat.id, busy: false, error: result.err().map(|e| format!("{e:#}")) });
     });
     Ok(id)
@@ -179,6 +219,9 @@ fn for_model(message: &Value) -> Value {
 }
 
 fn add(handle: &AppHandle, app: &App, chat: &mut Chat, message: Value) -> anyhow::Result<()> {
+    if app.chats.is_deleted(&chat.id) {
+        return Ok(());
+    }
     emit(handle, Event::Message { chat: &chat.id, message: &message });
     chat.messages.push(message);
     chat.save(&app.paths)
@@ -232,28 +275,22 @@ async fn stream_reply(handle: &AppHandle, client: &reqwest::Client, url: &str, k
     }
     let mut reply = Reply::default();
     let mut calls: Vec<Call> = Vec::new();
-    let mut buffer = String::new();
+    let mut buffer: Vec<u8> = Vec::new();
     let mut last = Instant::now();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        buffer.push_str(&String::from_utf8_lossy(&chunk.context("the reply was cut off")?));
-        while let Some(end) = buffer.find("\n\n") {
-            let event: String = buffer.drain(..end + 2).collect();
-            for data in event.lines().filter_map(|l| l.strip_prefix("data:")).map(str::trim) {
-                if data == "[DONE]" {
-                    continue;
-                }
-                let Ok(value) = serde_json::from_str::<Value>(data) else { continue };
-                if let Some(error) = value.get("error") {
-                    bail!("the model server said: {}", error["message"].as_str().unwrap_or("an error"));
-                }
-                read_delta(&value["choices"][0]["delta"], &mut reply, &mut calls);
-            }
+        buffer.extend_from_slice(&chunk.context("the reply was cut off")?);
+        while let Some((start, end)) = find_sse_event_end(&buffer) {
+            let event: Vec<u8> = buffer.drain(..end).collect();
+            consume_sse_event(&event[..start], &mut reply, &mut calls)?;
         }
         if last.elapsed() >= DELTA_EVERY {
             emit(handle, Event::Delta { chat, content: &reply.content, reasoning: &reply.reasoning });
             last = Instant::now();
         }
+    }
+    if !buffer.is_empty() {
+        consume_sse_event(&buffer, &mut reply, &mut calls)?;
     }
     // Calls the model named but never gave an id still need one to be answered.
     for (i, call) in calls.iter_mut().enumerate() {
@@ -263,6 +300,37 @@ async fn stream_reply(handle: &AppHandle, client: &reqwest::Client, url: &str, k
     }
     reply.calls = calls.into_iter().filter(|c| !c.name.is_empty()).collect();
     Ok(reply)
+}
+
+/// Finds the first `\n\n` or `\r\n\r\n` boundary in a raw byte buffer so multi-byte UTF-8
+/// characters split across HTTP chunks are never decoded mid-sequence.
+fn find_sse_event_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some((i, i + 2));
+        }
+        if i + 3 < buf.len() && &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some((i, i + 4));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn consume_sse_event(raw: &[u8], reply: &mut Reply, calls: &mut Vec<Call>) -> anyhow::Result<()> {
+    let event = String::from_utf8_lossy(raw);
+    for data in event.lines().filter_map(|l| l.strip_prefix("data:")).map(str::trim) {
+        if data == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else { continue };
+        if let Some(error) = value.get("error") {
+            bail!("the model server said: {}", error["message"].as_str().unwrap_or("an error"));
+        }
+        read_delta(&value["choices"][0]["delta"], reply, calls);
+    }
+    Ok(())
 }
 
 /// Adds one streamed delta to the reply: text, reasoning, and pieces of tool calls by index.
@@ -324,5 +392,24 @@ mod tests {
     fn reasoning_stays_out_of_requests() {
         let saved = json!({"role": "assistant", "content": "x", "reasoning": "y"});
         assert_eq!(for_model(&saved), json!({"role": "assistant", "content": "x"}));
+    }
+
+    #[test]
+    fn sse_byte_buffer_preserves_split_utf8_and_trailing_event() {
+        let mut reply = Reply::default();
+        let mut calls = Vec::new();
+        let stream = "data: {\"choices\":[{\"delta\":{\"content\":\"café — done\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}";
+        let mut buffer = Vec::new();
+        for chunk in stream.as_bytes().chunks(3) {
+            buffer.extend_from_slice(chunk);
+            while let Some((start, end)) = find_sse_event_end(&buffer) {
+                let event: Vec<u8> = buffer.drain(..end).collect();
+                consume_sse_event(&event[..start], &mut reply, &mut calls).unwrap();
+            }
+        }
+        if !buffer.is_empty() {
+            consume_sse_event(&buffer, &mut reply, &mut calls).unwrap();
+        }
+        assert_eq!(reply.content, "café — done!");
     }
 }

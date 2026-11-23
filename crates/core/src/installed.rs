@@ -112,13 +112,22 @@ fn sanitize(part: &str) -> String {
 /// Every complete model, newest first.
 pub fn list(paths: &Paths) -> Vec<InstalledModel> {
     let mut found = Vec::new();
-    let mut stack = vec![paths.models()];
-    while let Some(dir) = stack.pop() {
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = vec![(paths.models(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 16 {
+            continue;
+        }
+        if let Ok(real) = std::fs::canonicalize(&dir)
+            && !visited.insert(real)
+        {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                stack.push(path);
+                stack.push((path, depth + 1));
             } else if path.file_name().is_some_and(|n| n == MANIFEST) {
                 match read_manifest(&path) {
                     Ok(model) => found.push(model),
@@ -197,8 +206,16 @@ pub async fn install_to(
         let dest = dir.join(quant::local_path(&file.path));
         anyhow::ensure!(dest.starts_with(&dir) && !file.path.contains(".."), "unsafe file path {}", file.path);
         if std::fs::metadata(&dest).is_ok_and(|m| m.len() == file.size) {
-            finished += file.size;
-            continue;
+            if let Some(expected) = &file.sha256 {
+                if verify_sha256(&dest, expected, &cancel).await? {
+                    finished += file.size;
+                    continue;
+                }
+                let _ = tokio::fs::remove_file(&dest).await;
+            } else {
+                finished += file.size;
+                continue;
+            }
         }
         hub.download(&model.repo, &model.revision, file, &dest, &cancel, |done| {
             progress(Progress { done: finished + done, total })
@@ -217,6 +234,25 @@ pub async fn install_to(
     std::fs::write(dir.join(MANIFEST), serde_json::to_string_pretty(&installed)?)?;
     progress(Progress { done: total, total });
     Ok(installed)
+}
+
+async fn verify_sha256(path: &Path, expected: &str, cancel: &Arc<AtomicBool>) -> anyhow::Result<bool> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!("download cancelled");
+        }
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()).eq_ignore_ascii_case(expected))
 }
 
 /// Room a download must leave, so it never fills the disk to the last byte.

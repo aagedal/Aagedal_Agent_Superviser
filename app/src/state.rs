@@ -1,7 +1,7 @@
 //! The app's state and what it can do, independent of windows and menus.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -135,6 +135,9 @@ pub struct LoadedModel {
     /// Of system memory, with the conversations it keeps.
     #[serde(skip)]
     ram: u64,
+    /// Identifies the specific load attempt so an unload/reload race can't insert an old server.
+    #[serde(skip)]
+    load_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -182,6 +185,9 @@ pub struct App {
     running: tokio::sync::Mutex<HashMap<String, Running>>,
     /// Loaded, loading and failed models, most recently used first.
     models: Mutex<Vec<LoadedModel>>,
+    next_load_id: AtomicU64,
+    /// PIDs of model servers currently starting (`wait_ready`), so quit can stop them too.
+    loading_pids: Mutex<HashMap<u64, u32>>,
     judge_server: tokio::sync::Mutex<Option<LlamaServer>>,
     pub judge_status: Mutex<JudgeStatus>,
     pub downloads: Mutex<HashMap<String, Arc<AtomicBool>>>,
@@ -229,6 +235,8 @@ impl App {
             guard: Mutex::new(None),
             running: tokio::sync::Mutex::new(HashMap::new()),
             models: Mutex::new(Vec::new()),
+            next_load_id: AtomicU64::new(1),
+            loading_pids: Mutex::new(HashMap::new()),
             judge_server: tokio::sync::Mutex::new(None),
             judge_status: Mutex::new(JudgeStatus::Idle),
             downloads: Mutex::new(HashMap::new()),
@@ -298,12 +306,13 @@ impl App {
     /// Runs the judge while it is on, downloaded and a model is running; stops it otherwise.
     /// Options changes reach the guard without a restart.
     pub async fn sync_judge(&self) {
+        let mut server = self.judge_server.lock().await;
+        // Read desired state after acquiring the lock so queued syncs never act on stale settings.
         let (enabled, fail_closed) = {
             let settings = self.settings.lock().unwrap();
             (settings.judge, settings.judge_fail_closed)
         };
         let wanted = if enabled && self.latest_model().is_some() { self.judge_installed() } else { None };
-        let mut server = self.judge_server.lock().await;
         let Some(model) = wanted else {
             if let Some(mut old) = server.take() {
                 self.remember_pid("judge", None);
@@ -317,7 +326,6 @@ impl App {
             *self.judge_status.lock().unwrap() = JudgeStatus::Loading;
             match self.start_judge(&model).await {
                 Ok(started) => {
-                    self.remember_pid("judge", started.pid());
                     *server = Some(started);
                 }
                 Err(e) => {
@@ -357,7 +365,9 @@ impl App {
             slot_dir: None,
         };
         let mut server = LlamaServer::start(config).await?;
+        self.remember_pid("judge", server.pid());
         if let Err(e) = server.wait_ready(LOAD_TIMEOUT).await {
+            self.remember_pid("judge", None);
             server.stop().await;
             return Err(e.context(format!("see {}", log_file.display())));
         }
@@ -574,7 +584,17 @@ impl App {
                 return Ok(Room { fits: false, unload });
             }
         }
+        let loading: Vec<String> = models.iter().filter(|m| m.id != id && m.state == LoadState::Loading).map(|m| m.name.clone()).collect();
+        if !loading.is_empty() && self.fit(&model.model).is_some() {
+            bail!("{} is still loading; wait for it or unload it first", loading.join(" and "));
+        }
         bail!("{} doesn't fit in this machine's memory", model.model.name)
+    }
+
+    /// Safe unique file stem for a model id (avoids alias collisions in `.pid` and `.log` files).
+    fn model_file_key(id: &str) -> String {
+        let key: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' }).collect();
+        if key.is_empty() || key == "." || key == ".." { "model".into() } else { key }
     }
 
     /// Loads `id` in its own llama-server beside the loaded models, if it fits, and points the
@@ -584,6 +604,8 @@ impl App {
         let binary = runtime::find_llama_server().context("llama-server was not found (install llama.cpp, or set SUPERVISER_LLAMA_SERVER)")?;
         let entry = model.entry_path().context("model has no entry file")?;
         secrets::upstream_api_key(&self.paths)?;
+        let load_id = self.next_load_id.fetch_add(1, Ordering::Relaxed);
+        let file_key = Self::model_file_key(id);
         // Check the room and claim it in one go, so two loads can't both take it.
         let (mut fit, mut prompt_cache) = {
             let mut models = self.models.lock().unwrap();
@@ -592,6 +614,7 @@ impl App {
                     LoadState::Running { .. } => {
                         drop(models);
                         self.touch(id);
+                        self.sync_upstreams().await;
                         return Ok(());
                     }
                     LoadState::Loading => bail!("{} is already loading", model.model.name),
@@ -601,7 +624,14 @@ impl App {
             let fit = match self.fit_beside(&models, &model.model, id) {
                 Some(fit) => fit,
                 None => {
-                    let others: Vec<&str> = models.iter().filter(|m| m.id != id && matches!(m.state, LoadState::Running { .. })).map(|m| m.name.as_str()).collect();
+                    let others: Vec<&str> = models
+                        .iter()
+                        .filter(|m| m.id != id && !matches!(m.state, LoadState::Failed { .. }))
+                        .map(|m| m.name.as_str())
+                        .collect();
+                    if others.is_empty() {
+                        bail!("{} doesn't fit in this machine's memory", model.model.name);
+                    }
                     bail!("{} doesn't fit beside {}; unload one first", model.model.name, others.join(" and "));
                 }
             };
@@ -609,12 +639,12 @@ impl App {
             let prompt_cache = model.model.prompt_cache(&fit, self.model_hardware().ram_budget.saturating_sub(ram_used));
             models.retain(|m| m.id != id);
             let state = LoadState::Loading;
-            models.insert(0, LoadedModel { id: id.to_string(), name: model.model.name.clone(), alias: model.alias.clone(), state, memory: fit.required, ram: fit.required + prompt_cache });
+            models.insert(0, LoadedModel { id: id.to_string(), name: model.model.name.clone(), alias: model.alias.clone(), state, memory: fit.required, ram: fit.required + prompt_cache, load_id });
             (fit, prompt_cache)
         };
         changed();
         tracing::info!("{}: {}k context, {} MiB for saved conversations", model.alias, fit.context / 1024, prompt_cache >> 20);
-        let log_file = self.paths.logs().join(format!("llama-server-{}.log", model.alias));
+        let log_file = self.paths.logs().join(format!("llama-server-{file_key}.log"));
         let curated = self.catalog.curated(&model.model.repo);
         let save_conversations = self.settings.lock().unwrap().save_conversations;
         let slot_dir = match save_conversations.then(|| self.conversations.prepare()) {
@@ -644,16 +674,24 @@ impl App {
             };
             loop {
                 let mut server = LlamaServer::start(config.clone()).await?;
+                if let Some(pid) = server.pid() {
+                    self.loading_pids.lock().unwrap().insert(load_id, pid);
+                    self.remember_pid(&file_key, Some(pid));
+                }
                 match server.wait_ready(LOAD_TIMEOUT).await {
                     Ok(()) => break anyhow::Ok(server),
                     // A model llama.cpp can't draft for may stop while loading: once more without.
                     Err(e) if config.speculative && !server.is_running() => {
+                        self.loading_pids.lock().unwrap().remove(&load_id);
+                        self.remember_pid(&file_key, None);
                         tracing::warn!("{}: {e:#}; loading it again without speculative decoding", model.alias);
                         config.speculative = false;
                         config.port = runtime::free_port()?;
                     }
                     // Nor one whose attention can't use an 8-bit cache: with a 16-bit one, if it fits.
                     Err(e) if config.kv != KvType::F16 && !server.is_running() => {
+                        self.loading_pids.lock().unwrap().remove(&load_id);
+                        self.remember_pid(&file_key, None);
                         let mut models = self.models.lock().unwrap();
                         let Some(f16) = self.fit_beside_with(&models, &model.model, id, KvType::F16) else {
                             break Err(e.context(format!("{} needs a 16-bit context cache here, which doesn't fit beside the loaded models", model.model.name)));
@@ -662,7 +700,7 @@ impl App {
                         let (_, ram_used) = Self::used(&models, id);
                         fit = f16;
                         prompt_cache = model.model.prompt_cache(&fit, self.model_hardware().ram_budget.saturating_sub(ram_used));
-                        if let Some(m) = models.iter_mut().find(|m| m.id == id) {
+                        if let Some(m) = models.iter_mut().find(|m| m.id == id && m.load_id == load_id) {
                             (m.memory, m.ram) = (fit.required, fit.required + prompt_cache);
                         }
                         drop(models);
@@ -670,6 +708,8 @@ impl App {
                         config.port = runtime::free_port()?;
                     }
                     Err(e) => {
+                        self.loading_pids.lock().unwrap().remove(&load_id);
+                        self.remember_pid(&file_key, None);
                         server.stop().await;
                         break Err(e.context(format!("see {}", log_file.display())));
                     }
@@ -677,28 +717,42 @@ impl App {
             }
         }
         .await;
+        let still_active = || self.models.lock().unwrap().iter().any(|m| m.id == id && m.load_id == load_id);
         let set_state = |state: LoadState| {
-            if let Some(m) = self.models.lock().unwrap().iter_mut().find(|m| m.id == id) {
+            if let Some(m) = self.models.lock().unwrap().iter_mut().find(|m| m.id == id && m.load_id == load_id) {
                 m.state = state;
             }
         };
         match started {
-            Ok(server) => {
-                // Unloaded while it loaded: don't keep it.
-                if !self.models.lock().unwrap().iter().any(|m| m.id == id) {
-                    let mut server = server;
+            Ok(mut server) => {
+                // Unloaded or superseded while loading: don't restore or keep it.
+                if !still_active() {
+                    self.loading_pids.lock().unwrap().remove(&load_id);
+                    self.remember_pid(&file_key, None);
                     server.stop().await;
                     bail!("{} was unloaded while it loaded", model.model.name);
                 }
-                self.remember_pid(&model.alias, server.pid());
                 let key = slot_dir.as_ref().and_then(|_| conversations::Key::of(&model.entry_path()?, fit.kv, fit.context));
                 if let Some(key) = &key
                     && let Some(tokens) = self.conversations.restore(&server, id, key).await
                 {
                     tracing::info!("{}: picked up its last conversation ({tokens} tokens)", model.alias);
                 }
-                self.running.lock().await.insert(id.to_string(), Running { server, model: model.model.clone(), key });
-                set_state(LoadState::Running { context: fit.context });
+                // Re-check under the `running` lock so an unload during `restore()` can never
+                // leave an orphaned server invisible to `self.models`.
+                {
+                    let mut running = self.running.lock().await;
+                    if !still_active() {
+                        drop(running);
+                        self.loading_pids.lock().unwrap().remove(&load_id);
+                        self.remember_pid(&file_key, None);
+                        server.stop().await;
+                        bail!("{} was unloaded while it loaded", model.model.name);
+                    }
+                    running.insert(id.to_string(), Running { server, model: model.model.clone(), key });
+                    self.loading_pids.lock().unwrap().remove(&load_id);
+                    set_state(LoadState::Running { context: fit.context });
+                }
                 self.sync_upstreams().await;
                 changed();
                 self.settings.lock().unwrap().last_model = Some(id.to_string());
@@ -712,6 +766,7 @@ impl App {
                 Ok(())
             }
             Err(e) => {
+                self.loading_pids.lock().unwrap().remove(&load_id);
                 set_state(LoadState::Failed { error: format!("{e:#}") });
                 changed();
                 Err(e)
@@ -729,7 +784,7 @@ impl App {
         self.models.lock().unwrap().retain(|m| id.is_some_and(|id| id != m.id));
         for (model_id, mut running) in stopping {
             self.save_conversation(&model_id, &running).await;
-            self.remember_pid(&running.server.alias, None);
+            self.remember_pid(&Self::model_file_key(&model_id), None);
             running.server.stop().await;
         }
         self.sync_upstreams().await;
@@ -774,11 +829,11 @@ impl App {
     }
 
     /// Points the guard at every loaded model's server, by alias; requests naming none of
-    /// them go to the most recently loaded.
-    async fn sync_upstreams(&self) {
+    /// them go to the most recently loaded. Iterates LRU→MRU so a newer model wins alias collisions.
+    pub async fn sync_upstreams(&self) {
         let urls: HashMap<String, String> = self.running.lock().await.iter().map(|(id, r)| (id.clone(), r.server.base_url())).collect();
         let models = self.models();
-        let by_alias: HashMap<String, String> = models.iter().filter_map(|m| Some((m.alias.clone(), urls.get(&m.id)?.clone()))).collect();
+        let by_alias: HashMap<String, String> = models.iter().rev().filter_map(|m| Some((m.alias.clone(), urls.get(&m.id)?.clone()))).collect();
         let default = models.iter().find_map(|m| urls.get(&m.id).cloned());
         if let Some(guard) = self.guard.lock().unwrap().as_ref() {
             guard.set_upstreams(by_alias, default);
@@ -864,9 +919,18 @@ impl App {
     }
 
     pub fn delete_project(&self, id: &str) -> anyhow::Result<()> {
+        self.engines.stop(id);
+        self.chats.stop_project(id);
         self.settings.lock().unwrap().projects.retain(|p| p.id != id);
         superviser_core::agent::Chat::delete_all(&self.paths, id);
-        self.chat_models.lock().unwrap().retain(|key, _| !key.starts_with(&format!("{id}/")));
+        {
+            let mut chat_models = self.chat_models.lock().unwrap();
+            let before = chat_models.len();
+            chat_models.retain(|key, _| !key.starts_with(&format!("{id}/")));
+            if chat_models.len() != before {
+                superviser_core::paths::write_private(&self.paths.chat_models(), serde_json::to_string(&*chat_models)?.as_bytes())?;
+            }
+        }
         for chat in self.archived_chats(id) {
             self.set_chat_archived(id, &chat, false)?;
         }
@@ -914,20 +978,29 @@ impl App {
     }
 
     pub fn shutdown(&self) {
+        self.chats.stop_all();
         self.engines.stop_all();
-        if let Ok(mut running) = self.running.try_lock() {
-            for (id, mut running) in running.drain() {
-                tauri::async_runtime::block_on(self.save_conversation(&id, &running));
-                self.remember_pid(&running.server.alias, None);
-                tauri::async_runtime::block_on(running.server.stop());
+        // Stop any llama-server processes still mid-load before waiting on locks.
+        for (_, pid) in self.loading_pids.lock().unwrap().drain() {
+            let _ = std::process::Command::new("/bin/kill").arg(pid.to_string()).status();
+        }
+        tauri::async_runtime::block_on(async {
+            if let Ok(mut running) = tokio::time::timeout(Duration::from_secs(5), self.running.lock()).await {
+                for (id, mut running) in running.drain() {
+                    self.save_conversation(&id, &running).await;
+                    self.remember_pid(&Self::model_file_key(&id), None);
+                    running.server.stop().await;
+                }
             }
-        }
-        if let Ok(mut judge) = self.judge_server.try_lock()
-            && let Some(mut judge) = judge.take()
-        {
-            self.remember_pid("judge", None);
-            tauri::async_runtime::block_on(judge.stop());
-        }
+            if let Ok(mut judge) = tokio::time::timeout(Duration::from_secs(2), self.judge_server.lock()).await
+                && let Some(mut judge) = judge.take()
+            {
+                self.remember_pid("judge", None);
+                judge.stop().await;
+            }
+        });
+        // Catch any server whose lock timed out (e.g. mid-`start_judge`).
+        runtime::stop_leftovers(&self.paths.run(), &self.paths.upstream_api_key().display().to_string());
         if let Some(guard) = self.guard.lock().unwrap().as_mut() {
             guard.stop();
         }
