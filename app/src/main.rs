@@ -90,8 +90,8 @@ fn main() {
             update::start(&handle);
 
             // Until the first-run guide is finished or skipped, open it.
-            if !app.settings.lock().unwrap().setup_done {
-                open_window(&handle, "settings")?;
+            if needs_setup(&app) {
+                open_window(&handle, "setup")?;
             }
             Ok(())
         })
@@ -151,6 +151,7 @@ fn main() {
             commands::open_chat,
             commands::setup_done,
             commands::set_setup_done,
+            commands::leave_setup,
             commands::get_installer,
         ]);
 
@@ -160,6 +161,16 @@ fn main() {
         RunEvent::Exit => handle.state::<Arc<App>>().shutdown(),
         _ => {}
     });
+}
+
+/// Whether to offer the setup guide: not finished or skipped, and not set up some other way
+/// (a model that fits on this Mac and a project, from Settings).
+fn needs_setup(app: &App) -> bool {
+    let (done, projects) = {
+        let settings = app.settings.lock().unwrap();
+        (settings.setup_done, !settings.projects.is_empty())
+    };
+    !done && !(projects && app.installed().iter().any(|m| app.fit(&m.model).is_some()))
 }
 
 fn status_line(status: &ServerStatus) -> String {
@@ -236,6 +247,8 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
     let opencode_refs: Vec<&dyn IsMenuItem<tauri::Wry>> = opencode_items.iter().map(|i| i as &dyn IsMenuItem<tauri::Wry>).collect();
     let in_opencode = Submenu::with_id_and_items(handle, "in-opencode", "Open in OpenCode", cfg!(target_os = "macos") && !opencode_refs.is_empty(), &opencode_refs)?;
     let settings = MenuItem::with_id(handle, "settings", "Settings…", true, Some("CmdOrCtrl+,"))?;
+    // Until setup is finished or skipped, a way back to it.
+    let setup = needs_setup(app).then(|| MenuItem::with_id(handle, "setup", "Continue Setup…", true, None::<&str>)).transpose()?;
     let quit = MenuItem::with_id(handle, "quit", "Quit Agent Superviser", true, Some("CmdOrCtrl+Q"))?;
     let update = handle.state::<update::Updates>().available().map(|(version, installing)| {
         let label = if installing { format!("Installing {version}…") } else { format!("Update to {version} and Restart…") };
@@ -246,6 +259,10 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
     let mut top: Vec<&dyn IsMenuItem<tauri::Wry>> = Vec::new();
     if let Some(update) = &update {
         top.extend([update as &dyn IsMenuItem<tauri::Wry>, &separator_top]);
+    }
+    let separator_setup = PredefinedMenuItem::separator(handle)?;
+    if let Some(setup) = &setup {
+        top.extend([setup as &dyn IsMenuItem<tauri::Wry>, &separator_setup]);
     }
     Menu::with_items(
         handle,
@@ -310,7 +327,7 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
                 tracing::warn!("opening chat: {e}");
             }
         }
-        "settings" => {
+        "settings" | "setup" => {
             if let Err(e) = open_window(&handle, &id) {
                 tracing::warn!("opening {id}: {e}");
             }
@@ -396,11 +413,11 @@ pub fn open_project(handle: &AppHandle, id: &str) {
     }
 }
 
-fn show_error(handle: &AppHandle, title: &str, message: &str) {
+pub fn show_error(handle: &AppHandle, title: &str, message: &str) {
     handle.dialog().message(message).title(title).kind(MessageDialogKind::Error).show(|_| {});
 }
 
-/// Shows the `settings` or `chat` window, creating it if needed.
+/// Shows the `setup`, `settings` or `chat` window, creating it if needed.
 pub fn open_window(handle: &AppHandle, name: &str) -> tauri::Result<()> {
     open_window_at(handle, name, "")
 }
@@ -437,6 +454,7 @@ pub fn open_window_at(handle: &AppHandle, name: &str, tab: &str) -> tauri::Resul
     }
     let (title, size) = match name {
         "chat" => ("Agent Superviser Chat", (1000.0, 720.0)),
+        "setup" => ("Set Up Agent Superviser", (800.0, 680.0)),
         _ => ("Agent Superviser", (880.0, 640.0)),
     };
     let page = if tab.is_empty() { format!("{name}.html") } else { format!("{name}.html#{tab}") };

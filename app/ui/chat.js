@@ -292,7 +292,13 @@ function upsertTool(update) {
   scrollDown();
 }
 
-const OPTION_LABELS = { allow_once: "Allow", allow_always: "Always allow", reject_once: "Deny", reject_always: "Never" };
+const OPTION_LABELS = { allow_once: "Allow", allow_always: "Allow for this chat", reject_once: "Deny", reject_always: "Never" };
+const OPTION_TITLES = {
+  allow_once: "Allow this once",
+  allow_always: "Don't ask again for calls like this in this chat. The guard still checks each one.",
+  reject_once: "Don't run it; the agent is told and can try something else",
+  reject_always: "Don't run calls like this in this chat",
+};
 
 function askPermission(request, toolCall, options) {
   upsertTool(toolCall);
@@ -305,37 +311,48 @@ function askPermission(request, toolCall, options) {
     card.approval.remove();
     card.approval = null;
     card.state.textContent = option?.kind.startsWith("allow") ? "running…" : "declined";
+    renderWorking();
   };
   const question = { execute: "Run this command?", edit: "Make this change?", delete: "Delete this?", fetch: "Fetch this page?" }[card.call.kind] || "Allow this?";
+  const where = project?.name || "the project";
+  const why = {
+    execute: `It runs in the sandbox: it can change files only in ${where}, and the guard has checked it.`,
+    edit: `Only files in ${where} can change.`,
+    delete: `Only files in ${where} can be deleted.`,
+    fetch: "The guard has checked the address.",
+  }[card.call.kind];
   card.approval = el(
     "div",
     { class: "approval" },
-    el("span", {}, question),
-    ...options.map((option) => el("button", { class: option.kind === "allow_once" ? "primary" : "", onclick: () => answer(option) }, OPTION_LABELS[option.kind] || option.name)),
+    el("div", { class: "approval-text" }, el("strong", {}, question), why ? el("div", { class: "small muted" }, why) : null),
+    // "Never" is left out: Deny covers it, and fewer buttons are easier to answer.
+    ...options.filter((option) => option.kind !== "reject_always" || !options.some((o) => o.kind === "reject_once")).map((option) => el("button", { class: option.kind === "allow_once" ? "primary" : "", title: OPTION_TITLES[option.kind] || "", onclick: () => answer(option) }, OPTION_LABELS[option.kind] || option.name)),
   );
   card.box.append(card.approval);
   card.box.scrollIntoView({ block: "nearest" });
+  renderWorking();
 }
 
-function applyUpdate(update) {
-  switch (update.sessionUpdate) {
+function applyUpdate(change) {
+  switch (change.sessionUpdate) {
     case "user_message_chunk":
-      appendUser(update.messageId, textOf(update.content));
+      appendUser(change.messageId, textOf(change.content));
       break;
     case "agent_message_chunk":
-      agentText(update.messageId || "current", textOf(update.content));
+      agentText(change.messageId || "current", textOf(change.content));
       break;
     case "agent_thought_chunk":
-      agentThought(update.messageId || "current", textOf(update.content));
+      agentThought(change.messageId || "current", textOf(change.content));
       break;
     case "tool_call":
     case "tool_call_update":
-      upsertTool(update);
+      upsertTool(change);
       break;
     case "usage_update":
-      if (update.size) {
-        usage = { used: update.used, size: update.size };
-        $("usage").textContent = `${Math.round(update.used / 1000)}k of ${Math.round(update.size / 1000)}k tokens`;
+      if (change.size) {
+        usage = { used: change.used, size: change.size };
+        $("usage").textContent = `Chat ${Math.round((change.used / change.size) * 100)}% full`;
+        $("usage").title = `${Math.round(change.used / 1000)}k of ${Math.round(change.size / 1000)}k tokens of the model's context`;
         update();
       }
       break;
@@ -433,14 +450,40 @@ function reply(request, option) {
 
 // --- Chats ---
 
+// Ways to begin, for an empty chat. They fill in the message box; nothing is sent until you do.
+const STARTERS = [
+  ["Explain this project", "Explain what this project does and how its main files fit together. Don't change anything."],
+  ["Look for bugs", "Look through this project for bugs. Tell me what you find and how you'd fix each one before changing anything."],
+  ["Write a README", "Write a README.md that explains what this project is, how to set it up and how to run it."],
+  ["Start something new", "If this folder is empty, make a simple web page in index.html with a title, a short introduction and a contact link, in plain HTML and CSS. If it already has files, tell me what's here first and don't change anything."],
+];
+
 function emptyState() {
   const asks = { commands: "You'll be asked before commands run.", everything: "You'll be asked before commands run and files change.", never: "It won't ask before acting; the guard and sandbox still check everything." }[project?.approvals || "commands"];
-  const folders = project ? project.folders.map((f) => f.path.split("/").pop()).join(", ") : "";
+  if (!project) return el("div", { class: "empty" }, el("h2", {}, "Pick a project"));
+  const names = (folders) => folders.map((f) => f.path.split("/").pop()).join(", ");
+  const writable = project.folders.filter((f, i) => i === 0 || f.writable);
+  const readOnly = project.folders.filter((f, i) => i > 0 && !f.writable);
+  const reads = readOnly.length ? ` It can also read ${names(readOnly)}.` : "";
   return el(
     "div",
     { class: "empty" },
-    el("h2", {}, project ? `What should the agent do in ${project.name}?` : "Pick a project"),
-    project ? el("p", { class: "muted" }, `It can read and search ${folders}, change files and run commands in the project's sandbox. ${asks}`) : null,
+    el("h2", {}, `What should the agent do in ${project.name}?`),
+    el("p", { class: "muted" }, `It can read and change files in ${names(writable)} and run commands there, in a sandbox.${reads} It can't see your passwords, keys or other folders. ${asks}`),
+    el(
+      "div",
+      { class: "starters" },
+      STARTERS.map(([label, text]) =>
+        el("button", {
+          class: "starter",
+          onclick: () => {
+            $("input").value = text;
+            $("input").focus();
+          },
+        }, label),
+      ),
+    ),
+    el("p", { class: "small muted" }, "Describe what you want in plain words. One task per chat works best."),
   );
 }
 
@@ -576,6 +619,12 @@ const modelName = (id) => models.find((m) => m.id === id)?.name || "the chat's m
 async function loadModels() {
   const installed = await invoke("installed_models");
   models = installed.filter((m) => m.fit).map((m) => ({ id: m.id, name: m.model.name }));
+  // No model picked yet (none were installed when the chat opened), or the picked one is gone.
+  if (!models.some((m) => m.id === chatModel)) {
+    chatModel = defaultModel();
+    await refreshRoom();
+    update();
+  }
   renderModelPicker();
 }
 
@@ -584,7 +633,7 @@ function defaultModel() {
   try {
     last = localStorage.getItem("chatModel");
   } catch {}
-  const latest = loadedModels.find((m) => m.state === "running")?.id;
+  const latest = loadedModels.find((m) => m.state === "running" || m.state === "loading")?.id;
   return [latest, last, models[0]?.id].find((id) => id && models.some((m) => m.id === id)) || null;
 }
 
@@ -625,6 +674,32 @@ $("chat-model").addEventListener("change", async () => {
 });
 window.addEventListener("focus", loadModels);
 
+// A line under the messages while the agent works, so a quiet model doesn't look stuck.
+let workingSince = 0;
+let workingTimer = null;
+function renderWorking() {
+  const line = $("working");
+  if (!busy) {
+    line.hidden = true;
+    clearInterval(workingTimer);
+    workingTimer = null;
+    workingSince = 0;
+    return;
+  }
+  workingSince ||= Date.now();
+  workingTimer ||= setInterval(renderWorking, 1000);
+  const waiting = [...view.tools.values()].some((card) => card.approval);
+  const seconds = Math.round((Date.now() - workingSince) / 1000);
+  const elapsed = seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  line.classList.toggle("waiting", waiting);
+  $("working-text").textContent = waiting
+    ? "Waiting for you: allow or deny the request above."
+    : isLoading(chatModel)
+      ? `Loading ${modelName(chatModel)}… the first time can take a minute.`
+      : `Working… ${elapsed}`;
+  line.hidden = false;
+}
+
 // What can be done now, and what's in the way.
 // Of the context, from where a new chat is suggested: well before OpenCode summarizes it, which
 // it does when what's left won't hold a reply (we give replies a quarter of the context).
@@ -638,10 +713,10 @@ function update() {
   if (!models.length) reasons.push(["Download a model to chat.", "Models…", () => invoke("open_window", { name: "settings" })]);
   // Not in the way: sending starts the chat's model.
   const notes = [];
-  if (isLoading(chatModel)) notes.push(`Loading ${modelName(chatModel)}…`);
+  if (isLoading(chatModel) && !busy) notes.push(`Loading ${modelName(chatModel)}…`);
   else if (chatModel && !isLoaded(chatModel) && !busy) {
     const unload = (room?.unload || []).map((id) => loadedModels.find((m) => m.id === id)?.name || id);
-    notes.push(unload.length ? `Sending loads ${modelName(chatModel)}, unloading ${unload.join(" and ")} to make room.` : `Sending loads ${modelName(chatModel)}.`);
+    notes.push(unload.length ? `Sending starts ${modelName(chatModel)}, unloading ${unload.join(" and ")} to make room.` : `Sending starts ${modelName(chatModel)}, which can take up to a minute.`);
   }
   notice.replaceChildren(
     ...reasons.map(([text, label, action]) => el("div", { class: "row" }, el("span", { class: "spacer" }, text), el("button", { onclick: action }, label))),
@@ -649,7 +724,7 @@ function update() {
   );
   // Long chats: a new one for a new task beats OpenCode summarizing this one when it's full.
   const share = usage && usage.size ? usage.used / usage.size : 0;
-  const long = session && !busy && share >= LONG_CHAT ? [`This chat uses ${Math.round(usage.used / 1000)}k of ${Math.round(usage.size / 1000)}k tokens. Local models get slower and less reliable as a chat grows, and when it's nearly full OpenCode replaces it with a summary, which loses detail. If this task is done, start a new chat.`] : [];
+  const long = session && !busy && share >= LONG_CHAT ? [`This chat is ${Math.round(share * 100)}% full. Long chats get slower and less reliable, and a full one is shortened to a summary. If this task is done, start a new chat.`] : [];
   notice.hidden = reasons.length + notes.length + long.length === 0;
   notice.append(...long.map((text) => el("div", { class: "row info" }, el("span", { class: "spacer" }, text), el("button", { onclick: () => archiveChat(session, true) }, "Archive and start a new chat"))));
   $("archive").hidden = !session || archived.has(session);
@@ -657,6 +732,7 @@ function update() {
   $("send").disabled = busy || reasons.length > 0 || !chatModel;
   $("send").hidden = busy;
   $("stop").hidden = !busy;
+  renderWorking();
 }
 
 async function newProject() {
@@ -745,6 +821,18 @@ async function send(text) {
   busy = true;
   update();
   try {
+    // Already loading (setup starts it with the chat): wait for it rather than load it twice,
+    // and if it fails, say so instead of trying again.
+    let waited = false;
+    while (isLoading(chatModel)) {
+      waited = true;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await refreshStatus();
+    }
+    if (waited && !isLoaded(chatModel)) {
+      const failed = loadedModels.find((m) => m.id === chatModel && m.state === "failed");
+      throw `Not sent: ${modelName(chatModel)} couldn't start${failed?.error ? `: ${failed.error}` : "."}`;
+    }
     // The chat's model answers; load it if it isn't, making room if needed.
     if (!isLoaded(chatModel)) {
       const needed = await invoke("room_for", { id: chatModel });
@@ -760,6 +848,8 @@ async function send(text) {
     await engines[engine].send(text);
     if (session) invoke("set_chat_model", { project: project.id, chat: session, model: chatModel }).catch(() => {});
   } catch (e) {
+    // Not sent: give the message back, so it isn't lost.
+    if (!$("input").value) $("input").value = text;
     finished(String(e), null);
   }
   for (const run of pending.splice(0)) run();

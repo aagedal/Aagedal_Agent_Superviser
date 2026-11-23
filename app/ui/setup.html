@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Set Up Agent Superviser</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="setup">
+  <main>
+    <div id="activity" class="activity" hidden></div>
+    <section id="guide">
+      <div class="guide-head">
+        <h1>Get started</h1>
+        <button class="link small" id="guide-skip" title="Marks setup as done; you can come back to it from Settings">Skip setup and go to Advanced Settings</button>
+      </div>
+      <p class="muted" id="guide-progress"></p>
+      <ol class="steps" id="guide-steps"></ol>
+      <div id="guide-body"></div>
+      <div class="row guide-nav">
+        <button id="guide-back">Back</button>
+        <span class="spacer"></span>
+        <button id="guide-next">Next</button>
+      </div>
+    </section>
+  </main>
+  <script src="common.js"></script>
+  <script src="setup.js"></script>
+</body>
+</html>
