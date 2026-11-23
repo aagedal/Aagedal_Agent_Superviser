@@ -1,192 +1,55 @@
-const { invoke } = window.__TAURI__.core;
-const { listen } = window.__TAURI__.event;
-
-const $ = (id) => document.getElementById(id);
-const GIB = 1024 ** 3;
-const FAST_ACTIVE_PARAMS = 12; // as in crates/core/src/catalog.rs
-const gib = (bytes) => `${(bytes / GIB).toFixed(1)} GB`;
-
-function el(tag, attrs = {}, ...children) {
-  const node = document.createElement(tag);
-  for (const [key, value] of Object.entries(attrs)) {
-    if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
-    else if (key === "class") node.className = value;
-    else if (value !== undefined && value !== null && value !== false) node.setAttribute(key, value);
-  }
-  for (const child of children.flat()) {
-    if (child !== null && child !== undefined) node.append(child instanceof Node ? child : String(child));
-  }
-  return node;
-}
-
-function chip(text, kind = "") {
-  return el("span", { class: `chip ${kind}` }, text);
-}
-
 // --- Tabs ---
 function showTab(name) {
+  // The setup guide has a window of its own.
+  if (name === "guide") return invoke("open_window", { name: "setup" });
   if (name === "installed") {
     // The old tab's name, from links made before Models and Installed were one tab.
     modelFilter = "local";
     name = "models";
   }
-  for (const button of document.querySelectorAll("nav button")) button.classList.toggle("active", button.dataset.tab === name);
+  for (const button of document.querySelectorAll("nav button[data-tab]")) button.classList.toggle("active", button.dataset.tab === name);
   for (const section of document.querySelectorAll("main section")) section.hidden = section.id !== name;
   if (name === "models") renderModelsTab();
   if (name === "projects") renderProjects();
-  if (name === "guide") renderGuide();
   if (name === "connect") renderConnect();
   if (name === "safety") {
     renderJudge();
     renderCalls();
   }
 }
-for (const button of document.querySelectorAll("nav button")) button.addEventListener("click", () => showTab(button.dataset.tab));
+for (const button of document.querySelectorAll("nav button[data-tab]")) button.addEventListener("click", () => showTab(button.dataset.tab));
+$("open-setup").addEventListener("click", () => invoke("open_window", { name: "setup" }));
 
-// --- State shared by the tabs ---
-let overview = null;
-let installedIds = new Set();
-let localByRepo = new Map(); // lowercased repo -> installed models (any source) that fit
 let modelFilter = "suggested"; // or "local"
-const downloads = new Map(); // id -> {done, total}
-const downloadButtons = new Map(); // id -> Map(box -> render function); a model can show in the picks and the full list
 
-function rerenderAllDownloads() {
-  for (const id of downloadButtons.keys()) rerenderDownload(id);
-}
-
-function rerenderDownload(id) {
-  for (const [box, render] of downloadButtons.get(id) || []) {
-    if (box.isConnected) render();
-    else downloadButtons.get(id).delete(box);
-  }
-}
-
-async function refreshOverview() {
-  overview = await invoke("overview");
+// What this Mac has, above the suggestions.
+hooks.overview.push(() => {
   const hw = overview.hardware;
   const kind = hw.unified_memory ? "This Mac" : "This computer";
   const judge = overview.model_budget < hw.model_budget ? ` (${gib(hw.model_budget - overview.model_budget)} is kept for the judge, see Safety)` : "";
   $("machine").textContent = `${kind} has ${wholeGib(hw.total_memory)} of memory. Each choice below fits; they differ in how well they code, how quickly they answer and how much memory they leave for your other apps.`;
   $("budget").textContent = `Up to ${gib(overview.model_budget)} can go to a model${judge}. Only models that fit are shown.`;
-}
+});
+hooks.models.push(() => {
+  renderStatus();
+  if (modelFilter === "local") renderInstalled();
+});
+hooks.progress.push((event) => event.id === judgeDownload && renderJudge());
+hooks.finished.push((event) => {
+  if (event.id === judgeDownload) renderJudge();
+  renderLocalCount();
+  if (modelFilter === "local") renderInstalled();
+});
 
-const wholeGib = (bytes) => `${Math.round(bytes / GIB)} GB`;
-
-async function refreshInstalledIds() {
-  const installed = await invoke("installed_models");
-  installedIds = new Set(installed.map((m) => m.id));
-  localByRepo = new Map();
-  for (const m of installed) {
-    if (!m.model.repo || !m.fit) continue;
-    const key = m.model.repo.toLowerCase();
-    localByRepo.set(key, [...(localByRepo.get(key) || []), m]);
-  }
-  return installed;
+// How many models are on this Mac, on the filter, without opening it.
+function renderLocalCount() {
+  $("model-filter").querySelector('[data-filter="local"]').textContent = installedIds.size ? `On this Mac (${installedIds.size})` : "On this Mac";
 }
+hooks.judge.push(renderJudge);
+// Started here or in the setup window: the other suggestions stop standing out.
+hooks.started.push((id) => (id === judgeDownload ? renderJudge() : rerenderAllDownloads()));
 
 // --- Models tab ---
-
-// The same model already on this machine, possibly another quant from another app.
-function localCopy(model, id) {
-  const local = localByRepo.get(model.repo.toLowerCase()) || [];
-  return local.find((m) => m.id === id) || local[0];
-}
-
-// `compact` leaves out the second download button for this model's own quant; the full list keeps it.
-function downloadControl(model, { compact = false } = {}) {
-  const id = `${model.repo}:${model.quant.label}`;
-  const box = el("div", { class: "actions" });
-  const render = () => {
-    box.replaceChildren();
-    const progress = downloads.get(id);
-    const local = localCopy(model, id);
-    if (local && isLoaded(local.id)) {
-      box.append(chip("Loaded", "good"));
-    } else if (installedIds.has(id) && local?.source === "app") {
-      box.append(chip("Installed", "good"), el("button", { class: compact ? "primary" : "", onclick: () => loadModel(id) }, "Load"));
-    } else if (local && !progress) {
-      box.append(chip("On this Mac", "good"), el("button", { class: "primary", onclick: () => loadModel(local.id) }, "Load"));
-      if (local.id !== id && !compact) box.append(el("button", { onclick: () => download(model, id) }, `Download ${model.quant.label}`));
-    } else if (progress) {
-      const bar = el("progress", { max: progress.total || 1, value: progress.done });
-      const pct = progress.total ? Math.floor((progress.done / progress.total) * 100) : 0;
-      box.append(bar, el("span", { class: "small muted" }, `${pct}%`), el("button", { onclick: () => invoke("cancel_download", { id }) }, "Cancel"));
-    } else {
-      box.append(el("button", { class: "primary", onclick: () => download(model, id) }, `Download (${wholeGib(model.quant.size)})`));
-    }
-  };
-  if (!downloadButtons.has(id)) downloadButtons.set(id, new Map());
-  downloadButtons.get(id).set(box, render);
-  render();
-  return box;
-}
-
-async function download(model, id) {
-  downloads.set(id, { done: 0, total: model.quant.size });
-  rerenderDownload(id);
-  try {
-    await invoke("download_model", { model });
-  } catch (e) {
-    downloads.delete(id);
-    rerenderDownload(id);
-    alert(e);
-  }
-}
-
-listen("download", async ({ payload }) => {
-  if (payload.finished || payload.error) {
-    downloads.delete(payload.id);
-    if (payload.error && !payload.error.includes("cancelled")) alert(`Download failed: ${payload.error}`);
-    await refreshInstalledIds();
-  } else {
-    downloads.set(payload.id, { done: payload.done, total: payload.total });
-  }
-  rerenderDownload(payload.id);
-  if (payload.id === judgeDownload) renderJudge();
-});
-
-// An (i) that shows `content` on hover, or keeps it open after a click.
-function infoButton(...content) {
-  const wrap = el("span", { class: "info-wrap" });
-  const button = el("button", {
-    class: "info",
-    title: "Details",
-    "aria-label": "Details",
-    onclick: (event) => {
-      event.stopPropagation();
-      const open = !wrap.classList.contains("open");
-      closePopovers();
-      wrap.classList.toggle("open", open);
-    },
-  }, "i");
-  wrap.append(button, el("div", { class: "popover" }, ...content));
-  return wrap;
-}
-
-function closePopovers() {
-  for (const open of document.querySelectorAll(".info-wrap.open")) open.classList.remove("open");
-}
-document.addEventListener("click", (event) => {
-  if (!event.target.closest(".popover")) closePopovers();
-});
-
-function modelDetails(model, fit) {
-  const id = `${model.repo}:${model.quant.label}`;
-  const local = localCopy(model, id);
-  const rows = [
-    ["File", `${model.quant.label}, ${gib(model.quant.size)} download`],
-    ["Context", `${Math.round(fit.context / 1024)}k tokens`],
-    ["Memory", `about ${gib(fit.required)} while running`],
-  ];
-  if (model.active_params) rows.push(["Speed", `reads ${model.active_params}B parameters per token${model.active_params <= FAST_ACTIVE_PARAMS ? ", so it answers quickly" : ""}`]);
-  if (local) rows.push(["On this Mac", `${local.model.quant.label} from ${local.source_label}`]);
-  return [
-    el("div", { class: "title" }, model.name),
-    model.description ? el("p", { class: "muted" }, model.description) : null,
-    el("dl", {}, rows.flatMap(([term, text]) => [el("dt", {}, term), el("dd", {}, text)])),
-  ];
-}
 
 function modelCard(model, fit, recommended) {
   return el(
@@ -204,35 +67,9 @@ function modelCard(model, fit, recommended) {
   );
 }
 
-const ROLES = {
-  most_capable: "Most capable",
-  fast: "Capable and fast",
-  light: "Lighter",
-  basic: "For basic tasks",
-};
-
-function skill(capability) {
-  if (capability >= 8) return "Handles bigger coding tasks";
-  if (capability >= 6) return "Good for everyday coding";
-  if (capability >= 4) return "Fine for smaller changes";
-  return "Basic tasks only";
-}
-
-function pickCard(pick) {
-  const left = overview.hardware.total_memory - pick.fit.required;
-  const summary = [skill(pick.capability || 0), pick.fast ? "Quick replies" : "Slower replies", `Leaves ${wholeGib(left)} for your other apps`].join(" · ");
-  return el(
-    "div",
-    { class: "card pick" },
-    el("div", { class: "body" }, el("div", { class: "title" }, ROLES[pick.role], el("span", { class: "muted" }, pick.name)), el("p", { class: "muted" }, summary)),
-    infoButton(...modelDetails(pick, pick.fit)),
-    downloadControl(pick, { compact: true }),
-  );
-}
-
 async function renderOffers() {
   const { picks, offers, hidden } = await invoke("catalog_offers");
-  $("picks").replaceChildren(...picks.map(pickCard));
+  $("picks").replaceChildren(...pickCards(picks));
   const list = $("offers");
   list.replaceChildren();
   if (offers.length === 0) {
@@ -286,15 +123,6 @@ function searchCard(hit) {
 }
 
 // --- Models tab: status and what's on this Mac ---
-function statusText(status) {
-  switch (status.state) {
-    case "running": return `Running ${status.name} with a ${Math.round(status.context / 1024)}k context.`;
-    case "loading": return `Loading ${status.name}… big models can take a minute.`;
-    case "failed": return `Could not start the model: ${status.error}`;
-    default: return "No model is loaded.";
-  }
-}
-
 function renderModelsTab() {
   renderStatus();
   setModelFilter(modelFilter);
@@ -312,9 +140,6 @@ function setModelFilter(filter) {
   }
 }
 for (const button of document.querySelectorAll("#model-filter button")) button.addEventListener("click", () => setModelFilter(button.dataset.filter));
-
-// Loaded (or loading) models: in memory, ready for a chat.
-const isLoaded = (id) => overview?.models.some((m) => m.id === id && m.state !== "failed");
 
 function modelLine(m) {
   switch (m.state) {
@@ -454,30 +279,6 @@ $("clear-conversations").addEventListener("click", async () => {
   renderConversations(await invoke("clear_saved_conversations"));
 });
 
-// Loads a model beside the loaded ones; when memory is short, offers to unload the ones used longest ago.
-async function loadModel(id) {
-  try {
-    const room = await invoke("room_for", { id });
-    if (!room.fits) {
-      const names = room.unload.map((u) => overview.models.find((m) => m.id === u)?.name || u);
-      if (!confirm(`There isn't room for this model beside ${names.join(" and ")}. Unload ${names.length === 1 ? "it" : "them"} first?`)) return;
-      for (const u of room.unload) await invoke("unload_model", { id: u });
-    }
-  } catch (e) {
-    alert(e);
-    return;
-  }
-  const loading = invoke("load_model", { id });
-  renderStatus();
-  try {
-    await loading;
-  } catch (e) {
-    // The status area shows the error.
-  }
-  renderStatus();
-  if (modelFilter === "local") renderInstalled();
-}
-
 async function deleteModel(model) {
   if (!confirm(`Delete ${model.model.name} (${gib(model.model.quant.size)})?`)) return;
   try {
@@ -493,7 +294,6 @@ listen("status", () => {
   renderStatus();
   if (!$("models").hidden && modelFilter === "local") renderInstalled();
   if (!$("projects").hidden && !editingProject) renderProjects();
-  if (!$("guide").hidden) renderGuide();
 });
 
 // --- Connect tab ---
@@ -777,18 +577,6 @@ async function deleteProject(project) {
   renderProjects();
 }
 
-// Asks for a folder and makes a project of it (or finds the one it has); null if cancelled.
-async function chooseProjectFolder() {
-  const folder = await invoke("choose_folder", { title: "Choose your project's main folder" });
-  if (!folder) return null;
-  try {
-    return await invoke("new_project", { folder });
-  } catch (e) {
-    alert(e);
-    return null;
-  }
-}
-
 $("new-project").addEventListener("click", async () => {
   const project = await chooseProjectFolder();
   if (!project) return;
@@ -834,7 +622,6 @@ const JUDGE_STATUS = {
   running: () => "Running: WARN calls are checked.",
   failed: (s) => `Couldn't start: ${s.error}`,
 };
-let judgeDownload = null;
 async function renderJudge() {
   const judge = await invoke("judge_settings");
   judgeDownload = judge.download;
@@ -880,17 +667,6 @@ async function renderJudge() {
     else status.style.color = "";
   }
 }
-async function downloadJudge() {
-  downloads.set(judgeDownload, { done: 0, total: 0 });
-  await renderJudge();
-  try {
-    await invoke("download_judge");
-  } catch (e) {
-    downloads.delete(judgeDownload);
-    alert(e);
-  }
-  await renderJudge();
-}
 async function saveJudge() {
   const enabled = $("judge-enabled").checked;
   try {
@@ -929,144 +705,13 @@ listen("guard-call", ({ payload }) => {
   list.prepend(callRow(payload));
 });
 
-// --- Setup guide ---
-const GUIDE_STEPS = ["Model", "Project", "Safety", "Connect"];
-let guideStep = 0;
-let guideProject = null; // id of the project made or picked in step 2
-
-async function renderGuide() {
-  await refreshOverview();
-  $("guide-steps").replaceChildren(
-    ...GUIDE_STEPS.map((name, i) => el("li", { class: i === guideStep ? "current" : i < guideStep ? "done" : "", onclick: () => goToStep(i) }, el("span", { class: "num" }, i < guideStep ? "✓" : i + 1), name)),
-  );
-  const content = await [guideModel, guideProjectStep, guideSafety, guideConnect][guideStep]();
-  $("guide-body").replaceChildren(...content.filter(Boolean));
-  $("guide-back").hidden = guideStep === 0;
-  $("guide-next").textContent = guideStep === GUIDE_STEPS.length - 1 ? "Finish" : "Next";
-}
-
-function goToStep(step) {
-  guideStep = Math.max(0, Math.min(GUIDE_STEPS.length - 1, step));
-  renderGuide();
-}
-
-function runningModelName() {
-  return overview.status.state === "running" ? overview.status.name : null;
-}
-
-async function guideModel() {
-  const { picks } = await invoke("catalog_offers");
-  const running = runningModelName();
-  const loading = overview.status.state === "loading";
-  return [
-    el("h2", {}, "Pick a model"),
-    el("p", { class: "muted" }, "The model writes the code. Bigger ones code better but answer more slowly and leave less memory for your other apps. Load one that's already on this Mac, or download one: downloads keep going while you carry on."),
-    running ? el("div", { class: "banner good" }, `✓ ${running} is loaded.`) : loading ? el("div", { class: "banner" }, statusText(overview.status)) : null,
-    ...picks.map(pickCard),
-    picks.length ? null : el("div", { class: "banner" }, "None of the suggested models fit in this machine's memory."),
-    el("p", { class: "small muted" }, "More models, and models from other apps, are on the Models tab."),
-  ];
-}
-
-async function guideProjectStep() {
-  const { projects } = await invoke("projects_info");
-  const project = projects.find((p) => p.id === guideProject) || projects[0];
-  if (project) guideProject = project.id;
-  const choose = el("button", { class: project ? "" : "primary", onclick: async () => {
-    const made = await chooseProjectFolder();
-    if (made) {
-      guideProject = made.id;
-      renderGuide();
-    }
-  } }, project ? "Choose another folder…" : "Choose folder…");
-  const parts = [
-    el("h2", {}, "Your first project"),
-    el("p", { class: "muted" }, "Pick the folder you'll code in. The agent works in it in a sandbox: it can change files only there, and can't read your passwords, keys or other private files."),
-  ];
-  if (project) {
-    const internet = el("input", { type: "checkbox" });
-    internet.checked = project.network === "internet";
-    internet.addEventListener("change", async () => {
-      const { choices, ...rest } = project;
-      await invoke("save_project", { project: { ...rest, network: internet.checked ? "internet" : "local-only" } });
-    });
-    parts.push(
-      el("div", { class: "card" }, el("div", { class: "body" }, el("div", { class: "title" }, project.name), el("p", { class: "muted small selectable" }, project.folders[0].path))),
-      el("label", { class: "check" }, internet, "Allow internet (package installs, git push); the guard still checks every call"),
-    );
-  }
-  parts.push(el("div", { class: "row" }, choose), el("p", { class: "small muted" }, "Related folders, allowed websites and limits on tools are in Projects whenever you want them."));
-  return parts;
-}
-
-async function guideSafety() {
-  const judge = await invoke("judge_settings");
-  judgeDownload = judge.download;
-  const parts = [
-    el("h2", {}, "Safety"),
-    el("p", { class: "muted" }, "The guard is always on. It checks every command and file edit the model asks for before it runs, and blocks the ones that reach for your credentials, other agents' data or websites nobody mentioned."),
-  ];
-  if (judge.model) {
-    const box = el("input", { type: "checkbox" });
-    box.checked = judge.enabled;
-    box.disabled = !judge.fits && !judge.enabled;
-    box.addEventListener("change", async () => {
-      try {
-        await invoke("set_judge", { enabled: box.checked, failClosed: judge.fail_closed });
-        const now = await invoke("judge_settings");
-        if (now.enabled && !now.installed && !downloads.has(now.download)) downloadJudge();
-      } catch (e) {
-        alert(e);
-      }
-      renderGuide();
-    });
-    const note = !judge.fits && !judge.enabled
-      ? "This Mac doesn't have the memory to run it beside a model."
-      : `A ${gib(judge.model.quant.size)} download that uses about ${gib(judge.memory)} of memory while a model runs. Recommended if you can spare it.`;
-    parts.push(
-      el("label", { class: "check" }, box, `Double-check borderline calls with ${judge.model.name}, a small decision model`),
-      el("p", { class: "small muted indent" }, note, downloads.has(judge.download) ? " Downloading now; progress is on the Safety tab." : ""),
-    );
-  }
-  parts.push(el("p", { class: "small muted" }, "Every call the guard looked at is listed on the Safety tab."));
-  return parts;
-}
-
-async function guideConnect() {
-  const { projects } = await invoke("projects_info");
-  const project = projects.find((p) => p.id === guideProject) || projects[0];
-  const running = runningModelName();
-  const parts = [el("h2", {}, "Start coding"), el("p", { class: "muted" }, "Tell the agent what to do in the chat window. It works in the project's sandbox, talking to your model through the guard, and asks before it runs commands.")];
-  if (!running) {
-    parts.push(el("div", { class: "banner" }, "Load a model first. ", el("button", { onclick: () => goToStep(0) }, "Back to models")));
-  } else if (!project) {
-    parts.push(el("div", { class: "banner" }, "Choose a project folder first. ", el("button", { onclick: () => goToStep(1) }, "Back to projects")));
-  } else {
-    parts.push(
-      el("div", { class: "row" }, el("button", { class: "primary", onclick: () => invoke("open_chat", { project: project.id }) }, `Chat about ${project.name}`), el("span", { class: "small muted" }, `with ${running}`)),
-      el("p", { class: "small muted" }, "Prefer OpenCode? ", el("button", { class: "link", onclick: () => invoke("open_project", { id: project.id }) }, "Open it in OpenCode"), " instead."),
-    );
-  }
-  parts.push(el("p", { class: "small muted" }, "Later, open the chat from the menu bar icon or the Projects tab. Other tools that speak the OpenAI API can use the guard too: see Connect."));
-  return parts;
-}
-
-async function finishGuide() {
-  await invoke("set_setup_done", { done: true });
-  showTab("models");
-}
-
-$("guide-back").addEventListener("click", () => goToStep(guideStep - 1));
-$("guide-next").addEventListener("click", () => (guideStep === GUIDE_STEPS.length - 1 ? finishGuide() : goToStep(guideStep + 1)));
-$("guide-skip").addEventListener("click", finishGuide);
-
 // --- Start ---
 (async () => {
   await refreshOverview();
   await refreshInstalledIds();
   await renderOffers();
+  renderLocalCount();
   renderStatus();
   const tab = location.hash.slice(1);
-  if (!(await invoke("setup_done"))) showTab("guide");
-  else if (tab) showTab(tab);
+  if (tab) showTab(tab);
 })();

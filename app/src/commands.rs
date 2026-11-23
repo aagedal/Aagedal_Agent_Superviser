@@ -95,10 +95,16 @@ pub async fn check_model(app: State<'_, Arc<App>>, repo: String) -> Result<Check
 
 /// The download id of the judge's model.
 const JUDGE_DOWNLOAD: &str = "judge";
+/// How downloads of the judge's model are named in the windows.
+const JUDGE_NAME: &str = "the safety check model";
 
 #[derive(Clone, Serialize)]
 struct DownloadEvent {
     id: String,
+    /// What's downloading, and the memory it takes while running: a window opened
+    /// mid-download learns them from the next event.
+    name: String,
+    needs: Option<u64>,
     done: u64,
     total: u64,
     finished: bool,
@@ -119,6 +125,8 @@ pub fn download_model(handle: AppHandle, app: State<'_, Arc<App>>, model: Catalo
         }
         downloads.insert(id.clone(), cancel.clone());
     }
+    let needs = app.fit(&model).map(|fit| fit.required);
+    let name = model.name.clone();
     let app = app.inner().clone();
     let task_id = id.clone();
     tauri::async_runtime::spawn(async move {
@@ -127,7 +135,7 @@ pub fn download_model(handle: AppHandle, app: State<'_, Arc<App>>, model: Catalo
         let result = installed::install(&hub(), &app.paths, &model, cancel, |p| {
             if last.elapsed().as_millis() >= 250 || p.done == p.total {
                 last = std::time::Instant::now();
-                let _ = handle.emit("download", DownloadEvent { id: task_id.clone(), done: p.done, total: p.total, finished: false, error: None });
+                let _ = handle.emit("download", DownloadEvent { id: task_id.clone(), name: name.clone(), needs, done: p.done, total: p.total, finished: false, error: None });
             }
         })
         .await;
@@ -136,7 +144,7 @@ pub fn download_model(handle: AppHandle, app: State<'_, Arc<App>>, model: Catalo
             Ok(_) => (true, None),
             Err(e) => (false, Some(format!("{e:#}"))),
         };
-        let _ = handle.emit("download", DownloadEvent { id: task_id, done: 0, total: 0, finished, error });
+        let _ = handle.emit("download", DownloadEvent { id: task_id, name, needs, done: 0, total: 0, finished, error });
         crate::refresh_tray(&handle);
     });
     Ok(id)
@@ -374,7 +382,7 @@ pub fn download_judge(handle: AppHandle, app: State<'_, Arc<App>>) -> Result<()>
         let result = installed::install_to(&hub(), &dir, &model, cancel, |p| {
             if last.elapsed().as_millis() >= 250 || p.done == p.total {
                 last = std::time::Instant::now();
-                let _ = handle.emit("download", DownloadEvent { id: JUDGE_DOWNLOAD.into(), done: p.done, total: p.total, finished: false, error: None });
+                let _ = handle.emit("download", DownloadEvent { id: JUDGE_DOWNLOAD.into(), name: JUDGE_NAME.into(), needs: None, done: p.done, total: p.total, finished: false, error: None });
             }
         })
         .await;
@@ -383,7 +391,7 @@ pub fn download_judge(handle: AppHandle, app: State<'_, Arc<App>>) -> Result<()>
             Ok(_) => (true, None),
             Err(e) => (false, Some(format!("{e:#}"))),
         };
-        let _ = handle.emit("download", DownloadEvent { id: JUDGE_DOWNLOAD.into(), done: 0, total: 0, finished, error });
+        let _ = handle.emit("download", DownloadEvent { id: JUDGE_DOWNLOAD.into(), name: JUDGE_NAME.into(), needs: None, done: 0, total: 0, finished, error });
         if finished {
             app.sync_judge().await;
         }
@@ -734,9 +742,44 @@ pub fn set_setup_done(app: State<'_, Arc<App>>, done: bool) -> Result<()> {
     app.save_settings().map_err(err)
 }
 
+/// Ends the setup guide: marks setup done, opens the chat on `project` (starting `model`
+/// meanwhile, so the first message doesn't wait for it) or Settings, and closes the guide.
+#[tauri::command]
+pub fn leave_setup(handle: AppHandle, app: State<'_, Arc<App>>, window: tauri::WebviewWindow, to: String, project: Option<String>, model: Option<String>) -> Result<()> {
+    app.settings.lock().unwrap().setup_done = true;
+    app.save_settings().map_err(err)?;
+    crate::refresh_tray(&handle);
+    // Started before the chat opens, so the chat finds it loading rather than loading it too.
+    if let Some(model) = model.filter(|m| to == "chat" && !loading_or_loaded(&app, m)) {
+        let (handle, app) = (handle.clone(), app.inner().clone());
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = crate::load_model(handle.clone(), app.clone(), model.clone()).await {
+                // The chat may have started it meanwhile; only a real failure is worth a dialog.
+                if !loading_or_loaded(&app, &model) {
+                    crate::show_error(&handle, "Couldn't start the model", &e);
+                }
+            }
+        });
+    }
+    match to.as_str() {
+        "chat" => crate::open_chat(&handle, project.as_deref()).map_err(err)?,
+        "settings" => crate::open_window(&handle, "settings").map_err(err)?,
+        _ => return Err(format!("no window called {to}")),
+    }
+    if window.label() == "setup" {
+        window.close().map_err(err)?;
+    }
+    Ok(())
+}
+
+/// Whether `model` is loaded, or on its way.
+fn loading_or_loaded(app: &App, model: &str) -> bool {
+    app.models().iter().any(|m| m.id == model && !matches!(m.state, LoadState::Failed { .. }))
+}
+
 #[tauri::command]
 pub fn open_window(handle: AppHandle, name: String) -> Result<()> {
-    if !matches!(name.as_str(), "settings" | "chat") {
+    if !matches!(name.as_str(), "setup" | "settings" | "chat") {
         return Err(format!("no window called {name}"));
     }
     crate::open_window(&handle, &name).map_err(err)

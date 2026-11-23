@@ -12,23 +12,10 @@
     <button data-tab="projects">Projects</button>
     <button data-tab="safety">Safety</button>
     <button data-tab="connect">Connect</button>
-    <button data-tab="guide" class="nav-guide">Setup guide</button>
+    <button id="open-setup" class="nav-guide" title="The step-by-step setup, in its own window">Setup guide</button>
   </nav>
   <main>
-    <section id="guide" hidden>
-      <div class="guide-head">
-        <h1>Get started</h1>
-        <button class="link" id="guide-skip">Skip the guide</button>
-      </div>
-      <ol class="steps" id="guide-steps"></ol>
-      <div id="guide-body"></div>
-      <div class="row guide-nav">
-        <button id="guide-back">Back</button>
-        <span class="spacer"></span>
-        <button class="primary" id="guide-next">Next</button>
-      </div>
-    </section>
-
+    <div id="activity" class="activity" hidden></div>
     <section id="models">
       <div id="status-banner" class="banner" hidden></div>
       <div class="segmented" id="model-filter">
@@ -135,6 +122,7 @@
       <p class="small muted" id="hf-status"></p>
     </section>
   </main>
+  <script src="common.js"></script>
   <script src="settings.js"></script>
 </body>
 </html>

@@ -19,9 +19,10 @@
     <div class="chat">
       <header>
         <div class="chat-title"><strong id="title">New chat</strong> <span class="muted small" id="where"></span></div>
-        <span class="muted small"><span id="usage"></span> <select id="chat-model" title="The model this chat uses"></select> <button class="icon" id="unload" title="Unload the model, freeing its memory" hidden>⏏</button> <button class="icon" id="archive" title="Archive this chat: keep it, out of the list" hidden>Archive</button></span>
+        <span class="muted small"><span id="usage"></span> <select id="chat-model" title="The model this chat uses"></select> <button class="icon" id="unload" title="Unload the model, freeing its memory" hidden>Unload</button> <button class="icon" id="archive" title="Archive this chat: keep it, out of the list" hidden>Archive</button></span>
       </header>
       <div class="messages" id="messages"></div>
+      <div class="working" id="working" hidden><span class="pulse"></span><span id="working-text">Working…</span></div>
       <div class="banner notice" id="notice" hidden></div>
       <form class="composer" id="composer">
         <textarea id="input" placeholder="Ask the agent to do something… (Enter to send, Shift+Enter for a new line)"></textarea>
