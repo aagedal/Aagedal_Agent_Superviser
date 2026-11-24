@@ -54,7 +54,16 @@ function renderGuideSteps() {
   if (list.children.length !== GUIDE_STEPS.length) {
     list.replaceChildren(
       ...GUIDE_STEPS.map((name, i) =>
-        el("li", { onclick: () => goToStep(i) }, el("span", { class: "num" }), el("span", { class: "step-text" }, el("span", {}, name), el("span", { class: "step-note" }))),
+        el(
+          "li",
+          {},
+          el(
+            "button",
+            { type: "button", class: "step-btn", onclick: () => goToStep(i) },
+            el("span", { class: "num" }),
+            el("span", { class: "step-text" }, el("span", {}, name), el("span", { class: "step-note" })),
+          ),
+        ),
       ),
     );
   }
@@ -62,6 +71,9 @@ function renderGuideSteps() {
     const { state, note } = statuses[i];
     const item = list.children[i];
     item.className = `${i === guideStep ? "current" : ""} ${state}`;
+    const btn = item.querySelector("button.step-btn");
+    if (i === guideStep) btn.setAttribute("aria-current", "step");
+    else btn.removeAttribute("aria-current");
     item.querySelector(".num").textContent = state === "done" ? "✓" : i + 1;
     item.querySelector(".step-note").textContent = note;
   });
@@ -255,6 +267,7 @@ hooks.progress.push((event) => {
   if (line && event.id !== judgeDownload) line.textContent = downloadLine([event.id, downloads.get(event.id)]);
 });
 listen("status", () => renderGuide());
+listen("discovery", () => renderGuide());
 listen("projects", () => renderGuide());
 listen("judge", () => renderGuide());
 

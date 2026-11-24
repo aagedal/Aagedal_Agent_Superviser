@@ -312,13 +312,22 @@ fn scan_publisher_tree(source: Source, root: &Path, candidates: &mut Vec<Candida
 /// Ollama: each manifest names its model layer, a GGUF blob.
 fn scan_ollama(root: &Path, candidates: &mut Vec<Candidate>) {
     let manifests = root.join("manifests");
-    let mut stack = vec![manifests.clone()];
-    while let Some(dir) = stack.pop() {
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = vec![(manifests.clone(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 8 {
+            continue;
+        }
+        if let Ok(real) = std::fs::canonicalize(&dir)
+            && !visited.insert(real)
+        {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                stack.push(path);
+                stack.push((path, depth + 1));
                 continue;
             }
             let Ok(rel) = path.strip_prefix(&manifests) else { continue };
@@ -334,6 +343,9 @@ fn scan_ollama(root: &Path, candidates: &mut Vec<Candidate>) {
                 continue;
             };
             let blob = digest.replace(':', "-");
+            if blob.is_empty() || blob == "." || blob == ".." || blob.contains('/') || blob.contains('\\') {
+                continue;
+            }
             let name = match (registry.as_str(), namespace.as_str()) {
                 ("registry.ollama.ai", "library") => format!("{model}:{tag}"),
                 ("registry.ollama.ai", _) => format!("{namespace}/{model}:{tag}"),

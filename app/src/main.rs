@@ -76,8 +76,6 @@ fn main() {
                     quit.exit(0);
                 });
             }
-            app.rescan();
-
             TrayIconBuilder::with_id(TRAY_ID)
                 .icon(Image::from_bytes(include_bytes!("../icons/tray.png"))?)
                 .icon_as_template(true)
@@ -86,6 +84,15 @@ fn main() {
                 .show_menu_on_left_click(true)
                 .on_menu_event(on_menu_event)
                 .build(tauri_app)?;
+
+            // Scanning other apps' model caches can touch many GGUFs; keep it off the startup path.
+            let scan_app = app.clone();
+            let scan_handle = handle.clone();
+            std::thread::spawn(move || {
+                scan_app.rescan();
+                refresh_tray(&scan_handle);
+                let _ = scan_handle.emit("discovery", ());
+            });
 
             update::start(&handle);
 
@@ -447,7 +454,8 @@ pub fn open_window_at(handle: &AppHandle, name: &str, tab: &str) -> tauri::Resul
     if let Some(window) = handle.get_webview_window(name) {
         if !tab.is_empty() {
             let call = if name == "chat" { "openProject" } else { "showTab" };
-            window.eval(format!("{call}({tab:?})"))?;
+            let arg = serde_json::to_string(tab).unwrap_or_else(|_| "\"\"".into());
+            window.eval(format!("{call}({arg})"))?;
         }
         window.show()?;
         return window.set_focus();

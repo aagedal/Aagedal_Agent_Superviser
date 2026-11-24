@@ -36,24 +36,29 @@ impl Journal {
         let id = match *next {
             Some(id) => id,
             None => {
-                if let Some(parent) = self.path.parent() {
+                if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    let existed = parent.exists();
                     std::fs::create_dir_all(parent)?;
                     #[cfg(unix)]
-                    std::fs::set_permissions(parent, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+                    if !existed {
+                        let _ = std::fs::set_permissions(parent, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+                    }
                 }
-                read(&self.path).iter().filter_map(|e| e["id"].as_u64()).max().unwrap_or(0) + 1
+                read(&self.path).iter().filter_map(|e| e["id"].as_u64()).max().unwrap_or(0).saturating_add(1)
             }
         };
         let mut line = Map::new();
-        line.insert("id".into(), id.into());
         line.extend(entry);
+        line.insert("id".into(), id.into());
         let mut options = std::fs::OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options.open(&self.path)?;
+        #[cfg(unix)]
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         writeln!(file, "{}", Value::Object(line))?;
-        *next = Some(id + 1);
+        *next = Some(id.saturating_add(1));
         Ok(id)
     }
 }

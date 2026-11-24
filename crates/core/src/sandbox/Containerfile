@@ -9,7 +9,7 @@ RUN apt-get update \
       build-essential pkg-config python3 python3-pip python3-venv nodejs npm ripgrep fd-find jq \
  && rm -rf /var/lib/apt/lists/*
 
-ARG OPENCODE_VERSION=2.3.0
+ARG OPENCODE_VERSION=2.3.2
 RUN npm install -g "@opencode/cli@${OPENCODE_VERSION}" && npm cache clean --force
 
 RUN useradd --create-home --uid 1000 --shell /bin/bash agent \
@@ -17,10 +17,11 @@ RUN useradd --create-home --uid 1000 --shell /bin/bash agent \
       /home/agent/.local /home/agent/.local/share /home/agent/.local/state
 
 # The guard on the Mac arrives as a Unix socket only root can open (the runtime's
-# forwarded agent socket). As root, relay it to 127.0.0.1:8787, then run OpenCode as
-# `agent`, which can reach the guard only through the relay.
+# forwarded agent socket). As root, relay it to 127.0.0.1:8787, wait until the relay
+# is listening (port 8787 = 0x2253, state 0A = LISTEN), then run OpenCode as `agent`.
 RUN printf '%s\n' '#!/bin/sh' \
       'socat TCP-LISTEN:8787,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:"${SSH_AUTH_SOCK:?the guard socket is missing}" &' \
+      'i=0; while [ "$i" -lt 60 ] && ! grep -q ":2253 .* 0A " /proc/net/tcp 2>/dev/null; do sleep 0.05; i=$((i+1)); done' \
       'exec setpriv --reuid=agent --regid=agent --init-groups env HOME=/home/agent USER=agent LOGNAME=agent SSH_AUTH_SOCK= "$@"' \
       > /usr/local/bin/superviser-entry \
  && chmod 755 /usr/local/bin/superviser-entry

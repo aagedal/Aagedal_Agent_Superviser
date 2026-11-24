@@ -56,7 +56,13 @@ impl Paths {
         if preferred.as_os_str().len() <= 100 {
             return preferred;
         }
-        let user = std::env::var("USER").unwrap_or_default();
+        let user: String = std::env::var("USER")
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .take(32)
+            .collect();
+        let user = if user.is_empty() || user == "." || user == ".." { "user" } else { &user };
         std::env::temp_dir().join(format!("agent-superviser-{user}.sock"))
     }
 
@@ -117,17 +123,30 @@ pub fn private_dir(dir: &Path) -> std::io::Result<()> {
 
 /// Writes `contents` to `path` readable by the owner only, replacing it atomically.
 pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         private_dir(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    {
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = path.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), hex::encode(nonce)));
+    let write_result = (|| -> std::io::Result<()> {
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options.open(&tmp)?;
         std::io::Write::write_all(&mut file, contents)?;
+        std::io::Write::flush(&mut file)?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(tmp, path)
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }

@@ -90,15 +90,85 @@ pub(crate) fn call_id() -> String {
     (0..32u8).map(|i| CHARS[(state.hash_one(i) % CHARS.len() as u64) as usize] as char).collect()
 }
 
+/// Incremental Markdown code-block / inline-code tracker so `TextHealer` stays O(N) over long
+/// streams instead of rescanning from byte 0 on every tag or `<`.
+#[derive(Default, Clone, Copy)]
+enum LineState {
+    #[default]
+    Indent,
+    Mark(char, u8),
+    Other,
+}
+
+#[derive(Default, Clone, Copy)]
+struct CodeTracker {
+    fence: Option<char>,
+    line_state: LineState,
+    inline_open: Option<usize>,
+    inline_run: usize,
+}
+
+impl CodeTracker {
+    fn advance(&mut self, s: &str) {
+        for c in s.chars() {
+            if c == '\n' {
+                if let LineState::Mark(ch, 3) = self.line_state {
+                    match self.fence {
+                        None => self.fence = Some(ch),
+                        Some(mark) if mark == ch => self.fence = None,
+                        _ => {}
+                    }
+                }
+                self.line_state = LineState::Indent;
+                self.inline_open = None;
+                self.inline_run = 0;
+                continue;
+            }
+            self.line_state = match self.line_state {
+                LineState::Indent if c.is_whitespace() => LineState::Indent,
+                LineState::Indent if matches!(c, '`' | '~') => LineState::Mark(c, 1),
+                LineState::Indent => LineState::Other,
+                LineState::Mark(ch, 3) => LineState::Mark(ch, 3),
+                LineState::Mark(ch, n) if c == ch => LineState::Mark(ch, n + 1),
+                LineState::Mark(_, _) | LineState::Other => LineState::Other,
+            };
+            if c == '`' {
+                self.inline_run += 1;
+            } else if self.inline_run > 0 {
+                self.inline_open = match self.inline_open {
+                    Some(n) if n == self.inline_run => None,
+                    None => Some(self.inline_run),
+                    other => other,
+                };
+                self.inline_run = 0;
+            }
+        }
+    }
+
+    fn is_in_code(&self) -> bool {
+        if self.fence.is_some() {
+            return true;
+        }
+        if self.inline_run > 0 {
+            !matches!(self.inline_open, Some(n) if n == self.inline_run)
+        } else {
+            self.inline_open.is_some()
+        }
+    }
+}
+
 /// Heals one reply's text as it streams in. Text flows on at once, except from where an
 /// opening tag could be starting: that is held until it closes into a call or proves not to
 /// be one.
 #[derive(Default)]
 pub(crate) struct TextHealer {
-    /// All text so far, as code spans depend on everything before a tag.
+    /// Uncompacted tail of the streamed text.
     text: String,
     /// How much of `text` has been passed on or turned into calls.
     done: usize,
+    /// Incremental Markdown code state at byte offset `code_pos` within `text`.
+    code: CodeTracker,
+    code_pos: usize,
 }
 
 impl TextHealer {
@@ -113,16 +183,49 @@ impl TextHealer {
         self.drain(tools, true)
     }
 
+    fn in_code_at(&mut self, pos: usize) -> bool {
+        debug_assert!(pos >= self.code_pos);
+        if pos > self.code_pos {
+            self.code.advance(&self.text[self.code_pos..pos]);
+            self.code_pos = pos;
+        }
+        self.code.is_in_code()
+    }
+
+    /// The first opening tag at or after `from` that isn't in Markdown code.
+    fn next_opener(&mut self, mut from: usize) -> Option<usize> {
+        loop {
+            let start = from + OPENERS.iter().filter_map(|tag| self.text[from..].find(tag)).min()?;
+            if !self.in_code_at(start) {
+                return Some(start);
+            }
+            from = start + 1;
+        }
+    }
+
+    fn compact(&mut self) {
+        const COMPACT_THRESHOLD: usize = 4096;
+        if self.done >= COMPACT_THRESHOLD {
+            if self.done > self.code_pos {
+                self.code.advance(&self.text[self.code_pos..self.done]);
+                self.code_pos = self.done;
+            }
+            self.text.drain(..self.done);
+            self.code_pos = self.code_pos.saturating_sub(self.done);
+            self.done = 0;
+        }
+    }
+
     fn drain(&mut self, tools: &Tools, at_end: bool) -> (String, Vec<Healed>) {
         let mut out = String::new();
         let mut calls = Vec::new();
         let mut from = self.done;
         loop {
-            let Some(start) = next_opener(&self.text, from) else {
+            let Some(start) = self.next_opener(from) else {
                 // A tag starting in code wouldn't count, so code like `Vec<` isn't held.
                 let held = if at_end { 0 } else { partial_opener(&self.text[from..]) };
                 let end = self.text.len() - held;
-                let end = if held > 0 && in_code(&self.text, end) { self.text.len() } else { end };
+                let end = if held > 0 && self.in_code_at(end) { self.text.len() } else { end };
                 out.push_str(&self.text[self.done..end]);
                 self.done = end;
                 break;
@@ -146,6 +249,7 @@ impl TextHealer {
                 }
             }
         }
+        self.compact();
         (out, calls)
     }
 }
@@ -160,17 +264,6 @@ pub(crate) fn heal_text(text: &str, tools: &Tools) -> (String, Vec<Healed>) {
     (out, calls)
 }
 
-/// The first opening tag at or after `from` that isn't in Markdown code.
-fn next_opener(text: &str, mut from: usize) -> Option<usize> {
-    loop {
-        let start = from + OPENERS.iter().filter_map(|tag| text[from..].find(tag)).min()?;
-        if !in_code(text, start) {
-            return Some(start);
-        }
-        from = start + 1;
-    }
-}
-
 /// Length of the longest end of `text` that could still grow into an opening tag.
 fn partial_opener(text: &str) -> usize {
     (1..WRAPPER.len().min(text.len() + 1))
@@ -178,44 +271,6 @@ fn partial_opener(text: &str) -> usize {
         .filter(|n| text.is_char_boundary(text.len() - n))
         .find(|n| OPENERS.iter().any(|tag| tag.starts_with(&text[text.len() - n..])))
         .unwrap_or(0)
-}
-
-/// Whether `pos` falls in Markdown code: a fenced block, or an inline span on its line. A
-/// tag there is being shown, not used.
-fn in_code(text: &str, pos: usize) -> bool {
-    let before = &text[..pos];
-    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-    let mut fence: Option<char> = None;
-    for line in before[..line_start].lines() {
-        let line = line.trim_start();
-        match fence {
-            None if line.starts_with("```") => fence = Some('`'),
-            None if line.starts_with("~~~") => fence = Some('~'),
-            Some(mark) if line.starts_with(&mark.to_string().repeat(3)) => fence = None,
-            _ => {}
-        }
-    }
-    if fence.is_some() {
-        return true;
-    }
-    // A run of backticks opens a span that only a run of the same length closes.
-    let mut open: Option<usize> = None;
-    let mut run = 0;
-    for c in before[line_start..].chars().chain(['\n']) {
-        if c == '`' {
-            run += 1;
-            continue;
-        }
-        if run > 0 {
-            open = match open {
-                Some(n) if n == run => None,
-                None => Some(run),
-                other => other,
-            };
-            run = 0;
-        }
-    }
-    open.is_some()
 }
 
 /// Why text isn't a call (yet).
@@ -457,5 +512,32 @@ mod tests {
     fn nothing_heals_without_tools_or_with_tool_choice_none() {
         assert!(Tools::new(&json!({"messages": []})).is_none());
         assert!(Tools::new(&json!({"tools": [{"type": "function", "function": {"name": "bash"}}], "tool_choice": "none"})).is_none());
+    }
+
+    #[test]
+    fn incremental_code_tracker_compacts_and_handles_fences_and_inline_spans() {
+        let tools = tools();
+        let mut healer = TextHealer::default();
+        // Large fenced block containing many `<` and fake tags, then a real call outside code.
+        let mut stream = String::from("```rust\n");
+        for _ in 0..400 {
+            stream.push_str("let v: Vec<Option<String>> = <tool_call>{\"name\":\"bash\",\"arguments\":{}}</tool_call>;\n");
+        }
+        stream.push_str("```\nNow ``inline `code` ``<function=bash><parameter=command>echo ok</parameter></function> and `Vec<`");
+        let mut sent = String::new();
+        let mut calls = Vec::new();
+        for chunk in stream.as_bytes().chunks(13) {
+            let piece = std::str::from_utf8(chunk).unwrap();
+            let (text, healed) = healer.feed(piece, &tools);
+            sent.push_str(&text);
+            calls.extend(healed);
+        }
+        let (tail, more) = healer.finish(&tools);
+        sent.push_str(&tail);
+        calls.extend(more);
+        assert_eq!(calls, [call("bash", json!({"command": "echo ok"}))]);
+        assert!(sent.starts_with("```rust\n"));
+        assert!(sent.ends_with("Now ``inline `code` `` and `Vec<`"));
+        assert!(healer.text.len() < 8192, "buffer should compact: {} bytes", healer.text.len());
     }
 }

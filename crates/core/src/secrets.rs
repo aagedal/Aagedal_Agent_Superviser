@@ -17,7 +17,7 @@ pub fn generate_key(prefix: &str) -> String {
     format!("{prefix}{}", hex::encode(bytes))
 }
 
-/// The key in `path`, created on first use.
+/// The key in `path`, created atomically on first use so concurrent callers get the same key.
 pub fn key_file(path: &Path, prefix: &str) -> anyhow::Result<String> {
     if let Ok(existing) = std::fs::read_to_string(path) {
         let existing = existing.trim();
@@ -25,9 +25,31 @@ pub fn key_file(path: &Path, prefix: &str) -> anyhow::Result<String> {
             return Ok(existing.to_string());
         }
     }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        crate::paths::private_dir(parent)?;
+    }
     let key = generate_key(prefix);
-    write_private(path, key.as_bytes())?;
-    Ok(key)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    match options.open(path) {
+        Ok(mut file) => {
+            std::io::Write::write_all(&mut file, key.as_bytes())?;
+            std::io::Write::flush(&mut file)?;
+            Ok(key)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read_to_string(path)?;
+            let existing = existing.trim();
+            if !existing.is_empty() {
+                return Ok(existing.to_string());
+            }
+            write_private(path, key.as_bytes())?;
+            Ok(key)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub fn local_api_key(paths: &Paths) -> anyhow::Result<String> {

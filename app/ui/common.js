@@ -14,7 +14,7 @@ function el(tag, attrs = {}, ...children) {
     else if (value !== undefined && value !== null && value !== false) node.setAttribute(key, value);
   }
   for (const child of children.flat()) {
-    if (child !== null && child !== undefined) node.append(child instanceof Node ? child : String(child));
+    if (child !== null && child !== undefined && child !== false) node.append(child instanceof Node ? child : String(child));
   }
   return node;
 }
@@ -239,6 +239,9 @@ function closePopovers() {
 document.addEventListener("click", (event) => {
   if (!event.target.closest(".popover")) closePopovers();
 });
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closePopovers();
+});
 
 function modelDetails(model, fit) {
   const id = `${model.repo}:${model.quant.label}`;
@@ -331,12 +334,18 @@ async function loadModel(id) {
   }
   const loading = invoke("load_model", { id });
   run("models");
+  let error = null;
   try {
     await loading;
   } catch (e) {
-    // The page shows the error with the model's status.
+    error = e;
   }
+  await refreshOverview().catch(() => {});
   run("models");
+  // Startup failures show in the model status banner; surface pre-flight errors that never reached it.
+  if (error && !overview?.models.some((m) => m.id === id && m.state === "failed")) {
+    alert(error);
+  }
 }
 
 // Asks for a folder and makes a project of it (or finds the one it has); null if cancelled.

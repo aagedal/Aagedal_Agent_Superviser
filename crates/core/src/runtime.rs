@@ -207,8 +207,9 @@ impl LlamaServer {
             if let Some(status) = self.child.try_wait()? {
                 bail!("llama-server exited while loading ({status})");
             }
-            if let Ok(response) = client.get(&url).timeout(Duration::from_secs(2)).send().await
+            if let Ok(response) = self.authorized(client.get(&url).timeout(Duration::from_secs(2))).send().await
                 && response.status().is_success()
+                && response.json::<serde_json::Value>().await.is_ok_and(|v| v["status"] == "ok")
             {
                 return Ok(());
             }
@@ -243,17 +244,28 @@ pub fn stop_leftovers(dir: &Path, marker: &str) {
         if path.extension().is_none_or(|e| e != "pid") {
             continue;
         }
-        if let Some(pid) = std::fs::read_to_string(&path).ok().and_then(|t| t.trim().parse::<u32>().ok())
-            && std::process::Command::new("/bin/ps")
+        let matches_server = |pid: u32| {
+            std::process::Command::new("/bin/ps")
                 .args(["-o", "command=", "-p", &pid.to_string()])
                 .output()
                 .is_ok_and(|out| {
                     let command = String::from_utf8_lossy(&out.stdout);
                     command.contains("llama-server") && command.contains(marker)
                 })
+        };
+        if let Some(pid) = std::fs::read_to_string(&path).ok().and_then(|t| t.trim().parse::<u32>().ok())
+            && matches_server(pid)
         {
             tracing::info!("stopping a model server left from an earlier run (pid {pid})");
             let _ = std::process::Command::new("/bin/kill").arg(pid.to_string()).status();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline && matches_server(pid) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if matches_server(pid) {
+                tracing::warn!("force-killing unresponsive leftover llama-server (pid {pid})");
+                let _ = std::process::Command::new("/bin/kill").args(["-KILL", &pid.to_string()]).status();
+            }
         }
         let _ = std::fs::remove_file(path);
     }

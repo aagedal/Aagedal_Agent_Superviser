@@ -174,19 +174,22 @@ impl Conversations {
     /// Makes room for `bytes` more for `id`, whose old conversation it replaces, by deleting
     /// the least recently used others. False if it can't fit at all.
     fn make_room(&self, id: &str, bytes: u64) -> bool {
-        let limit = self.limit();
+        self.make_room_within(id, bytes, self.limit())
+    }
+
+    fn make_room_within(&self, id: &str, bytes: u64, limit: u64) -> bool {
         if bytes > limit {
             return false;
         }
         let others: Vec<Meta> = self.saved().into_iter().filter(|m| m.id != id).collect();
-        let mut total: u64 = others.iter().map(|m| m.bytes).sum();
+        let mut total: u64 = others.iter().fold(0u64, |acc, m| acc.saturating_add(m.bytes));
         for old in others {
-            if total + bytes <= limit {
+            if total.saturating_add(bytes) <= limit {
                 break;
             }
             tracing::info!("deleting the saved conversation of {} for room", old.id);
             self.remove(&old.id);
-            total -= old.bytes;
+            total = total.saturating_sub(old.bytes);
         }
         true
     }
@@ -206,20 +209,21 @@ impl Conversations {
         let known: Vec<String> = saved.iter().flat_map(|m| [Self::file_name(&m.id), format!("{}.json", stem(&m.id))]).collect();
         for entry in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            // Another model's save in progress.
-            let saving = name.ends_with("-saving.bin") && entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age < SAVING_AGE));
-            if !saving && !known.contains(&name) {
+            // Another model's save or atomic metadata write in progress.
+            let in_progress = (name.ends_with("-saving.bin") || name.ends_with(".tmp"))
+                && entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age < SAVING_AGE));
+            if !in_progress && !known.contains(&name) {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
         let limit = self.limit();
-        let mut total: u64 = saved.iter().map(|m| m.bytes).sum();
+        let mut total: u64 = saved.iter().fold(0u64, |acc, m| acc.saturating_add(m.bytes));
         for old in saved {
             if total <= limit {
                 break;
             }
             self.remove(&old.id);
-            total -= old.bytes;
+            total = total.saturating_sub(old.bytes);
         }
     }
 
@@ -255,11 +259,14 @@ impl Conversations {
                 return Err(e);
             }
         };
-        std::fs::rename(&temp, self.dir.join(Self::file_name(id)))?;
-        let meta = Meta { id: id.to_string(), key: key.clone(), tokens: saved.tokens, bytes: saved.bytes, used: now() };
+        let final_path = self.dir.join(Self::file_name(id));
+        let disk_bytes = std::fs::metadata(&temp).map(|m| m.len()).unwrap_or(0);
+        let bytes = if saved.bytes > 0 { saved.bytes } else { disk_bytes };
+        std::fs::rename(&temp, &final_path)?;
+        let meta = Meta { id: id.to_string(), key: key.clone(), tokens: saved.tokens, bytes, used: now() };
         Self::write_meta(&self.meta_path(id), &meta)?;
         self.prune();
-        Ok(Some(saved))
+        Ok(Some(Saved { tokens: saved.tokens, bytes }))
     }
 
     /// Loads `id`'s conversation into `server` if one was saved with `key`; returns its tokens.
@@ -324,12 +331,15 @@ mod tests {
         // Plenty of room: nothing goes.
         assert!(c.make_room("mine", 100));
         assert_eq!(c.summary().count, 3);
+        // Use a fixed limit for boundary checks so live disk fluctuations from parallel tests
+        // or the OS on low-free-space volumes can't race between `limit()` and `make_room()`.
+        const LIMIT: u64 = 500;
         // More than the limit alone: refused, nothing deleted.
-        assert!(!c.make_room("mine", c.limit() + 1));
+        assert!(!c.make_room_within("mine", LIMIT + 1, LIMIT));
         assert_eq!(c.summary().count, 3);
         // Room for all but 150 bytes beside the others: the oldest goes first, and `mine`
         // doesn't count, since the new one replaces it.
-        assert!(c.make_room("mine", c.limit() - 150));
+        assert!(c.make_room_within("mine", LIMIT - 150, LIMIT));
         let left: Vec<String> = c.saved().into_iter().map(|m| m.id).collect();
         assert_eq!(left, ["newer", "mine"]);
         std::fs::remove_dir_all(&c.dir).ok();

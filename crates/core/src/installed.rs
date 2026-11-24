@@ -74,29 +74,60 @@ pub fn alias(repo: &str) -> String {
     name.to_ascii_lowercase()
 }
 
-fn model_dir(paths: &Paths, model: &CatalogModel) -> PathBuf {
-    let mut dir = paths.models();
+fn model_dir(paths: &Paths, model: &CatalogModel) -> anyhow::Result<PathBuf> {
+    validate_model(model)?;
+    let root = paths.models();
+    let mut dir = root.clone();
     for part in model.repo.split('/') {
         dir.push(sanitize(part));
     }
     dir.push(sanitize(&model.quant.label));
-    dir
+    anyhow::ensure!(dir.starts_with(&root) && dir != root, "unsafe model directory {}", dir.display());
+    Ok(dir)
+}
+
+/// Checks that `model`'s repo, quant label and file paths cannot traverse out of its install folder.
+pub fn validate_model(model: &CatalogModel) -> anyhow::Result<()> {
+    let bad_segment = |s: &str| s.is_empty() || s == "." || s == ".." || s.contains('\\');
+    anyhow::ensure!(!model.repo.is_empty() && !model.repo.split('/').any(bad_segment), "unsafe model repo {}", model.repo);
+    anyhow::ensure!(!bad_segment(&model.quant.label) && !model.quant.label.contains('/'), "unsafe quant label {}", model.quant.label);
+    for file in &model.quant.files {
+        let p = Path::new(&file.path);
+        anyhow::ensure!(
+            !file.path.is_empty()
+                && !file.path.contains('\\')
+                && p.components().all(|c| matches!(c, std::path::Component::Normal(_))),
+            "unsafe file path {}",
+            file.path
+        );
+    }
+    Ok(())
 }
 
 fn sanitize(part: &str) -> String {
-    part.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect()
+    let cleaned: String = part.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." { "_".into() } else { cleaned }
 }
 
 /// Every complete model, newest first.
 pub fn list(paths: &Paths) -> Vec<InstalledModel> {
     let mut found = Vec::new();
-    let mut stack = vec![paths.models()];
-    while let Some(dir) = stack.pop() {
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = vec![(paths.models(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 16 {
+            continue;
+        }
+        if let Ok(real) = std::fs::canonicalize(&dir)
+            && !visited.insert(real)
+        {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                stack.push(path);
+                stack.push((path, depth + 1));
             } else if path.file_name().is_some_and(|n| n == MANIFEST) {
                 match read_manifest(&path) {
                     Ok(model) => found.push(model),
@@ -142,7 +173,8 @@ pub async fn install(
     cancel: Arc<AtomicBool>,
     progress: impl FnMut(Progress),
 ) -> anyhow::Result<InstalledModel> {
-    install_to(hub, &model_dir(paths, model), model, cancel, progress).await
+    let dir = model_dir(paths, model)?;
+    install_to(hub, &dir, model, cancel, progress).await
 }
 
 /// The judge's model: kept in its own folder, so it isn't listed with the chat models.
@@ -163,6 +195,7 @@ pub async fn install_to(
     cancel: Arc<AtomicBool>,
     mut progress: impl FnMut(Progress),
 ) -> anyhow::Result<InstalledModel> {
+    validate_model(model)?;
     let dir = dir.to_path_buf();
     if let Some(free) = available_space(&dir) {
         check_space(&model.name, missing_bytes(&dir, model), free)?;
@@ -173,8 +206,16 @@ pub async fn install_to(
         let dest = dir.join(quant::local_path(&file.path));
         anyhow::ensure!(dest.starts_with(&dir) && !file.path.contains(".."), "unsafe file path {}", file.path);
         if std::fs::metadata(&dest).is_ok_and(|m| m.len() == file.size) {
-            finished += file.size;
-            continue;
+            if let Some(expected) = &file.sha256 {
+                if verify_sha256(&dest, expected, &cancel).await? {
+                    finished += file.size;
+                    continue;
+                }
+                let _ = tokio::fs::remove_file(&dest).await;
+            } else {
+                finished += file.size;
+                continue;
+            }
         }
         hub.download(&model.repo, &model.revision, file, &dest, &cancel, |done| {
             progress(Progress { done: finished + done, total })
@@ -193,6 +234,25 @@ pub async fn install_to(
     std::fs::write(dir.join(MANIFEST), serde_json::to_string_pretty(&installed)?)?;
     progress(Progress { done: total, total });
     Ok(installed)
+}
+
+async fn verify_sha256(path: &Path, expected: &str, cancel: &Arc<AtomicBool>) -> anyhow::Result<bool> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!("download cancelled");
+        }
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()).eq_ignore_ascii_case(expected))
 }
 
 /// Room a download must leave, so it never fills the disk to the last byte.
@@ -282,7 +342,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("superviser-installed-{}", std::process::id()));
         let paths = Paths::at(&tmp);
         let model = crate::catalog::Catalog::bundled().models.remove(0);
-        let dir = model_dir(&paths, &model);
+        let dir = model_dir(&paths, &model).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let installed = InstalledModel {
             id: model_id(&model),
@@ -299,5 +359,21 @@ mod tests {
         remove(&paths, &installed.id).unwrap();
         assert!(list(&paths).is_empty());
         std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn rejects_traversal_in_model_metadata() {
+        let paths = Paths::at("/tmp/superviser-models-test");
+        let mut bad_repo = crate::catalog::Catalog::bundled().models.remove(0);
+        bad_repo.repo = "../escape/repo".into();
+        assert!(model_dir(&paths, &bad_repo).is_err());
+
+        let mut bad_quant = crate::catalog::Catalog::bundled().models.remove(0);
+        bad_quant.quant.label = "..".into();
+        assert!(model_dir(&paths, &bad_quant).is_err());
+
+        let mut bad_file = crate::catalog::Catalog::bundled().models.remove(0);
+        bad_file.quant.files[0].path = "../pwn.gguf".into();
+        assert!(validate_model(&bad_file).is_err());
     }
 }

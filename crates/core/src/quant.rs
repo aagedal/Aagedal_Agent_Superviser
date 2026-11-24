@@ -34,7 +34,7 @@ static LABEL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:^|[-_.])((?:UD-)?(?:I?Q\d(?:_[A-Z0-9]+)*|TQ\d_\d|MXFP4(?:_MOE)?|BF16|F16|F32))$").unwrap()
 });
 static SHARD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-\d{5}-of-\d{5}$").unwrap());
-static FIRST_SHARD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-0*1-of-\d{5}\.gguf$").unwrap());
+static FIRST_SHARD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)-0*1-of-\d{5}\.gguf$").unwrap());
 
 /// What Unsloth names GGUFs in mainline llama.cpp's layout when the plain `.gguf` files in
 /// the same repo need its own llama.cpp build (`Mainline_Support/*.gguf_file`).
@@ -89,16 +89,23 @@ pub fn preferred<'a>(labels: impl IntoIterator<Item = &'a str>) -> Option<&'a st
     PREFERRED.iter().find_map(|want| labels.iter().copied().find(|have| have.eq_ignore_ascii_case(want)))
 }
 
+fn strip_gguf(path: &str) -> &str {
+    match path.len().checked_sub(5) {
+        Some(len) if path[len..].eq_ignore_ascii_case(".gguf") => &path[..len],
+        _ => path,
+    }
+}
+
 /// Whether `path` is the file llama.cpp should be pointed at: the only file, or the first shard.
 pub fn is_entry_file(path: &str) -> bool {
     let path = local_path(path);
-    !SHARD.is_match(path.trim_end_matches(".gguf")) || FIRST_SHARD.is_match(&path)
+    !SHARD.is_match(strip_gguf(&path)) || FIRST_SHARD.is_match(&path)
 }
 
 /// `(index, total)` of a shard such as `m-Q4_K_M-00002-of-00003.gguf`.
 pub fn shard(path: &str) -> Option<(u32, u32)> {
     let path = local_path(path);
-    let stem = path.trim_end_matches(".gguf");
+    let stem = strip_gguf(&path);
     let tail = SHARD.find(stem)?.as_str();
     let (index, total) = tail.trim_start_matches('-').split_once("-of-")?;
     Some((index.parse().ok()?, total.parse().ok()?))
@@ -202,6 +209,7 @@ mod tests {
     #[test]
     fn shards() {
         assert_eq!(shard("Q4/m-Q4_K_M-00002-of-00003.gguf"), Some((2, 3)));
+        assert_eq!(shard("Q4/m-Q4_K_M-00002-of-00003.GGUF"), Some((2, 3)));
         assert_eq!(shard("m-Q4_K_M.gguf"), None);
     }
 
@@ -209,7 +217,9 @@ mod tests {
     fn entry_files() {
         assert!(is_entry_file("a-Q4_K_M.gguf"));
         assert!(is_entry_file("Q4_K_M/a-Q4_K_M-00001-of-00003.gguf"));
+        assert!(is_entry_file("Q4_K_M/a-Q4_K_M-00001-of-00003.GGUF"));
         assert!(!is_entry_file("Q4_K_M/a-Q4_K_M-00002-of-00003.gguf"));
+        assert!(!is_entry_file("Q4_K_M/a-Q4_K_M-00002-of-00003.GGUF"));
         assert!(is_auxiliary("mmproj-F16.gguf"));
     }
 

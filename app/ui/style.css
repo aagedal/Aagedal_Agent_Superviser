@@ -173,7 +173,8 @@ button.small { font-size: 12px; padding: 3px 8px; }
 .guide-head { display: flex; align-items: baseline; justify-content: space-between; }
 #guide-progress { margin: 2px 0 0; }
 .steps { display: flex; gap: 6px; list-style: none; padding: 0; margin: 12px 0 20px; }
-.steps li { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); color: var(--muted); cursor: pointer; font-weight: 500; }
+.steps li { flex: 1; min-width: 0; display: flex; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); color: var(--muted); }
+.steps li > button.step-btn { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; padding: 7px 10px; border: none; border-radius: inherit; background: none; color: inherit; font-weight: 500; text-align: left; }
 .steps li .num { flex: none; width: 22px; height: 22px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; background: var(--chip); font-size: 12px; }
 .steps .step-text { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }
 .steps .step-note { font-size: 11px; font-weight: 400; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -229,12 +230,12 @@ progress { width: 140px; height: 6px; accent-color: var(--accent); }
 .sidebar { display: flex; flex-direction: column; gap: 8px; padding: 12px; border-right: 1px solid var(--line); background: var(--panel); min-height: 0; }
 .sidebar select { width: 100%; padding: 6px 8px; }
 .chat-list { flex: 1; overflow: auto; margin: 4px -4px 0; }
-.chat-item { display: flex; align-items: center; gap: 4px; padding: 6px 8px; border-radius: 6px; cursor: pointer; font-size: 13px; }
-.chat-item:hover { background: var(--chip); }
+.chat-item { display: flex; align-items: center; gap: 4px; padding: 0 4px 0 0; border-radius: 6px; font-size: 13px; }
+.chat-item:hover, .chat-item:focus-within { background: var(--chip); }
 .chat-item.active { background: var(--chip); font-weight: 500; }
-.chat-item-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chat-item-action { visibility: hidden; border: none; background: none; padding: 0 4px; color: var(--muted); }
-.chat-item:hover .chat-item-action { visibility: visible; }
+.chat-item-title { flex: 1; min-width: 0; border: none; background: none; padding: 6px 4px 6px 8px; text-align: left; font: inherit; color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 6px; }
+.chat-item-action { opacity: 0; border: none; background: none; padding: 2px 4px; color: var(--muted); }
+.chat-item:hover .chat-item-action, .chat-item:focus-within .chat-item-action, .chat-item-action:focus-visible { opacity: 1; }
 .archived-chats { margin-top: 8px; }
 .archived-chats summary { cursor: pointer; padding: 4px 8px; }
 .sidebar-foot { border-top: 1px solid var(--line); padding-top: 8px; }

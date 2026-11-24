@@ -25,9 +25,20 @@ use crate::rewrite::{SseRewriter, guard_response};
 /// Request headers not forwarded upstream; `accept-encoding` becomes `identity` so
 /// responses come back uncompressed and can be inspected. Client keys are replaced.
 const SKIP_REQUEST: &[&str] =
-    &["host", "content-length", "accept-encoding", "connection", "transfer-encoding", "authorization", "x-api-key", "origin"];
-/// Response headers not forwarded back: framing is ours, and the body may be rewritten.
-const SKIP_RESPONSE: &[&str] = &["content-length", "connection", "transfer-encoding", "content-encoding"];
+    &["host", "content-length", "content-encoding", "accept-encoding", "connection", "transfer-encoding", "authorization", "x-api-key", "origin"];
+/// Response headers not forwarded back: framing and CORS are ours, and the body may be rewritten.
+const SKIP_RESPONSE: &[&str] = &[
+    "content-length",
+    "connection",
+    "transfer-encoding",
+    "content-encoding",
+    "access-control-allow-origin",
+    "access-control-allow-headers",
+    "access-control-allow-methods",
+    "access-control-allow-credentials",
+    "access-control-expose-headers",
+    "access-control-max-age",
+];
 /// Request bodies above this are refused (long conversations with images are large).
 const MAX_BODY: usize = 64 << 20;
 
@@ -105,6 +116,7 @@ impl GuardServer {
         let addr = listener.local_addr()?;
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(std::io::Error::other)?;
         let api_key = RwLock::new(options.api_key.clone());
@@ -192,7 +204,11 @@ fn presented_key(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn same(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    if a.len() != b.len() {
+        return false;
+    }
+    let diff = a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | std::hint::black_box(x ^ y));
+    std::hint::black_box(diff) == 0
 }
 
 fn cors_headers(state: &AppState, request_headers: &HeaderMap, response: &mut HeaderMap) {
@@ -243,13 +259,37 @@ async fn forward_inner(state: &Arc<AppState>, request: Request) -> Response {
             return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json!({ "object": "list", "data": data }).to_string()).into_response();
         }
     }
+    // Reject compressed request bodies so an encoded payload can never fail JSON parsing and bypass the guard.
+    if parts
+        .headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| !v.trim().is_empty() && !v.trim().eq_ignore_ascii_case("identity"))
+    {
+        return error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "compressed request bodies are not supported by the guard");
+    }
     let body = match axum::body::to_bytes(body, MAX_BODY).await {
         Ok(body) => body,
         Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
 
-    // Only JSON object bodies with messages are model calls worth guarding.
-    let request_json = serde_json::from_slice::<Value>(&body).ok().filter(Value::is_object);
+    // Guard model calls; refuse malformed JSON on model endpoints instead of failing open.
+    let json_slice = body.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&body);
+    let request_json = serde_json::from_slice::<Value>(json_slice).ok().filter(Value::is_object);
+    let path_only = path_and_query.split('?').next().unwrap_or(&path_and_query);
+    let is_json_content = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json")));
+    let is_model_endpoint = parts.method == Method::POST
+        && (path_only.ends_with("/chat/completions")
+            || path_only.ends_with("/messages")
+            || path_only.ends_with("/responses")
+            || is_json_content);
+    if request_json.is_none() && is_model_endpoint && !json_slice.iter().all(u8::is_ascii_whitespace) {
+        return error(StatusCode::BAD_REQUEST, "request body must be a valid JSON object");
+    }
     let model = request_json.as_ref().and_then(|r| r.get("model")).and_then(Value::as_str);
     let Some(upstream) = state.upstreams.read().unwrap().pick(model) else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "no model is loaded; load one from the Agent Superviser menu");
@@ -298,7 +338,8 @@ async fn forward_inner(state: &Arc<AppState>, request: Request) -> Response {
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("text/event-stream"));
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"));
 
     let body = match guard {
         // Not a model call: pass the response through untouched.

@@ -66,24 +66,25 @@ async fn check(handle: &AppHandle) -> anyhow::Result<Option<Update>> {
 pub fn install(handle: &AppHandle) {
     let updates = handle.state::<Updates>();
     let Some(update) = updates.ready.lock().unwrap().clone() else { return };
-    if updates.installing.load(Ordering::Relaxed) {
+    if updates.installing.swap(true, Ordering::AcqRel) {
         return;
     }
+    crate::refresh_tray(handle);
     let version = update.version.clone();
     let owned = handle.clone();
     let go = move |confirmed: bool| {
         let handle = owned;
         if !confirmed {
+            handle.state::<Updates>().installing.store(false, Ordering::Release);
+            crate::refresh_tray(&handle);
             return;
         }
-        handle.state::<Updates>().installing.store(true, Ordering::Relaxed);
-        crate::refresh_tray(&handle);
         tauri::async_runtime::spawn(async move {
             tracing::info!("installing version {}", update.version);
             match update.download_and_install(|_, _| {}, || {}).await {
                 Ok(()) => handle.request_restart(),
                 Err(e) => {
-                    handle.state::<Updates>().installing.store(false, Ordering::Relaxed);
+                    handle.state::<Updates>().installing.store(false, Ordering::Release);
                     crate::refresh_tray(&handle);
                     handle.dialog().message(format!("{e:#}")).title("Couldn't install the update").kind(MessageDialogKind::Error).show(|_| {});
                 }

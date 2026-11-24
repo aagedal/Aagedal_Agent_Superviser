@@ -113,6 +113,7 @@ struct DownloadEvent {
 
 #[tauri::command]
 pub fn download_model(handle: AppHandle, app: State<'_, Arc<App>>, model: CatalogModel) -> Result<String> {
+    installed::validate_model(&model).map_err(err)?;
     if app.fit(&model).is_none() {
         return Err("This model is too large for this machine's memory.".into());
     }
@@ -550,6 +551,7 @@ pub async fn acp_open(handle: AppHandle, app: State<'_, Arc<App>>, project: Stri
 pub async fn acp_prompt(handle: AppHandle, app: State<'_, Arc<App>>, project: String, session: String, text: String, model: String) -> Result<()> {
     let (model, _) = app.loaded(&model).ok_or("Load the chat's model first.")?;
     app.touch(&model.id);
+    app.sync_upstreams().await;
     let project = self::project(&app, &project)?;
     let engine = app.engines.get(&handle, &app, &project).await.map_err(|e| format!("{e:#}"))?;
     engine.prompt(handle, &session, &text, &model.alias).map_err(|e| format!("{e:#}"))
@@ -610,9 +612,11 @@ const EDITORS: &[&str] = &["Visual Studio Code", "Cursor", "Zed", "Sublime Text"
 /// Kinds of file whose default app runs them: opening one would run the agent's code
 /// outside the sandbox, so they only open in an editor or Finder.
 const RUNS_CODE: &[&str] = &[
-    "app", "command", "sh", "bash", "zsh", "fish", "csh", "ksh", "tool", "terminal", "scpt", "scptd", "applescript", "workflow",
-    "action", "shortcut", "pkg", "mpkg", "dmg", "jar", "py", "pyw", "rb", "pl", "php", "url", "webloc", "inetloc", "fileloc",
+    "app", "command", "sh", "bash", "zsh", "fish", "csh", "ksh", "tool", "terminal", "term", "scpt", "scptd", "applescript", "osa", "workflow",
+    "action", "shortcut", "pkg", "mpkg", "dmg", "iso", "img", "cdr", "sparseimage", "sparsebundle", "jar", "jnlp", "py", "pyw", "rb", "pl", "php",
+    "url", "webloc", "inetloc", "fileloc", "ftploc", "mailloc", "afploc", "vncloc", "news",
     "osax", "prefpane", "kext", "plugin", "bundle", "dylib", "so", "mobileconfig",
+    "appex", "xpc", "saver", "qlgenerator", "mdimporter", "wdgt", "xcodeproj", "xcworkspace", "html", "htm", "svg",
 ];
 
 fn installed_app(name: &str) -> bool {
@@ -719,7 +723,7 @@ pub fn chat_answer(app: State<'_, Arc<App>>, chat: String, call: String, allow: 
 
 #[tauri::command]
 pub fn chat_delete(app: State<'_, Arc<App>>, project: String, id: String) -> Result<()> {
-    app.chats.stop(&id);
+    app.chats.stop_and_delete(&id);
     Chat::delete(&app.paths, &project, &id).map_err(err)?;
     app.forget_chat(&project, &id).map_err(err)
 }

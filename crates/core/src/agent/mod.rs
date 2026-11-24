@@ -65,6 +65,7 @@ impl Chat {
     }
 
     pub fn save(&mut self, paths: &Paths) -> anyhow::Result<()> {
+        anyhow::ensure!(valid_id(&self.id), "bad chat id");
         self.updated = now();
         if self.title == "New chat"
             && let Some(first) = self.messages.iter().find(|m| m["role"] == "user").and_then(|m| m["content"].as_str())

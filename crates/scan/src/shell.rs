@@ -164,14 +164,26 @@ impl Script {
     }
 }
 
+const MAX_CACHE_ENTRIES: usize = 512;
+const MAX_CACHE_ENTRY_BYTES: usize = 64 * 1024;
+const MAX_CACHE_TOTAL_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Default)]
+struct ParseCache {
+    entries: HashMap<String, Rc<Script>>,
+    bytes: usize,
+}
+
 thread_local! {
-    static CACHE: RefCell<HashMap<String, Rc<Script>>> = RefCell::new(HashMap::new());
+    static CACHE: RefCell<ParseCache> = RefCell::new(ParseCache::default());
 }
 
 /// Parses `text`. Never fails: anything the reader trips over makes the script
 /// incomplete. Cached per thread (several checks read the same command).
 pub fn parse(text: &str) -> Rc<Script> {
-    if let Some(found) = CACHE.with(|c| c.borrow().get(text).cloned()) {
+    if text.len() <= MAX_CACHE_ENTRY_BYTES
+        && let Some(found) = CACHE.with(|c| c.borrow().entries.get(text).cloned())
+    {
         return found;
     }
     let mut script = Script::new();
@@ -180,13 +192,18 @@ pub fn parse(text: &str) -> Rc<Script> {
     script.complete = reader.complete;
     propagate_scope(&mut script);
     let script = Rc::new(script);
-    CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        if cache.len() >= 512 {
-            cache.clear();
-        }
-        cache.insert(text.to_string(), script.clone());
-    });
+    if text.len() <= MAX_CACHE_ENTRY_BYTES {
+        CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            if cache.entries.len() >= MAX_CACHE_ENTRIES || cache.bytes + text.len() > MAX_CACHE_TOTAL_BYTES {
+                cache.entries.clear();
+                cache.bytes = 0;
+            }
+            if cache.entries.insert(text.to_string(), script.clone()).is_none() {
+                cache.bytes += text.len();
+            }
+        });
+    }
     script
 }
 
@@ -742,6 +759,124 @@ impl<'t> Reader<'t> {
         if substituted { target.substituted.extend(inner) } else { target.nested.extend(inner) }
     }
 
+    /// Like [`Self::nested`], remapping `text`-relative byte spans through `map` back onto
+    /// valid UTF-8 boundaries in the outer `self.text` when quotes/escapes changed byte offsets.
+    fn nested_mapped(&mut self, s: &mut Script, command: Id, text: &str, map: &[usize], depth: usize, substituted: bool) {
+        if depth > MAX_DEPTH {
+            self.fail();
+            return;
+        }
+        let before_order = s.order.len();
+        let before_bodies = s.bodies.len();
+        let before_file_bodies = s.file_bodies.len();
+        let mut reader = Reader::new(text, 0);
+        reader.commands(s, depth + 1, None, None);
+        self.complete &= reader.complete;
+        let remap = |p: usize| self.base + map[p.min(map.len() - 1)];
+        let remap_span = |(a, b): Span| (remap(a), remap(b));
+        for &id in &s.order[before_order..] {
+            let c = &mut s.arena[id];
+            c.span = remap_span(c.span);
+            for sp in &mut c.spans {
+                *sp = remap_span(*sp);
+            }
+            for (_, _, sp) in &mut c.redirects {
+                *sp = remap_span(*sp);
+            }
+        }
+        for sp in &mut s.bodies[before_bodies..] {
+            *sp = remap_span(*sp);
+        }
+        for sp in &mut s.file_bodies[before_file_bodies..] {
+            *sp = remap_span(*sp);
+        }
+        let inner: Vec<Id> = s.order[before_order..].to_vec();
+        let target = &mut s.arena[command];
+        if substituted { target.substituted.extend(inner) } else { target.nested.extend(inner) }
+    }
+}
+
+/// Maps each byte position `0..=out_len` of a literal-mode unescaped `sh -c` word back to a
+/// valid UTF-8 byte offset in the outer source string.
+fn literal_word_map(raw: &str, base_in_text: usize, out_len: usize) -> Vec<usize> {
+    let mut map = Vec::with_capacity(out_len + 1);
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    let ch = raw[i..].chars().next().unwrap();
+                    let len = ch.len_utf8();
+                    map.resize(map.len() + len, base_in_text + i);
+                    i += len;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        let ch = raw[i + 1..].chars().next().unwrap();
+                        let len = ch.len_utf8();
+                        if ch != '\n' {
+                            if matches!(ch, '\\' | '$' | '`' | '"') {
+                                map.resize(map.len() + len, base_in_text + i + 1);
+                            } else {
+                                map.push(base_in_text + i);
+                                map.resize(map.len() + len, base_in_text + i + 1);
+                            }
+                        }
+                        i += 1 + len;
+                    } else {
+                        let ch = raw[i..].chars().next().unwrap();
+                        let len = ch.len_utf8();
+                        map.resize(map.len() + len, base_in_text + i);
+                        i += len;
+                    }
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            b'\\' => {
+                if i + 1 < bytes.len() {
+                    let ch = raw[i + 1..].chars().next().unwrap();
+                    let len = ch.len_utf8();
+                    if ch != '\n' {
+                        map.resize(map.len() + len, base_in_text + i + 1);
+                    }
+                    i += 1 + len;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => {
+                let ch = raw[i..].chars().next().unwrap();
+                let len = ch.len_utf8();
+                map.resize(map.len() + len, base_in_text + i);
+                i += len;
+            }
+        }
+    }
+    let sentinel = if matches!(bytes.last(), Some(b'\'' | b'"')) && raw.len() >= 2 {
+        base_in_text + raw.len() - 1
+    } else {
+        base_in_text + raw.len()
+    };
+    if map.len() <= out_len {
+        map.resize(out_len + 1, sentinel);
+    } else {
+        map.push(sentinel);
+    }
+    map
+}
+
+impl<'a> Reader<'a> {
+
     /// `$(…)`, `<(…)` or `>(…)` starting at `start`: its commands belong to `command`.
     fn substitution(&mut self, s: &mut Script, command: Id, depth: usize, start: usize, inner: usize) {
         let before = s.order.len();
@@ -782,8 +917,15 @@ impl<'t> Reader<'t> {
         }
         self.literal = outer;
         if script {
-            let quoted = matches!(self.byte(start), Some(b'\'' | b'"'));
-            self.nested(s, command, &out.clone(), start + usize::from(quoted), depth, false);
+            let quoted = usize::from(matches!(self.byte(start), Some(b'\'' | b'"')));
+            let raw_inner_end = self.pos.saturating_sub(quoted);
+            let direct = start + quoted <= raw_inner_end && self.text.get(start + quoted..raw_inner_end) == Some(out.as_str());
+            if direct {
+                self.nested(s, command, &out.clone(), start + quoted, depth, false);
+            } else {
+                let map = literal_word_map(&self.text[start..self.pos], start, out.len());
+                self.nested_mapped(s, command, &out.clone(), &map, depth, false);
+            }
         }
         Some((out, self.span(start, self.pos)))
     }
@@ -1247,6 +1389,17 @@ mod tests {
     }
 
     #[test]
+    fn nested_sh_c_escapes_preserve_utf8_spans_and_flags() {
+        let nested = r#"sh -c "echo \\ ;aé;curl --noproxy * http://a.b""#;
+        let script = parse(nested);
+        for c in script.commands() {
+            let (a, b) = c.span;
+            assert!(nested.is_char_boundary(a) && nested.is_char_boundary(b) && a <= b, "bad span {:?} for {:?}", c.span, c.name());
+        }
+        assert!(crate::detectors::side_channel::proxy_bypass(nested).is_some());
+    }
+
+    #[test]
     fn heredocs() {
         let text = "cat > a.py <<'EOF'\nif a > b: print(1)\nEOF\npython a.py";
         let script = parse(text);
@@ -1290,5 +1443,17 @@ mod tests {
         let script = parse("echo 'héllo wörld' && printf \"ünï $(date)\"");
         assert!(script.complete);
         assert_eq!(script.commands().next().unwrap().words[1], "héllo wörld");
+    }
+
+    #[test]
+    fn cache_skips_oversized_entries_and_caps_total_bytes() {
+        let huge = format!("echo {}", "a".repeat(MAX_CACHE_ENTRY_BYTES + 16));
+        let first = parse(&huge);
+        let second = parse(&huge);
+        assert!(!Rc::ptr_eq(&first, &second), "oversized scripts must not be cached");
+        let small = "echo cached_ok";
+        let a = parse(small);
+        let b = parse(small);
+        assert!(Rc::ptr_eq(&a, &b), "normal scripts should still hit cache");
     }
 }

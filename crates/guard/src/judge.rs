@@ -51,6 +51,8 @@ pub struct Decision {
 }
 
 /// The judge's view of one call as one text: the call first, so a short context still sees it.
+/// Arguments are normalized onto one line (preventing forged `User's task:` headers) and keep
+/// both head and tail when long so trailing payloads cannot hide behind padding.
 pub fn build_state(task: &str, name: &str, args: &str, signals: &[Signal]) -> String {
     let length = task.chars().count();
     let task = if length > MAX_TASK {
@@ -58,16 +60,23 @@ pub fn build_state(task: &str, name: &str, args: &str, signals: &[Signal]) -> St
     } else {
         task.to_string()
     };
-    let args = if args.chars().count() > MAX_ARGS {
-        format!("{} [...]", args.chars().take(MAX_ARGS).collect::<String>())
+    let clean_name: String = name.chars().map(|c| if matches!(c, '\r' | '\n') { ' ' } else { c }).collect();
+    let single_line_args = args.replace('\r', "\\r").replace('\n', "\\n");
+    let args_len = single_line_args.chars().count();
+    let args = if args_len > MAX_ARGS {
+        let head_len = MAX_ARGS * 2 / 3;
+        let tail_len = MAX_ARGS - head_len;
+        let head: String = single_line_args.chars().take(head_len).collect();
+        let tail: String = single_line_args.chars().skip(args_len - tail_len).collect();
+        format!("{head} [...] {tail}")
     } else {
-        args.to_string()
+        single_line_args
     };
     let findings: Vec<String> = signals
         .iter()
         .map(|s| format!("{} ({}): {}", s.id, serde_json::to_value(s.severity).unwrap().as_str().unwrap(), s.title))
         .collect();
-    format!("Tool call: {name}\nArguments: {args}\nScanner findings: {}\n\nUser's task:\n{task}", findings.join("; "))
+    format!("Tool call: {clean_name}\nArguments: {args}\nScanner findings: {}\n\nUser's task:\n{task}", findings.join("; "))
 }
 
 /// Client for a decision model behind llama-server.
@@ -135,8 +144,9 @@ mod tests {
 
     #[test]
     fn long_arguments_and_tasks_are_cut() {
-        let state = build_state(&format!("start {}", "é".repeat(MAX_TASK)), "bash", &"é".repeat(MAX_ARGS + 10), &[]);
-        assert!(state.contains(&format!("Arguments: {} [...]\n", "é".repeat(MAX_ARGS))));
+        let state = build_state(&format!("start {}", "é".repeat(MAX_TASK)), "bash", &format!("{}TAIL", "é".repeat(MAX_ARGS + 10)), &[]);
+        assert!(state.contains(&format!("Arguments: {} [...] ", "é".repeat(MAX_ARGS * 2 / 3))));
+        assert!(state.contains("TAIL\nScanner findings:"));
         assert!(state.ends_with(&format!("User's task:\n[...] {}", "é".repeat(MAX_TASK))));
     }
 
