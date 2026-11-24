@@ -174,19 +174,22 @@ impl Conversations {
     /// Makes room for `bytes` more for `id`, whose old conversation it replaces, by deleting
     /// the least recently used others. False if it can't fit at all.
     fn make_room(&self, id: &str, bytes: u64) -> bool {
-        let limit = self.limit();
+        self.make_room_within(id, bytes, self.limit())
+    }
+
+    fn make_room_within(&self, id: &str, bytes: u64, limit: u64) -> bool {
         if bytes > limit {
             return false;
         }
         let others: Vec<Meta> = self.saved().into_iter().filter(|m| m.id != id).collect();
-        let mut total: u64 = others.iter().map(|m| m.bytes).sum();
+        let mut total: u64 = others.iter().fold(0u64, |acc, m| acc.saturating_add(m.bytes));
         for old in others {
-            if total + bytes <= limit {
+            if total.saturating_add(bytes) <= limit {
                 break;
             }
             tracing::info!("deleting the saved conversation of {} for room", old.id);
             self.remove(&old.id);
-            total -= old.bytes;
+            total = total.saturating_sub(old.bytes);
         }
         true
     }
@@ -328,12 +331,15 @@ mod tests {
         // Plenty of room: nothing goes.
         assert!(c.make_room("mine", 100));
         assert_eq!(c.summary().count, 3);
+        // Use a fixed limit for boundary checks so live disk fluctuations from parallel tests
+        // or the OS on low-free-space volumes can't race between `limit()` and `make_room()`.
+        const LIMIT: u64 = 500;
         // More than the limit alone: refused, nothing deleted.
-        assert!(!c.make_room("mine", c.limit() + 1));
+        assert!(!c.make_room_within("mine", LIMIT + 1, LIMIT));
         assert_eq!(c.summary().count, 3);
         // Room for all but 150 bytes beside the others: the oldest goes first, and `mine`
         // doesn't count, since the new one replaces it.
-        assert!(c.make_room("mine", c.limit() - 150));
+        assert!(c.make_room_within("mine", LIMIT - 150, LIMIT));
         let left: Vec<String> = c.saved().into_iter().map(|m| m.id).collect();
         assert_eq!(left, ["newer", "mine"]);
         std::fs::remove_dir_all(&c.dir).ok();
