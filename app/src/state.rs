@@ -607,16 +607,11 @@ impl App {
         let load_id = self.next_load_id.fetch_add(1, Ordering::Relaxed);
         let file_key = Self::model_file_key(id);
         // Check the room and claim it in one go, so two loads can't both take it.
-        let (mut fit, mut prompt_cache) = {
+        let claimed = 'claim: {
             let mut models = self.models.lock().unwrap();
             if let Some(existing) = models.iter().find(|m| m.id == id) {
                 match existing.state {
-                    LoadState::Running { .. } => {
-                        drop(models);
-                        self.touch(id);
-                        self.sync_upstreams().await;
-                        return Ok(());
-                    }
+                    LoadState::Running { .. } => break 'claim None,
                     LoadState::Loading => bail!("{} is already loading", model.model.name),
                     LoadState::Failed { .. } => {}
                 }
@@ -640,7 +635,12 @@ impl App {
             models.retain(|m| m.id != id);
             let state = LoadState::Loading;
             models.insert(0, LoadedModel { id: id.to_string(), name: model.model.name.clone(), alias: model.alias.clone(), state, memory: fit.required, ram: fit.required + prompt_cache, load_id });
-            (fit, prompt_cache)
+            Some((fit, prompt_cache))
+        };
+        let Some((mut fit, mut prompt_cache)) = claimed else {
+            self.touch(id);
+            self.sync_upstreams().await;
+            return Ok(());
         };
         changed();
         tracing::info!("{}: {}k context, {} MiB for saved conversations", model.alias, fit.context / 1024, prompt_cache >> 20);
