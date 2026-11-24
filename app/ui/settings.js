@@ -254,10 +254,15 @@ $("use-other-apps").addEventListener("change", async (event) => {
 });
 $("rescan").addEventListener("click", async () => {
   $("rescan").disabled = true;
-  renderOtherApps(await invoke("rescan_models"));
-  $("rescan").disabled = false;
-  await renderInstalled();
-  renderOffers();
+  try {
+    renderOtherApps(await invoke("rescan_models"));
+    await renderInstalled();
+    renderOffers();
+  } catch (e) {
+    alert(e);
+  } finally {
+    $("rescan").disabled = false;
+  }
 });
 
 const diskGb = (bytes) => `${(bytes / 1e9).toFixed(1)} GB`;
@@ -452,8 +457,8 @@ function listEditor(items, placeholder, onChange) {
       }
     });
     box.replaceChildren(
-      items.length ? el("div", { class: "chips" }, items.map((item, i) => el("span", { class: "chip removable" }, item, el("button", { title: "Remove", onclick: () => { items.splice(i, 1); onChange(); render(); } }, "×")))) : null,
-      el("div", { class: "row" }, input, el("button", { onclick: add }, "Add")),
+      ...(items.length ? [el("div", { class: "chips" }, items.map((item, i) => el("span", { class: "chip removable" }, item, el("button", { type: "button", title: "Remove", "aria-label": `Remove ${item}`, onclick: () => { items.splice(i, 1); onChange(); render(); } }, "×"))))] : []),
+      el("div", { class: "row" }, input, el("button", { type: "button", onclick: add }, "Add")),
     );
   };
   render();
@@ -699,10 +704,21 @@ async function renderCalls() {
   for (const call of calls) list.append(callRow(call));
 }
 
+const MAX_CALL_ROWS = 200;
 listen("guard-call", ({ payload }) => {
   const list = $("calls");
   if (list.querySelector("p")) list.replaceChildren();
   list.prepend(callRow(payload));
+  while (list.children.length > MAX_CALL_ROWS) list.lastElementChild.remove();
+});
+listen("discovery", async () => {
+  await refreshInstalledIds();
+  renderLocalCount();
+  renderOffers();
+  if (modelFilter === "local") {
+    renderInstalled();
+    invoke("other_apps").then(renderOtherApps);
+  }
 });
 
 // --- Start ---

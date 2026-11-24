@@ -164,14 +164,26 @@ impl Script {
     }
 }
 
+const MAX_CACHE_ENTRIES: usize = 512;
+const MAX_CACHE_ENTRY_BYTES: usize = 64 * 1024;
+const MAX_CACHE_TOTAL_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Default)]
+struct ParseCache {
+    entries: HashMap<String, Rc<Script>>,
+    bytes: usize,
+}
+
 thread_local! {
-    static CACHE: RefCell<HashMap<String, Rc<Script>>> = RefCell::new(HashMap::new());
+    static CACHE: RefCell<ParseCache> = RefCell::new(ParseCache::default());
 }
 
 /// Parses `text`. Never fails: anything the reader trips over makes the script
 /// incomplete. Cached per thread (several checks read the same command).
 pub fn parse(text: &str) -> Rc<Script> {
-    if let Some(found) = CACHE.with(|c| c.borrow().get(text).cloned()) {
+    if text.len() <= MAX_CACHE_ENTRY_BYTES
+        && let Some(found) = CACHE.with(|c| c.borrow().entries.get(text).cloned())
+    {
         return found;
     }
     let mut script = Script::new();
@@ -180,13 +192,18 @@ pub fn parse(text: &str) -> Rc<Script> {
     script.complete = reader.complete;
     propagate_scope(&mut script);
     let script = Rc::new(script);
-    CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        if cache.len() >= 512 {
-            cache.clear();
-        }
-        cache.insert(text.to_string(), script.clone());
-    });
+    if text.len() <= MAX_CACHE_ENTRY_BYTES {
+        CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            if cache.entries.len() >= MAX_CACHE_ENTRIES || cache.bytes + text.len() > MAX_CACHE_TOTAL_BYTES {
+                cache.entries.clear();
+                cache.bytes = 0;
+            }
+            if cache.entries.insert(text.to_string(), script.clone()).is_none() {
+                cache.bytes += text.len();
+            }
+        });
+    }
     script
 }
 
@@ -1426,5 +1443,17 @@ mod tests {
         let script = parse("echo 'héllo wörld' && printf \"ünï $(date)\"");
         assert!(script.complete);
         assert_eq!(script.commands().next().unwrap().words[1], "héllo wörld");
+    }
+
+    #[test]
+    fn cache_skips_oversized_entries_and_caps_total_bytes() {
+        let huge = format!("echo {}", "a".repeat(MAX_CACHE_ENTRY_BYTES + 16));
+        let first = parse(&huge);
+        let second = parse(&huge);
+        assert!(!Rc::ptr_eq(&first, &second), "oversized scripts must not be cached");
+        let small = "echo cached_ok";
+        let a = parse(small);
+        let b = parse(small);
+        assert!(Rc::ptr_eq(&a, &b), "normal scripts should still hit cache");
     }
 }

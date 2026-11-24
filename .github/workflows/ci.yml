@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Test and lint
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check version consistency
+        run: |
+          python3 - <<'EOF'
+          import json, tomllib
+          tauri = json.load(open("app/tauri.conf.json"))["version"]
+          cargo = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
+          assert tauri == cargo, f"Version mismatch: app/tauri.conf.json={tauri}, Cargo.toml={cargo}"
+          EOF
+
+      - name: Check UI JavaScript syntax
+        run: |
+          for file in app/ui/*.js; do
+            node --check "$file"
+          done
+
+      - name: Install Rust
+        run: rustup update stable
+
+      - name: Clippy
+        run: cargo clippy -p superviser-core -p superviser-guard -p superviser-scan --all-targets -- -D warnings
+
+      - name: Test crates
+        run: cargo test -p superviser-core -p superviser-guard -p superviser-scan

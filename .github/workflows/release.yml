@@ -39,6 +39,10 @@ jobs:
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "::error::The tag $GITHUB_REF_NAME doesn't match version $version in app/tauri.conf.json"; exit 1
           fi
+          cargo_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [ "$cargo_version" != "$version" ]; then
+            echo "::error::Cargo.toml workspace version $cargo_version doesn't match app/tauri.conf.json version $version"; exit 1
+          fi
           pubkey=$(python3 -c 'import json; print(json.load(open("app/tauri.conf.json"))["plugins"]["updater"]["pubkey"])')
           if [ -z "$pubkey" ]; then
             echo "::error::app/tauri.conf.json has no updater public key (plugins.updater.pubkey); see README → Releases"; exit 1
@@ -91,6 +95,11 @@ jobs:
           done
           codesign --verify --strict --verbose=2 app/binaries/opencode/opencode
           codesign -dv app/binaries/opencode/opencode 2>&1 | grep -q 'flags=.*runtime' || { echo "::error::OpenCode isn't signed with the hardened runtime"; exit 1; }
+
+      - name: Run workspace tests
+        run: |
+          cargo clippy -p superviser-core -p superviser-guard -p superviser-scan --all-targets -- -D warnings
+          cargo test --workspace
 
       - name: Build, sign and notarize the app
         working-directory: app

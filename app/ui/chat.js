@@ -89,12 +89,25 @@ async function linkPath(node, path) {
   const info = await fileInfo.get(key);
   if (!info || node.dataset.path !== path) return;
   node.classList.add("path-link");
+  node.tabIndex = 0;
+  node.setAttribute("role", "button");
   node.title = info.runs_code ? "Could run as a program: click for options" : `${info.is_dir ? "Show in Finder" : "Open"}; right-click for more`;
   node.onclick = (event) => {
     event.preventDefault();
     event.stopPropagation();
     if (info.runs_code) fileMenu(event, info);
     else openFile(info.path, "default");
+  };
+  node.onkeydown = (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (info.runs_code) {
+      const rect = node.getBoundingClientRect();
+      fileMenu({ clientX: rect.left, clientY: rect.bottom }, info);
+    } else {
+      openFile(info.path, "default");
+    }
   };
   node.oncontextmenu = (event) => {
     event.preventDefault();
@@ -156,6 +169,8 @@ function clearView() {
 
 function appendUser(id, text) {
   list().querySelector(".empty")?.remove();
+  view.texts.delete("current");
+  view.thoughts.delete("current");
   let entry = id && view.users.get(id);
   if (!entry) {
     entry = { node: el("div", { class: "msg user" }), text: "" };
@@ -165,6 +180,7 @@ function appendUser(id, text) {
   entry.text += text;
   entry.node.textContent = entry.text;
   scrollDown();
+  return entry.node;
 }
 
 // A reply's text grows chunk by chunk; `set` replaces it (the built-in agent sends it whole).
@@ -181,7 +197,7 @@ function agentText(id, text, set = false) {
   const notes = lines.filter((l) => l.startsWith("[guard]"));
   const rest = lines.filter((l) => !l.startsWith("[guard]")).join("\n");
   entry.node.replaceChildren(
-    rest.trim() ? richText(rest) : null,
+    ...(rest.trim() ? [richText(rest)] : []),
     ...notes.map((line) => el("div", { class: "guard-note" }, line.replace(/^\[guard\] blocked call to (`[^`]+`)/, "The guard blocked a $1 call").replace(/^\[guard\]\s*/, "The guard: "))),
   );
   entry.node.hidden = !rest.trim() && !notes.length;
@@ -367,51 +383,56 @@ function scrollDown() {
 // --- The two engines ---
 
 const opencode = {
-  async sessions() {
-    const sessions = await invoke("acp_sessions", { project: project.id });
+  async sessions(projectId = project?.id) {
+    const sessions = await invoke("acp_sessions", { project: projectId });
     return sessions.map((s) => ({ id: s.sessionId, title: s.title?.startsWith("New session - ") ? "New chat" : s.title || "Chat" }));
   },
   // Replays the session as events while it opens.
-  async open(id) {
-    const opened = await invoke("acp_open", { project: project.id, session: id });
+  async open(id, projectId = project?.id) {
+    const opened = await invoke("acp_open", { project: projectId, session: id });
     return opened.busy;
   },
-  async send(text) {
-    if (!session) {
+  async send(text, { projectId = project?.id, sessionId = session, model = chatModel, onSession } = {}) {
+    let target = sessionId;
+    if (!target) {
       awaiting = true;
       try {
-        session = (await invoke("acp_open", { project: project.id, session: null })).session;
+        target = (await invoke("acp_open", { project: projectId, session: null })).session;
+        onSession?.(target);
       } finally {
         awaiting = false;
       }
     }
-    await invoke("acp_prompt", { project: project.id, session, text, model: chatModel });
+    await invoke("acp_prompt", { project: projectId, session: target, text, model });
+    return target;
   },
-  stop: () => invoke("acp_cancel", { project: project.id, session }),
-  remove: (id) => invoke("acp_delete", { project: project.id, session: id }),
+  stop: (projectId = project?.id, sessionId = session) => invoke("acp_cancel", { project: projectId, session: sessionId }),
+  remove: (id, projectId = project?.id) => invoke("acp_delete", { project: projectId, session: id }),
 };
 
 // The built-in agent keeps OpenAI-style messages; these become the same updates.
 const builtin = {
   live: 0,
-  async sessions() {
-    return (await invoke("chat_list", { project: project.id })).map((c) => ({ id: c.id, title: c.title }));
+  async sessions(projectId = project?.id) {
+    return (await invoke("chat_list", { project: projectId })).map((c) => ({ id: c.id, title: c.title }));
   },
-  async open(id) {
-    const chat = await invoke("chat_load", { project: project.id, id });
+  async open(id, projectId = project?.id) {
+    const chat = await invoke("chat_load", { project: projectId, id });
     chat.messages.forEach((message, i) => this.message(message, `m${i}`, true));
     return chat.busy;
   },
-  async send(text) {
-    awaiting = !session;
+  async send(text, { projectId = project?.id, sessionId = session, model = chatModel, onSession } = {}) {
+    awaiting = !sessionId;
     try {
-      session = await invoke("chat_send", { project: project.id, chat: session, text, model: chatModel });
+      const id = await invoke("chat_send", { project: projectId, chat: sessionId, text, model });
+      onSession?.(id);
+      return id;
     } finally {
       awaiting = false;
     }
   },
-  stop: () => invoke("chat_stop", { chat: session }),
-  remove: (id) => invoke("chat_delete", { project: project.id, id }),
+  stop: (_projectId = project?.id, sessionId = session) => invoke("chat_stop", { chat: sessionId }),
+  remove: (id, projectId = project?.id) => invoke("chat_delete", { project: projectId, id }),
   message(message, id, replay) {
     if (message.role === "user") {
       if (replay) appendUser(id, message.content || "");
@@ -487,57 +508,91 @@ function emptyState() {
   );
 }
 
+let chatGen = 0;
+let listGen = 0;
+let projectGen = 0;
+const SEND_CANCELLED = Symbol("cancelled");
+let sending = null; // active send() pre-dispatch cancellation handle
+
 async function showChat(id) {
+  const mine = ++chatGen;
+  if (sending) {
+    sending.cancel();
+    sending = null;
+  }
+  const proj = project;
   session = id;
   busy = false;
   usage = null;
+  if (!awaiting) pending.length = 0;
   clearView();
   $("usage").textContent = "";
   $("title").textContent = "New chat";
-  if (id && project) {
+  if (id && proj) {
     try {
-      busy = await engines[engine].open(id);
+      const isBusy = await engines[engine].open(id, proj.id);
+      if (mine !== chatGen) return;
+      busy = isBusy;
     } catch (e) {
+      if (mine !== chatGen) return;
       list().append(el("div", { class: "banner bad" }, String(e)));
     }
   } else {
     list().append(emptyState());
   }
   // Its own model, unless that one was deleted since.
-  const own = id && project ? await invoke("chat_model", { project: project.id, chat: id }).catch(() => null) : null;
+  const own = id && proj ? await invoke("chat_model", { project: proj.id, chat: id }).catch(() => null) : null;
+  if (mine !== chatGen) return;
   chatModel = models.some((m) => m.id === own) ? own : defaultModel();
   await refreshRoom();
+  if (mine !== chatGen) return;
   list().scrollTop = list().scrollHeight;
   await renderChatList();
+  if (mine !== chatGen) return;
   update();
 }
 
 let chatTitles = new Map();
 async function renderChatList() {
+  const mine = ++listGen;
   const box = $("chat-list");
-  if (!project) return box.replaceChildren();
+  const proj = project;
+  if (!proj) return box.replaceChildren();
   let chats = [];
   // A Linux VM takes a few seconds to start, more the first time.
-  if (box.dataset.project !== project.id && project.isolation === "linux-vm") box.replaceChildren(el("p", { class: "small muted" }, "Starting the Linux VM…"));
+  if (box.dataset.project !== proj.id && proj.isolation === "linux-vm") box.replaceChildren(el("p", { class: "small muted" }, "Starting the Linux VM…"));
   try {
-    chats = await engines[engine].sessions();
+    chats = await engines[engine].sessions(proj.id);
   } catch (e) {
+    if (mine !== listGen || proj.id !== project?.id) return;
     box.replaceChildren(el("p", { class: "small muted" }, String(e)));
     return;
   }
-  box.dataset.project = project.id;
-  archived = new Set(await invoke("archived_chats", { project: project.id }).catch(() => []));
+  if (mine !== listGen || proj.id !== project?.id) return;
+  box.dataset.project = proj.id;
+  const archivedList = await invoke("archived_chats", { project: proj.id }).catch(() => []);
+  if (mine !== listGen || proj.id !== project?.id) return;
+  archived = new Set(archivedList);
   chatTitles = new Map(chats.map((c) => [c.id, c.title]));
   if (session && chatTitles.has(session)) $("title").textContent = chatTitles.get(session);
   const item = (chat) =>
     el(
       "div",
-      { class: `chat-item${chat.id === session ? " active" : ""}`, onclick: () => showChat(chat.id) },
-      el("span", { class: "chat-item-title" }, chat.title),
+      { class: `chat-item${chat.id === session ? " active" : ""}` },
+      el(
+        "button",
+        {
+          type: "button",
+          class: "chat-item-title",
+          "aria-current": chat.id === session ? "true" : null,
+          onclick: () => showChat(chat.id),
+        },
+        chat.title,
+      ),
       archived.has(chat.id)
-        ? el("button", { class: "chat-item-action", title: "Put back in the list", onclick: (event) => { event.stopPropagation(); archiveChat(chat.id, false); } }, "↩")
-        : el("button", { class: "chat-item-action", title: "Archive chat", onclick: (event) => { event.stopPropagation(); archiveChat(chat.id, true); } }, "⤓"),
-      el("button", { class: "chat-item-action", title: "Delete chat", onclick: (event) => { event.stopPropagation(); deleteChat(chat); } }, "×"),
+        ? el("button", { type: "button", class: "chat-item-action", title: "Put back in the list", "aria-label": `Put "${chat.title}" back in the list`, onclick: () => archiveChat(chat.id, false) }, "↩")
+        : el("button", { type: "button", class: "chat-item-action", title: "Archive chat", "aria-label": `Archive "${chat.title}"`, onclick: () => archiveChat(chat.id, true) }, "⤓"),
+      el("button", { type: "button", class: "chat-item-action", title: "Delete chat", "aria-label": `Delete "${chat.title}"`, onclick: () => deleteChat(chat) }, "×"),
     );
   const kept = chats.filter((c) => archived.has(c.id));
   const more = el("details", { class: "archived-chats" }, el("summary", { class: "small muted" }, `Archived (${kept.length})`), ...kept.map(item));
@@ -549,23 +604,29 @@ async function renderChatList() {
 
 // Archived chats are kept, out of the list; sending in one puts it back.
 async function archiveChat(id, archive) {
+  const proj = project;
+  if (!proj) return;
   try {
-    await invoke("set_chat_archived", { project: project.id, chat: id, archived: archive });
+    await invoke("set_chat_archived", { project: proj.id, chat: id, archived: archive });
   } catch (e) {
     alert(e);
     return;
   }
+  if (proj.id !== project?.id) return;
   if (archive && id === session) showChat(null);
   else renderChatList();
 }
 
 async function deleteChat(chat) {
+  const proj = project;
+  if (!proj) return;
   if (!confirm(`Delete “${chat.title}”?`)) return;
   try {
-    await engines[engine].remove(chat.id);
+    await engines[engine].remove(chat.id, proj.id);
   } catch (e) {
     alert(e);
   }
+  if (proj.id !== project?.id) return;
   if (chat.id === session) showChat(null);
   else renderChatList();
 }
@@ -581,7 +642,9 @@ async function loadProjects() {
 
 // Shows `id` (or the current, or most recent project) with a new chat. The app calls it too.
 async function openProject(id) {
+  const mine = ++projectGen;
   await loadProjects();
+  if (mine !== projectGen) return;
   project = projects.find((p) => p.id === id) || projects.find((p) => p.id === project?.id) || projects[0] || null;
   $("project").value = project?.id || "";
   $("where").textContent = project ? `· ${project.folders[0].path}` : "";
@@ -750,6 +813,10 @@ async function newProject() {
 
 function finished(error, stopReason) {
   busy = false;
+  view.texts.delete("current");
+  view.texts.delete("live-text");
+  view.thoughts.delete("current");
+  view.thoughts.delete("live-thought");
   if (stopReason === "cancelled") list().append(el("div", { class: "small muted stopped" }, "Stopped."));
   if (error) list().append(el("div", { class: "banner bad" }, error));
   renderChatList();
@@ -808,51 +875,138 @@ function deliver(handler) {
 listen("acp", deliver(onOpencode));
 listen("chat", deliver(onBuiltin));
 listen("status", refreshStatus);
+listen("discovery", loadModels);
 listen("projects", async () => {
   await loadProjects();
-  project = projects.find((p) => p.id === project?.id) || project;
-  $("project").value = project?.id || "";
-  update();
+  const found = project ? projects.find((p) => p.id === project.id) : null;
+  if (found) {
+    project = found;
+    $("project").value = project.id;
+    $("where").textContent = `· ${project.folders[0].path}`;
+    update();
+  } else if (project || projects.length) {
+    await openProject(projects[0]?.id || "");
+  } else {
+    $("project").value = "";
+    $("where").textContent = "";
+    update();
+  }
 });
 
 async function send(text) {
+  const proj = project;
+  const startSession = session;
+  const modelId = chatModel;
+  const startGen = chatGen;
+  if (!proj || !modelId) return;
+
   list().querySelector(".empty")?.remove();
-  appendUser(null, text);
+  const userNode = appendUser(null, text);
   busy = true;
+  let resolveAbort;
+  const aborted = new Promise((resolve) => (resolveAbort = resolve));
+  const token = {
+    cancelled: false,
+    cancel() {
+      if (this.cancelled) return;
+      this.cancelled = true;
+      resolveAbort(SEND_CANCELLED);
+    },
+  };
+  sending = token;
+  const raceAbort = (p) => {
+    p.catch(() => {});
+    return Promise.race([p, aborted]);
+  };
+  const checkActive = () => {
+    if (startGen !== chatGen) return "switched";
+    if (token.cancelled) return "cancelled";
+    return null;
+  };
   update();
   try {
     // Already loading (setup starts it with the chat): wait for it rather than load it twice,
     // and if it fails, say so instead of trying again.
     let waited = false;
-    while (isLoading(chatModel)) {
+    while (isLoading(modelId)) {
       waited = true;
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      await refreshStatus();
+      const r = await raceAbort(new Promise((resolve) => setTimeout(resolve, 500)));
+      if (r === SEND_CANCELLED || checkActive()) break;
+      await raceAbort(refreshStatus());
+      if (checkActive()) break;
     }
-    if (waited && !isLoaded(chatModel)) {
-      const failed = loadedModels.find((m) => m.id === chatModel && m.state === "failed");
-      throw `Not sent: ${modelName(chatModel)} couldn't start${failed?.error ? `: ${failed.error}` : "."}`;
+    const afterWait = checkActive();
+    if (afterWait === "switched") return;
+    if (afterWait === "cancelled") throw SEND_CANCELLED;
+    if (waited && !isLoaded(modelId)) {
+      const failed = loadedModels.find((m) => m.id === modelId && m.state === "failed");
+      throw `Not sent: ${modelName(modelId)} couldn't start${failed?.error ? `: ${failed.error}` : "."}`;
     }
     // The chat's model answers; load it if it isn't, making room if needed.
-    if (!isLoaded(chatModel)) {
-      const needed = await invoke("room_for", { id: chatModel });
+    if (!isLoaded(modelId)) {
+      const needed = await raceAbort(invoke("room_for", { id: modelId }));
+      const afterRoom = checkActive();
+      if (afterRoom === "switched") return;
+      if (afterRoom === "cancelled" || needed === SEND_CANCELLED) throw SEND_CANCELLED;
       if (!needed.fits) {
         const names = needed.unload.map((id) => loadedModels.find((m) => m.id === id)?.name || id);
-        if (!confirm(`Loading ${modelName(chatModel)} needs the memory ${names.join(" and ")} ${names.length === 1 ? "uses" : "use"}. Unload ${names.length === 1 ? "it" : "them"}?`)) throw "Not sent: the chat's model isn't loaded.";
-        for (const id of needed.unload) await invoke("unload_model", { id });
+        if (!confirm(`Loading ${modelName(modelId)} needs the memory ${names.join(" and ")} ${names.length === 1 ? "uses" : "use"}. Unload ${names.length === 1 ? "it" : "them"}?`)) throw "Not sent: the chat's model isn't loaded.";
+        const afterConfirm = checkActive();
+        if (afterConfirm === "switched") return;
+        if (afterConfirm === "cancelled") throw SEND_CANCELLED;
+        for (const id of needed.unload) {
+          await raceAbort(invoke("unload_model", { id }));
+          const afterUnload = checkActive();
+          if (afterUnload === "switched") return;
+          if (afterUnload === "cancelled") throw SEND_CANCELLED;
+        }
       }
-      await invoke("load_model", { id: chatModel });
-      await refreshStatus();
+      const loadRes = await raceAbort(invoke("load_model", { id: modelId }));
+      const afterLoad = checkActive();
+      if (afterLoad === "switched") return;
+      if (afterLoad === "cancelled" || loadRes === SEND_CANCELLED) throw SEND_CANCELLED;
+      await raceAbort(refreshStatus());
+      const afterStatus = checkActive();
+      if (afterStatus === "switched") return;
+      if (afterStatus === "cancelled") throw SEND_CANCELLED;
     }
-    if (session && archived.has(session)) await invoke("set_chat_archived", { project: project.id, chat: session, archived: false }).then(() => archived.delete(session)).catch(() => {});
-    await engines[engine].send(text);
-    if (session) invoke("set_chat_model", { project: project.id, chat: session, model: chatModel }).catch(() => {});
+    if (startSession && archived.has(startSession)) {
+      await invoke("set_chat_archived", { project: proj.id, chat: startSession, archived: false })
+        .then(() => {
+          if (startGen === chatGen) archived.delete(startSession);
+        })
+        .catch(() => {});
+      const afterUnarchive = checkActive();
+      if (afterUnarchive === "switched") return;
+      if (afterUnarchive === "cancelled") throw SEND_CANCELLED;
+    }
+    const targetSession = await engines[engine].send(text, {
+      projectId: proj.id,
+      sessionId: startSession,
+      model: modelId,
+      onSession: (id) => {
+        if (startGen === chatGen) session = id;
+      },
+    });
+    if (token.cancelled && targetSession) {
+      engines[engine].stop(proj.id, targetSession).catch(() => {});
+    }
+    if (targetSession) invoke("set_chat_model", { project: proj.id, chat: targetSession, model: modelId }).catch(() => {});
   } catch (e) {
-    // Not sent: give the message back, so it isn't lost.
+    if (startGen !== chatGen) return;
+    // Not sent: remove the unsent bubble and give the message back, so it isn't lost or duplicated.
+    userNode?.remove();
     if (!$("input").value) $("input").value = text;
-    finished(String(e), null);
+    if (e === SEND_CANCELLED) {
+      if (!list().querySelector(".msg") && !session) list().append(emptyState());
+      finished(null, "cancelled");
+    } else {
+      finished(String(e), null);
+    }
+  } finally {
+    if (sending === token) sending = null;
+    for (const run of pending.splice(0)) run();
   }
-  for (const run of pending.splice(0)) run();
 }
 
 $("composer").addEventListener("submit", (event) => {
@@ -868,7 +1022,10 @@ $("input").addEventListener("keydown", (event) => {
     $("composer").requestSubmit();
   }
 });
-$("stop").addEventListener("click", () => session && engines[engine].stop());
+$("stop").addEventListener("click", () => {
+  if (sending) sending.cancel();
+  if (session) engines[engine].stop(project?.id, session).catch(() => {});
+});
 $("new-chat").addEventListener("click", () => showChat(null));
 $("archive").addEventListener("click", () => session && archiveChat(session, true));
 $("project").addEventListener("change", () => openProject($("project").value));
