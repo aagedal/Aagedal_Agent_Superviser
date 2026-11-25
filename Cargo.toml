@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/guard", "crates/scan", "app"]
+members = ["crates/core", "crates/guard", "crates/scan", "app", "app-gpui"]
 
 [workspace.package]
 version = "0.1.0"
