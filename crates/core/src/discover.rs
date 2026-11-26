@@ -375,7 +375,8 @@ fn evaluate(candidate: Candidate) -> Result<InstalledModel, String> {
     if let Some(kind) = info.kind.as_deref().filter(|k| *k != "model") {
         return Err(format!("a {kind} file, not a model"));
     }
-    if info.is_draft() || entry.rsplit('/').next().is_some_and(|f| f.to_ascii_lowercase().starts_with("mtp-")) {
+    let filename = entry.rsplit('/').next().unwrap_or(&entry);
+    if info.draft_kind(filename).is_some() {
         return Err("a speculative-decoding draft, not a model on its own".into());
     }
     if info.ints.contains_key("pooling_type") {
@@ -429,6 +430,7 @@ fn evaluate(candidate: Candidate) -> Result<InstalledModel, String> {
             kv_fixed_bytes: info.kv_cache().map_or(0, |kv| kv.fixed),
             sampling: None,
             reasoning_budget: None,
+            spec_draft_n_max: None,
             quant: QuantGroup { label, files, size },
         },
         installed_at,

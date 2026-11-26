@@ -9,11 +9,14 @@ pub mod agent;
 pub mod events;
 pub mod explain;
 pub mod files;
+pub mod git;
 pub mod skills;
 pub mod state;
+pub mod subagents;
 
 pub use events::{AcpEvent, AppEvent, ChatEvent, DownloadEvent, EventBus};
 pub use state::{
     App, DEFAULT_GUARD_PORT, JUDGE_DOWNLOAD, JUDGE_NAME, JudgeStatus, LoadState, LoadedModel,
     ReasoningLevel, Room, ServerStatus, Settings,
 };
+pub use subagents::{SubagentRecord, SubagentState, SubagentStep};

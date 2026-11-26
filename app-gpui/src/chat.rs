@@ -26,7 +26,10 @@ use gpui_kit::{
 };
 use serde_json::Value;
 use superviser_backend::explain::{self, TokenKind};
+use superviser_backend::files;
+use superviser_backend::git::{self, GitStatus};
 use superviser_backend::skills::{self, Skill, SkillScope};
+use superviser_backend::subagents::{self, SubagentRecord, SubagentState};
 use superviser_backend::{AcpEvent, AppEvent, ChatEvent, JudgeStatus, LoadState, ReasoningLevel};
 use superviser_core::agent::Chat;
 use superviser_core::opencode;
@@ -163,6 +166,24 @@ struct SkillEditor {
     editing_original: Option<Skill>,
 }
 
+enum GitPanel {
+    Commit {
+        message_input: Entity<InputState>,
+    },
+    Pr {
+        title_input: Entity<InputState>,
+        body_input: Entity<TextareaState>,
+        draft: bool,
+    },
+}
+
+#[derive(Clone)]
+struct GitNotice {
+    text: String,
+    url: Option<String>,
+    is_error: bool,
+}
+
 #[derive(Clone)]
 enum ModelExplainState {
     Loading { model_name: String },
@@ -277,6 +298,14 @@ pub struct ChatWindow {
     skill_editor: Option<SkillEditor>,
     skill_drafting: bool,
     skill_notice: Option<(String, bool)>,
+    git_status: Option<GitStatus>,
+    git_gen: u64,
+    git_panel: Option<GitPanel>,
+    git_busy: Option<String>,
+    git_drafting: bool,
+    git_notice: Option<GitNotice>,
+    subagents: Vec<SubagentRecord>,
+    inspected_subagent: Option<String>,
     _composer_sub: Subscription,
 }
 
@@ -342,13 +371,15 @@ impl ChatWindow {
         })
         .detach();
 
-        // 1-second tick for the elapsed "Working… Xs" timer while busy.
+        // 1-second tick for the elapsed "Working… Xs" and live sub-agent timers.
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let alive = this
                     .update(cx, |this, cx| {
-                        if this.busy {
+                        let any_subagent_running =
+                            this.subagents.iter().any(|s| s.state.is_active());
+                        if this.busy || any_subagent_running {
                             cx.notify();
                         }
                     })
@@ -404,12 +435,21 @@ impl ChatWindow {
             skill_editor: None,
             skill_drafting: false,
             skill_notice: None,
+            git_status: None,
+            git_gen: 0,
+            git_panel: None,
+            git_busy: None,
+            git_drafting: false,
+            git_notice: None,
+            subagents: Vec::new(),
+            inspected_subagent: None,
             _composer_sub: composer_sub,
         };
 
         this.refresh_skills();
         if selected_project.is_some() {
             this.refresh_sessions(cx);
+            this.refresh_git(true, cx);
         }
         this
     }
@@ -627,9 +667,13 @@ impl ChatWindow {
         self.project_select = select;
         self.project_sub = sub;
         if self.selected_project != prev {
+            self.git_panel = None;
+            self.git_notice = None;
+            self.git_status = None;
             self.refresh_skills();
             self.show_chat(None, window, cx);
             self.refresh_sessions(cx);
+            self.refresh_git(true, cx);
         }
     }
 
@@ -687,9 +731,13 @@ impl ChatWindow {
             Self::make_project_select(&self.backend, self.selected_project.as_deref(), window, cx);
         self.project_select = select;
         self.project_sub = sub;
+        self.git_panel = None;
+        self.git_notice = None;
+        self.git_status = None;
         self.refresh_skills();
         self.show_chat(None, window, cx);
         self.refresh_sessions(cx);
+        self.refresh_git(true, cx);
     }
 
     fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
@@ -797,6 +845,11 @@ impl ChatWindow {
         self.working_phase = WorkingPhase::ReadingPrompt;
         self.pending_send = None;
         self.confirm_delete_chat = None;
+        self.inspected_subagent = None;
+        self.subagents = match (&self.selected_project, &session_id) {
+            (Some(pid), Some(sid)) => self.backend.app.subagents.for_session(pid, sid),
+            _ => Vec::new(),
+        };
         if !self.creating_session {
             self.buffered_events.clear();
         }
@@ -1288,6 +1341,11 @@ impl ChatWindow {
                         }
                         this.archived.remove(&target_session);
                         this.active_session = Some(target_session.clone());
+                        this.subagents = this
+                            .backend
+                            .app
+                            .subagents
+                            .for_session(&pid, &target_session);
                         this.working_since_by_session
                             .entry(target_session.clone())
                             .or_insert(started_at);
@@ -1418,7 +1476,9 @@ impl ChatWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.creating_session && matches!(event, AppEvent::Acp(_) | AppEvent::Chat(_)) {
+        if self.creating_session
+            && matches!(event, AppEvent::Acp(_) | AppEvent::Chat(_) | AppEvent::Subagent(_))
+        {
             self.buffered_events.push(event);
             return;
         }
@@ -1441,6 +1501,7 @@ impl ChatWindow {
             }
             AppEvent::Acp(ev) => self.handle_acp_event(ev, cx),
             AppEvent::Chat(ev) => self.handle_chat_event(ev, cx),
+            AppEvent::Subagent(rec) => self.handle_subagent_event(rec, cx),
             AppEvent::Download(dl) if dl.finished => {
                 self.rebuild_model_select(window, cx);
                 cx.notify();
@@ -1694,6 +1755,7 @@ impl ChatWindow {
             });
         }
         self.refresh_sessions(cx);
+        self.refresh_git(false, cx);
         self.scroll_if_following();
     }
 
@@ -3204,6 +3266,9 @@ impl ChatWindow {
                         .child(format_guard_note(note))
                 })),
             ChatBlock::ToolCall(tc) => {
+                if let Some(sub) = self.subagents.iter().find(|s| s.id == tc.call_id).cloned() {
+                    return self.render_inline_subagent_card(tc.id, &sub, p, cx);
+                }
                 let ToolCallBlock {
                     id,
                     kind,
@@ -3508,6 +3573,1310 @@ impl ChatWindow {
                     })),
             )
     }
+    // --- First-class Sub-Agent tracking UI (T3 Code-style strip + inspector drawer) ---
+
+    fn handle_subagent_event(&mut self, rec: SubagentRecord, cx: &mut Context<Self>) {
+        if self.selected_project.as_deref() != Some(rec.project.as_str())
+            || self.active_session.as_deref() != Some(rec.parent_session.as_str())
+        {
+            return;
+        }
+        if let Some(existing) = self.subagents.iter_mut().find(|s| s.id == rec.id) {
+            *existing = rec;
+        } else {
+            self.subagents.push(rec);
+        }
+        cx.notify();
+    }
+
+    fn toggle_inspect_subagent(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.inspected_subagent.as_deref() == Some(id.as_str()) {
+            self.inspected_subagent = None;
+        } else {
+            self.inspected_subagent = Some(id);
+        }
+        cx.notify();
+    }
+
+    fn cancel_subagent(&mut self, id: String, cx: &mut Context<Self>) {
+        let app = self.backend.app.clone();
+        app.subagents.cancel(&id, &app.bus);
+        cx.notify();
+    }
+
+    fn subagent_elapsed(rec: &SubagentRecord) -> String {
+        let end = rec.finished_ms.unwrap_or_else(subagents::now_ms);
+        let secs = end.saturating_sub(rec.started_ms) / 1000;
+        format_elapsed(secs)
+    }
+
+    fn subagent_status_visual(
+        state: SubagentState,
+        p: crate::theme::Palette,
+    ) -> (&'static str, Hsla) {
+        match state {
+            SubagentState::Running => ("●", p.accent),
+            SubagentState::Completed => ("✓", p.good),
+            SubagentState::Failed => ("✕", p.bad),
+            SubagentState::Cancelled => ("○", p.muted),
+        }
+    }
+
+    fn render_inline_subagent_card(
+        &self,
+        block_id: usize,
+        rec: &SubagentRecord,
+        p: crate::theme::Palette,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let (glyph, color) = Self::subagent_status_visual(rec.state, p);
+        let elapsed = Self::subagent_elapsed(rec);
+        let inspected = self.inspected_subagent.as_deref() == Some(rec.id.as_str());
+        let step_count = rec.steps.len();
+        let latest_step = rec.steps.last().map(|s| {
+            if s.subject.is_empty() {
+                s.verb.clone()
+            } else {
+                format!("{} {}", s.verb, s.subject)
+            }
+        });
+        let sub_id_inspect = rec.id.clone();
+        let sub_id_stop = rec.id.clone();
+
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(if inspected { p.accent } else { p.line })
+            .bg(p.panel)
+            .px_3()
+            .py_2()
+            .gap_1()
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_xs().text_color(color).child(glyph))
+                            .child(
+                                Tag::secondary()
+                                    .small()
+                                    .child(format!("Sub-agent · {}", rec.role)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                    .truncate()
+                                    .child(rec.title.clone()),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_2()
+                            .when_some(rec.model.clone(), |row, m| {
+                                row.child(div().text_xs().text_color(p.muted).child(m))
+                            })
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(color)
+                                    .child(format!("{} · {elapsed}", rec.state.label())),
+                            )
+                            .when(rec.state.is_active() && rec.cancellable, |row| {
+                                row.child(
+                                    Button::new(("inline-sub-stop", block_id))
+                                        .xsmall()
+                                        .danger()
+                                        .label("Stop")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.cancel_subagent(sub_id_stop.clone(), cx);
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new(("inline-sub-inspect", block_id))
+                                    .xsmall()
+                                    .when(inspected, |b| b.primary())
+                                    .label(if inspected { "Inspecting" } else { "Inspect" })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_inspect_subagent(sub_id_inspect.clone(), cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .when(step_count > 0 || rec.error.is_some(), |col| {
+                let note = if let Some(err) = &rec.error {
+                    err.lines().next().unwrap_or(err).to_string()
+                } else if let Some(last) = latest_step {
+                    format!(
+                        "{step_count} step{} · {last}",
+                        if step_count == 1 { "" } else { "s" }
+                    )
+                } else {
+                    format!(
+                        "{step_count} step{}",
+                        if step_count == 1 { "" } else { "s" }
+                    )
+                };
+                col.child(
+                    div()
+                        .text_xs()
+                        .text_color(if rec.error.is_some() { p.bad } else { p.muted })
+                        .truncate()
+                        .child(note),
+                )
+            })
+    }
+
+    fn render_subagent_strip(
+        &self,
+        p: crate::theme::Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let running = self.subagents.iter().filter(|s| s.state.is_active()).count();
+        let total = self.subagents.len();
+        let heading = if running > 0 {
+            format!("Sub-agents ({running}/{total} active)")
+        } else {
+            format!("Sub-agents ({total})")
+        };
+
+        h_flex()
+            .flex_shrink_0()
+            .px_4()
+            .py(px(5.0))
+            .gap_2()
+            .items_center()
+            .flex_wrap()
+            .bg(p.panel)
+            .border_b_1()
+            .border_color(p.line)
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .text_color(p.muted)
+                    .child(heading),
+            )
+            .children(self.subagents.iter().enumerate().map(|(i, rec)| {
+                let (glyph, color) = Self::subagent_status_visual(rec.state, p);
+                let elapsed = Self::subagent_elapsed(rec);
+                let active = self.inspected_subagent.as_deref() == Some(rec.id.as_str());
+                let id_click = rec.id.clone();
+                let steps_label = if rec.steps.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {} steps", rec.steps.len())
+                };
+                h_flex()
+                    .id(("subagent-pill", i))
+                    .cursor_pointer()
+                    .px_2()
+                    .py(px(2.0))
+                    .gap_1()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(if active { p.accent } else { p.line })
+                    .bg(if active { p.accent.opacity(0.14) } else { p.chip })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_inspect_subagent(id_click.clone(), cx);
+                    }))
+                    .child(div().text_xs().text_color(color).child(glyph))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child(rec.role.clone()),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(180.0))
+                            .text_xs()
+                            .text_color(p.muted)
+                            .truncate()
+                            .child(rec.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(p.muted)
+                            .child(format!("{elapsed}{steps_label}")),
+                    )
+            }))
+    }
+
+    fn render_subagent_inspector(
+        &self,
+        rec: &SubagentRecord,
+        p: crate::theme::Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (glyph, color) = Self::subagent_status_visual(rec.state, p);
+        let elapsed = Self::subagent_elapsed(rec);
+        let sub_id_stop = rec.id.clone();
+        let child_sid = rec.child_session.clone();
+        let output_body = rec
+            .result
+            .clone()
+            .or_else(|| rec.live_text.clone());
+
+        v_flex()
+            .flex_shrink_0()
+            .max_h(px(300.0))
+            .bg(p.bg)
+            .border_b_1()
+            .border_color(p.accent.opacity(0.6))
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .px_4()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .bg(p.panel)
+                    .border_b_1()
+                    .border_color(p.line)
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_2()
+                            .items_center()
+                            .child(div().text_xs().text_color(color).child(glyph))
+                            .child(Tag::secondary().small().child(rec.role.clone()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .truncate()
+                                    .child(rec.title.clone()),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap_2()
+                            .items_center()
+                            .when_some(rec.model.clone(), |row, m| {
+                                row.child(Tag::secondary().small().child(m))
+                            })
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(color)
+                                    .child(format!("{} · {elapsed}", rec.state.label())),
+                            )
+                            .when_some(
+                                child_sid.filter(|_| self.engine == ChatEngine::OpenCode),
+                                |row, sid| {
+                                    row.child(
+                                        Button::new("subagent-open-session")
+                                            .xsmall()
+                                            .label("Open session")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.show_chat(Some(sid.clone()), window, cx);
+                                            })),
+                                    )
+                                },
+                            )
+                            .when(rec.state.is_active() && rec.cancellable, |row| {
+                                row.child(
+                                    Button::new("subagent-inspector-stop")
+                                        .xsmall()
+                                        .danger()
+                                        .label("Stop")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.cancel_subagent(sub_id_stop.clone(), cx);
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("subagent-inspector-close")
+                                    .xsmall()
+                                    .ghost()
+                                    .label("Close")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.inspected_subagent = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("subagent-inspector-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_4()
+                    .py_2()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .gap_2()
+                            .when(!rec.prompt.is_empty(), |col| {
+                                col.child(
+                                    v_flex()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                .text_color(p.muted)
+                                                .child("Task"),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded(px(6.0))
+                                                .bg(p.chip)
+                                                .text_xs()
+                                                .child(rec.prompt.clone()),
+                                        ),
+                                )
+                            })
+                            .when(!rec.steps.is_empty(), |col| {
+                                col.child(
+                                    v_flex()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                .text_color(p.muted)
+                                                .child(format!("Steps ({})", rec.steps.len())),
+                                        )
+                                        .children(rec.steps.iter().map(|step| {
+                                            let st_color = match step.status.as_str() {
+                                                "failed" => p.bad,
+                                                "in_progress" => p.accent,
+                                                _ => p.good,
+                                            };
+                                            h_flex()
+                                                .px_2()
+                                                .py(px(3.0))
+                                                .gap_2()
+                                                .items_center()
+                                                .rounded(px(5.0))
+                                                .bg(p.panel)
+                                                .border_1()
+                                                .border_color(p.line)
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                                        .child(step.verb.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .text_xs()
+                                                        .font_family("Menlo")
+                                                        .text_color(p.muted)
+                                                        .truncate()
+                                                        .child(step.subject.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(st_color)
+                                                        .child(step.status.clone()),
+                                                )
+                                        })),
+                                )
+                            })
+                            .when_some(rec.error.clone(), |col, err| {
+                                col.child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded(px(6.0))
+                                        .bg(p.bad.opacity(0.14))
+                                        .text_xs()
+                                        .text_color(p.bad)
+                                        .child(err),
+                                )
+                            })
+                            .when_some(output_body, |col, text| {
+                                col.child(
+                                    v_flex()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                .text_color(p.muted)
+                                                .child(if rec.result.is_some() {
+                                                    "Result"
+                                                } else {
+                                                    "Live output"
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_3()
+                                                .py_2()
+                                                .rounded(px(6.0))
+                                                .bg(p.panel)
+                                                .border_1()
+                                                .border_color(p.line)
+                                                .text_xs()
+                                                .child(
+                                                    TextView::markdown(
+                                                        ("subagent-md", rec.started_ms as usize),
+                                                        text,
+                                                    )
+                                                    .selectable(true),
+                                                ),
+                                        ),
+                                )
+                            }),
+                    ),
+            )
+    }
+
+    // --- Host-side Git & GitHub PR actions (outside the agent's sandbox) ---
+
+    fn project_root(&self) -> Option<std::path::PathBuf> {
+        let pid = self.selected_project.as_deref()?;
+        Some(self.backend.app.project(pid)?.main().to_path_buf())
+    }
+
+    fn refresh_git(&mut self, check_pr: bool, cx: &mut Context<Self>) {
+        let Some(root) = self.project_root() else {
+            self.git_status = None;
+            cx.notify();
+            return;
+        };
+        self.git_gen += 1;
+        let mine = self.git_gen;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let root_task = root.clone();
+        self.backend.tokio.spawn(async move {
+            let st = git::status(&root_task).await;
+            let _ = tx.send(st);
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(mut st) = rx.await else {
+                return;
+            };
+            let should_check_pr =
+                check_pr && st.is_repo && st.has_remote && st.gh_available && !st.detached;
+            let _ = this.update(cx, |this, cx| {
+                if this.git_gen != mine {
+                    return;
+                }
+                // Preserve known PR info on the same branch during fast local refreshes.
+                if !should_check_pr
+                    && let Some(prev) = &this.git_status
+                    && prev.branch == st.branch
+                {
+                    st.open_pr = prev.open_pr.clone();
+                }
+                this.git_status = if st.is_repo { Some(st) } else { None };
+                cx.notify();
+            });
+            if should_check_pr {
+                let (pr_tx, pr_rx) = tokio::sync::oneshot::channel();
+                let tokio_handle = this
+                    .update(cx, |this, _| this.backend.tokio.handle().clone())
+                    .ok();
+                if let Some(handle) = tokio_handle {
+                    handle.spawn(async move {
+                        let pr = git::current_pr(&root).await;
+                        let _ = pr_tx.send(pr);
+                    });
+                    if let Ok(pr) = pr_rx.await {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.git_gen != mine {
+                                return;
+                            }
+                            if let Some(gs) = &mut this.git_status {
+                                gs.open_pr = pr;
+                            }
+                            cx.notify();
+                        });
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn toggle_commit_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.git_panel, Some(GitPanel::Commit { .. })) {
+            self.git_panel = None;
+            cx.notify();
+            return;
+        }
+        self.git_notice = None;
+        let message_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Commit message (e.g. Fix login redirect)")
+        });
+        self.git_panel = Some(GitPanel::Commit { message_input });
+        cx.notify();
+    }
+
+    fn toggle_pr_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.git_panel, Some(GitPanel::Pr { .. })) {
+            self.git_panel = None;
+            cx.notify();
+            return;
+        }
+        self.git_notice = None;
+        let title_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Pull request title")
+        });
+        let body_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Short summary of what changed (optional)")
+                .rows(3)
+                .auto_grow(2, 6)
+        });
+        self.git_panel = Some(GitPanel::Pr {
+            title_input,
+            body_input,
+            draft: false,
+        });
+        cx.notify();
+        // Automatically pre-fill title & summary from branch commits (uses model if loaded).
+        self.draft_pr_with_ai(window, cx);
+    }
+
+    fn draft_commit_with_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.git_drafting {
+            return;
+        }
+        let Some(root) = self.project_root() else {
+            return;
+        };
+        let Some(GitPanel::Commit { message_input }) = &self.git_panel else {
+            return;
+        };
+        let message_input = message_input.clone();
+        self.git_drafting = true;
+        self.git_notice = None;
+        cx.notify();
+
+        let app = self.backend.app.clone();
+        let preferred = self.selected_model.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.backend.tokio.spawn(async move {
+            let res = git::generate_commit_message(&app, &root, preferred.as_deref())
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(res);
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(res) = rx.await else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.git_drafting = false;
+                match res {
+                    Ok(msg) => {
+                        message_input.update(cx, |state, cx| {
+                            state.set_value(msg, window, cx);
+                        });
+                    }
+                    Err(err) => {
+                        this.git_notice = Some(GitNotice {
+                            text: err,
+                            url: None,
+                            is_error: true,
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn draft_pr_with_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.git_drafting {
+            return;
+        }
+        let Some(root) = self.project_root() else {
+            return;
+        };
+        let Some(GitPanel::Pr {
+            title_input,
+            body_input,
+            ..
+        }) = &self.git_panel
+        else {
+            return;
+        };
+        let title_input = title_input.clone();
+        let body_input = body_input.clone();
+        self.git_drafting = true;
+        cx.notify();
+
+        let app = self.backend.app.clone();
+        let preferred = self.selected_model.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.backend.tokio.spawn(async move {
+            let res = git::generate_pr_draft(&app, &root, preferred.as_deref())
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(res);
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(res) = rx.await else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.git_drafting = false;
+                match res {
+                    Ok(draft) => {
+                        title_input.update(cx, |state, cx| {
+                            state.set_value(draft.title, window, cx);
+                        });
+                        body_input.update(cx, |state, cx| {
+                            state.set_value(draft.body, window, cx);
+                        });
+                    }
+                    Err(err) => {
+                        this.git_notice = Some(GitNotice {
+                            text: err,
+                            url: None,
+                            is_error: true,
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn submit_commit(&mut self, also_push: bool, cx: &mut Context<Self>) {
+        if self.git_busy.is_some() {
+            return;
+        }
+        let Some(root) = self.project_root() else {
+            return;
+        };
+        let message = match &self.git_panel {
+            Some(GitPanel::Commit { message_input }) => {
+                message_input.read(cx).value().trim().to_string()
+            }
+            _ => return,
+        };
+        if message.is_empty() {
+            self.git_notice = Some(GitNotice {
+                text: "Enter a commit message first.".into(),
+                url: None,
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        self.git_busy = Some(if also_push {
+            "Committing & pushing…".into()
+        } else {
+            "Committing…".into()
+        });
+        self.git_notice = None;
+        cx.notify();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.backend.tokio.spawn(async move {
+            let res: Result<String, String> = async {
+                let c = git::commit(&root, &message, true)
+                    .await
+                    .map_err(|e| format!("{e:#}"))?;
+                if also_push {
+                    let p = git::push(&root).await.map_err(|e| format!("{e:#}"))?;
+                    Ok(format!("Committed {} and pushed to {}/{}", c.hash, p.remote, p.branch))
+                } else {
+                    Ok(format!("Committed {} — {}", c.hash, c.summary))
+                }
+            }
+            .await;
+            let _ = tx.send(res);
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(res) = rx.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.git_busy = None;
+                match res {
+                    Ok(text) => {
+                        this.git_panel = None;
+                        this.git_notice = Some(GitNotice {
+                            text,
+                            url: None,
+                            is_error: false,
+                        });
+                        this.refresh_git(also_push, cx);
+                    }
+                    Err(err) => {
+                        this.git_notice = Some(GitNotice {
+                            text: err,
+                            url: None,
+                            is_error: true,
+                        });
+                        this.refresh_git(false, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn run_git_push(&mut self, cx: &mut Context<Self>) {
+        if self.git_busy.is_some() {
+            return;
+        }
+        let Some(root) = self.project_root() else {
+            return;
+        };
+        self.git_busy = Some("Pushing…".into());
+        self.git_notice = None;
+        cx.notify();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.backend.tokio.spawn(async move {
+            let res = git::push(&root).await.map_err(|e| format!("{e:#}"));
+            let _ = tx.send(res);
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(res) = rx.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.git_busy = None;
+                match res {
+                    Ok(p) => {
+                        let suffix = if p.set_upstream { " (upstream set)" } else { "" };
+                        this.git_notice = Some(GitNotice {
+                            text: format!("Pushed {} to {}{suffix}", p.branch, p.remote),
+                            url: None,
+                            is_error: false,
+                        });
+                        this.refresh_git(true, cx);
+                    }
+                    Err(err) => {
+                        this.git_notice = Some(GitNotice {
+                            text: err,
+                            url: None,
+                            is_error: true,
+                        });
+                        this.refresh_git(false, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn submit_pr(&mut self, cx: &mut Context<Self>) {
+        if self.git_busy.is_some() {
+            return;
+        }
+        let Some(root) = self.project_root() else {
+            return;
+        };
+        let (title, body, draft) = match &self.git_panel {
+            Some(GitPanel::Pr {
+                title_input,
+                body_input,
+                draft,
+            }) => (
+                title_input.read(cx).value().trim().to_string(),
+                body_input.read(cx).value().trim().to_string(),
+                *draft,
+            ),
+            _ => return,
+        };
+        if title.is_empty() {
+            self.git_notice = Some(GitNotice {
+                text: "Enter a pull request title first.".into(),
+                url: None,
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        self.git_busy = Some("Creating PR…".into());
+        self.git_notice = None;
+        cx.notify();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.backend.tokio.spawn(async move {
+            let res = git::create_pr(&root, &title, &body, draft)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(res);
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(res) = rx.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.git_busy = None;
+                match res {
+                    Ok(pr) => {
+                        this.git_panel = None;
+                        let label = if pr.number > 0 {
+                            format!("Created PR #{}: {}", pr.number, pr.title)
+                        } else {
+                            format!("Created PR: {}", pr.title)
+                        };
+                        let url = (!pr.url.is_empty()).then_some(pr.url.clone());
+                        if let Some(gs) = &mut this.git_status {
+                            gs.open_pr = Some(pr);
+                        }
+                        this.git_notice = Some(GitNotice {
+                            text: label,
+                            url,
+                            is_error: false,
+                        });
+                        this.refresh_git(true, cx);
+                    }
+                    Err(err) => {
+                        this.git_notice = Some(GitNotice {
+                            text: err,
+                            url: None,
+                            is_error: true,
+                        });
+                        this.refresh_git(false, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_git_bar(
+        &self,
+        st: &GitStatus,
+        p: crate::theme::Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let dirty = st.dirty_count();
+        let branch_label = if st.detached {
+            "detached HEAD".to_string()
+        } else {
+            st.branch.clone().unwrap_or_else(|| "HEAD".into())
+        };
+        let git_busy = self.git_busy.is_some();
+        let can_commit = dirty > 0 && !git_busy;
+        let can_push = st.has_remote && !st.detached && !git_busy;
+        let push_highlighted = dirty == 0 && (st.ahead > 0 || st.upstream.is_none()) && can_push;
+
+        let commit_label = if dirty > 0 {
+            format!("Commit ({dirty})")
+        } else {
+            "Commit".into()
+        };
+        let push_label = if st.ahead > 0 {
+            format!("Push ↑{}", st.ahead)
+        } else if st.upstream.is_none() && st.has_remote {
+            "Push branch".into()
+        } else {
+            "Push".into()
+        };
+        let open_pr = st.open_pr.clone();
+        let can_pr = st.has_remote && !st.detached && !git_busy;
+
+        h_flex()
+            .flex_shrink_0()
+            .px_4()
+            .py(px(5.0))
+            .gap_2()
+            .items_center()
+            .justify_between()
+            .bg(p.bg)
+            .border_b_1()
+            .border_color(p.line)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .id("git-branch-pill")
+                            .cursor_pointer()
+                            .px_2()
+                            .py(px(2.0))
+                            .rounded(px(5.0))
+                            .bg(p.chip)
+                            .text_xs()
+                            .font_family("Menlo")
+                            .text_color(p.text)
+                            .child(format!("⎇ {branch_label}"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.refresh_git(true, cx);
+                            })),
+                    )
+                    .when(dirty > 0, |row| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(p.warn)
+                                .child(format!("{dirty} changed")),
+                        )
+                    })
+                    .when(dirty == 0 && st.ahead == 0 && st.behind == 0, |row| {
+                        row.child(div().text_xs().text_color(p.muted).child("Clean"))
+                    })
+                    .when(st.ahead > 0, |row| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(p.good)
+                                .child(format!("↑{}", st.ahead)),
+                        )
+                    })
+                    .when(st.behind > 0, |row| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(p.muted)
+                                .child(format!("↓{}", st.behind)),
+                        )
+                    })
+                    .when_some(self.git_busy.clone(), |row, msg| {
+                        row.child(div().text_xs().text_color(p.accent).child(msg))
+                    }),
+            )
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Button::new("git-commit-btn")
+                            .xsmall()
+                            .when(dirty > 0, |b| b.primary())
+                            .disabled(!can_commit)
+                            .label(commit_label)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_commit_panel(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("git-push-btn")
+                            .xsmall()
+                            .when(push_highlighted, |b| b.primary())
+                            .disabled(!can_push)
+                            .label(push_label)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.run_git_push(cx);
+                            })),
+                    )
+                    .child(match open_pr {
+                        Some(pr) => {
+                            let url = pr.url.clone();
+                            let label = if pr.number > 0 {
+                                format!("PR #{} ↗", pr.number)
+                            } else {
+                                "Open PR ↗".into()
+                            };
+                            Button::new("git-pr-btn")
+                                .xsmall()
+                                .label(label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Err(e) = files::open_url(&url) {
+                                        this.git_notice = Some(GitNotice {
+                                            text: format!("Couldn't open PR link: {e}"),
+                                            url: None,
+                                            is_error: true,
+                                        });
+                                        cx.notify();
+                                    }
+                                }))
+                        }
+                        None => Button::new("git-pr-btn")
+                            .xsmall()
+                            .disabled(!can_pr)
+                            .label("PR")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_pr_panel(window, cx);
+                            })),
+                    }),
+            )
+    }
+
+    fn render_git_panel(
+        &self,
+        panel: &GitPanel,
+        st: Option<&GitStatus>,
+        p: crate::theme::Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let has_model = self.loaded_explain_model().is_some();
+        let busy = self.git_busy.is_some();
+
+        match panel {
+            GitPanel::Commit { message_input } => {
+                let files_list = st.map(|s| s.dirty_files.as_slice()).unwrap_or(&[]);
+                let shown: Vec<_> = files_list.iter().take(8).cloned().collect();
+                let extra = files_list.len().saturating_sub(shown.len());
+                let can_push = st.is_some_and(|s| s.has_remote && !s.detached);
+
+                v_flex()
+                    .flex_shrink_0()
+                    .px_4()
+                    .py_3()
+                    .gap_2()
+                    .bg(p.panel)
+                    .border_b_1()
+                    .border_color(p.line)
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .child(format!(
+                                        "Commit {} changed file{}",
+                                        files_list.len(),
+                                        if files_list.len() == 1 { "" } else { "s" }
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(p.muted)
+                                    .child("Stages all project changes and commits on host"),
+                            ),
+                    )
+                    .when(!shown.is_empty(), |col| {
+                        col.child(
+                            h_flex()
+                                .flex_wrap()
+                                .gap_1()
+                                .children(shown.into_iter().map(|f| {
+                                    div()
+                                        .px_2()
+                                        .py(px(1.0))
+                                        .rounded(px(4.0))
+                                        .bg(p.chip)
+                                        .text_xs()
+                                        .font_family("Menlo")
+                                        .text_color(p.muted)
+                                        .child(format!("{} {}", f.status, f.path))
+                                }))
+                                .when(extra > 0, |row| {
+                                    row.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(p.muted)
+                                            .child(format!("+{extra} more")),
+                                    )
+                                }),
+                        )
+                    })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().flex_1().child(Input::new(message_input).small()))
+                            .when(has_model, |row| {
+                                row.child(
+                                    Button::new("git-ai-commit")
+                                        .small()
+                                        .disabled(self.git_drafting || busy)
+                                        .label(if self.git_drafting {
+                                            "Drafting…"
+                                        } else {
+                                            "Draft message"
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.draft_commit_with_ai(window, cx);
+                                        })),
+                                )
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("git-commit-cancel")
+                                    .small()
+                                    .ghost()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.git_panel = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("git-commit-only")
+                                    .small()
+                                    .disabled(busy)
+                                    .label("Commit")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_commit(false, cx);
+                                    })),
+                            )
+                            .when(can_push, |row| {
+                                row.child(
+                                    Button::new("git-commit-push")
+                                        .small()
+                                        .primary()
+                                        .disabled(busy)
+                                        .label("Commit & Push")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.submit_commit(true, cx);
+                                        })),
+                                )
+                            }),
+                    )
+            }
+            GitPanel::Pr {
+                title_input,
+                body_input,
+                draft,
+            } => {
+                let is_draft = *draft;
+                let will_push = st.is_some_and(|s| s.upstream.is_none() || s.ahead > 0);
+                let gh_ok = st.is_some_and(|s| s.gh_available);
+
+                v_flex()
+                    .flex_shrink_0()
+                    .px_4()
+                    .py_3()
+                    .gap_2()
+                    .bg(p.panel)
+                    .border_b_1()
+                    .border_color(p.line)
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .child("Create Pull Request"),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .when(has_model, |row| {
+                                        row.child(
+                                            Button::new("git-ai-pr")
+                                                .xsmall()
+                                                .disabled(self.git_drafting || busy)
+                                                .label(if self.git_drafting {
+                                                    "Drafting…"
+                                                } else {
+                                                    "Draft with AI"
+                                                })
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.draft_pr_with_ai(window, cx);
+                                                })),
+                                        )
+                                    })
+                                    .child(
+                                        Button::new("git-pr-draft-toggle")
+                                            .xsmall()
+                                            .when(is_draft, |b| b.primary())
+                                            .label(if is_draft {
+                                                "Draft PR: On"
+                                            } else {
+                                                "Draft PR: Off"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(GitPanel::Pr { draft, .. }) =
+                                                    &mut this.git_panel
+                                                {
+                                                    *draft = !*draft;
+                                                    cx.notify();
+                                                }
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .when(!gh_ok, |col| {
+                        col.child(
+                            div()
+                                .text_xs()
+                                .text_color(p.warn)
+                                .child("GitHub CLI (`gh`) not found on PATH. Install it with `brew install gh` and run `gh auth login`."),
+                        )
+                    })
+                    .child(Input::new(title_input).small())
+                    .child(Textarea::new(body_input))
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(p.muted)
+                                    .child(if will_push {
+                                        "Pushes this branch first, then opens the PR via gh."
+                                    } else {
+                                        "Opens a pull request on GitHub via gh."
+                                    }),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("git-pr-cancel")
+                                            .small()
+                                            .ghost()
+                                            .label("Cancel")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.git_panel = None;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("git-pr-submit")
+                                            .small()
+                                            .primary()
+                                            .disabled(busy || !gh_ok)
+                                            .label(if is_draft {
+                                                "Create Draft PR"
+                                            } else {
+                                                "Create PR"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.submit_pr(cx);
+                                            })),
+                                    ),
+                            ),
+                    )
+            }
+        }
+    }
 }
 
 impl Render for ChatWindow {
@@ -3558,6 +4927,15 @@ impl Render for ChatWindow {
             loaded
                 .iter()
                 .any(|m| m.id == id && matches!(m.state, LoadState::Running { .. }))
+        });
+        let selected_spec_badge = self.selected_model.as_deref().and_then(|id| {
+            loaded.iter().find_map(|m| {
+                if m.id == id && matches!(m.state, LoadState::Running { .. }) {
+                    m.speculative.clone()
+                } else {
+                    None
+                }
+            })
         });
         let selected_loading = self.selected_model.as_deref().and_then(|id| {
             loading_models.iter().find(|(mid, _, _, _)| mid == id).cloned()
@@ -3903,6 +5281,9 @@ impl Render for ChatWindow {
                                     .when_some(usage_text, |row, usage| {
                                         row.child(Tag::secondary().small().child(usage))
                                     })
+                                    .when_some(selected_spec_badge, |row, spec| {
+                                        row.child(Tag::secondary().small().child(format!("⚡ {spec}")))
+                                    })
                                     .child(
                                         div()
                                             .w(px(192.0))
@@ -3934,6 +5315,75 @@ impl Render for ChatWindow {
                                         )
                                     }),
                             ),
+                    )
+                    // Git bar (Commit, Push, PR) — runs on host outside the sandbox
+                    .when_some(self.git_status.as_ref().filter(|s| s.is_repo), |col, st| {
+                        col.child(self.render_git_bar(st, p, cx))
+                    })
+                    .when_some(self.git_panel.as_ref(), |col, panel| {
+                        col.child(self.render_git_panel(panel, self.git_status.as_ref(), p, cx))
+                    })
+                    .when_some(self.git_notice.clone(), |col, notice| {
+                        col.child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .px_4()
+                                .py(px(6.0))
+                                .gap_2()
+                                .items_center()
+                                .justify_between()
+                                .bg(if notice.is_error {
+                                    p.bad.opacity(0.14)
+                                } else {
+                                    p.good.opacity(0.14)
+                                })
+                                .border_b_1()
+                                .border_color(if notice.is_error { p.bad } else { p.good })
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_xs()
+                                        .text_color(if notice.is_error { p.bad } else { p.text })
+                                        .child(notice.text),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .items_center()
+                                        .when_some(notice.url, |row, url| {
+                                            row.child(
+                                                Button::new("git-notice-open-pr")
+                                                    .xsmall()
+                                                    .primary()
+                                                    .label("Open PR ↗")
+                                                    .on_click(move |_, _, _| {
+                                                        let _ = files::open_url(&url);
+                                                    }),
+                                            )
+                                        })
+                                        .child(
+                                            Button::new("git-notice-dismiss")
+                                                .xsmall()
+                                                .ghost()
+                                                .label("Dismiss")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.git_notice = None;
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                ),
+                        )
+                    })
+                    // Sub-agent tracking strip + inspector drawer (shown only when sub-agents exist)
+                    .when(!self.subagents.is_empty(), |col| {
+                        col.child(self.render_subagent_strip(p, cx))
+                    })
+                    .when_some(
+                        self.inspected_subagent
+                            .as_deref()
+                            .and_then(|id| self.subagents.iter().find(|s| s.id == id))
+                            .cloned(),
+                        |col, rec| col.child(self.render_subagent_inspector(&rec, p, cx)),
                     )
                     // Model loading progress bar banner
                     .when(has_loading_models, |col| {

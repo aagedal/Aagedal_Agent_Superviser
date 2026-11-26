@@ -93,6 +93,9 @@ fn main() {
                         AppEvent::Chat(ev) => {
                             let _ = event_handle.emit("chat", &ev);
                         }
+                        AppEvent::Subagent(rec) => {
+                            let _ = event_handle.emit("subagent", &rec);
+                        }
                     }
                 }
             });
@@ -195,6 +198,15 @@ fn main() {
             commands::set_setup_done,
             commands::leave_setup,
             commands::get_installer,
+            commands::git_status,
+            commands::git_commit,
+            commands::git_push,
+            commands::git_create_pr,
+            commands::git_generate_commit_message,
+            commands::git_generate_pr_draft,
+            commands::open_external_url,
+            commands::subagents_list,
+            commands::subagent_cancel,
         ]);
 
     builder.build(tauri::generate_context!()).expect("building the app").run(|handle, event| match event {

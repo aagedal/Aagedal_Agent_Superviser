@@ -302,6 +302,74 @@ impl GgufInfo {
         self.arch.ends_with("-assistant")
             || self.int("nextn_predict_layers").is_some_and(|n| self.int("block_count").is_some_and(|b| n >= b))
     }
+
+    /// Whether this main model carries built-in Multi-Token Prediction (MTP) layers
+    /// (`{arch}.nextn_predict_layers > 0`) that `llama-server --spec-type draft-mtp` can use.
+    pub fn has_embedded_mtp(&self) -> bool {
+        !self.is_draft() && self.int("nextn_predict_layers").is_some_and(|n| n > 0)
+    }
+
+    /// Classifies a standalone speculative-decoding draft GGUF (MTP, DSpark, DFlash, Eagle-3),
+    /// using both its GGUF metadata and filename.
+    pub fn draft_kind(&self, filename: &str) -> Option<DraftKind> {
+        let lower = filename.to_ascii_lowercase();
+        let arch = self.arch.to_ascii_lowercase();
+        if lower.contains("dspark") || arch.contains("dspark") {
+            return Some(DraftKind::Dspark);
+        }
+        if lower.contains("dflash") || arch.contains("dflash") {
+            return Some(DraftKind::Dflash);
+        }
+        if lower.contains("eagle3") || lower.contains("eagle-3") || arch.contains("eagle3") {
+            return Some(DraftKind::Eagle3);
+        }
+        if self.is_draft()
+            || lower.starts_with("mtp-")
+            || lower.starts_with("mtp_")
+            || lower.contains("-mtp.")
+            || lower.contains("_mtp.")
+            || lower.contains("-assistant")
+        {
+            return Some(DraftKind::Mtp);
+        }
+        None
+    }
+}
+
+/// Kind of neural speculative-decoding drafter supported by `llama-server --spec-type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DraftKind {
+    /// Multi-Token Prediction head (built-in or companion `mtp-*.gguf`).
+    Mtp,
+    /// DSpark semi-autoregressive block drafter.
+    Dspark,
+    /// DFlash block-diffusion drafter.
+    Dflash,
+    /// Eagle-3 speculative drafter.
+    Eagle3,
+}
+
+impl DraftKind {
+    /// Value for `llama-server --spec-type`.
+    pub fn llama_spec_type(self) -> &'static str {
+        match self {
+            Self::Mtp => "draft-mtp",
+            Self::Dspark => "draft-dspark",
+            Self::Dflash => "draft-dflash",
+            Self::Eagle3 => "draft-eagle3",
+        }
+    }
+
+    /// Short human-readable name for logs and UI badges.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mtp => "MTP",
+            Self::Dspark => "DSpark",
+            Self::Dflash => "DFlash",
+            Self::Eagle3 => "Eagle-3",
+        }
+    }
 }
 
 /// Tokens a sliding-window layer keeps beyond its window: one batch (llama.cpp's default ubatch).
@@ -460,5 +528,28 @@ pub(crate) mod tests {
         .unwrap();
         overflow.ints.insert("attention.key_length".into(), u64::MAX);
         assert_eq!(overflow.kv_cache(), None);
+    }
+
+    #[test]
+    fn classifies_embedded_mtp_and_companion_draft_kinds() {
+        let embedded = parse(&header(
+            "qwen35",
+            &[("block_count", 64), ("nextn_predict_layers", 1)],
+            &[],
+        ))
+        .unwrap();
+        assert!(!embedded.is_draft());
+        assert!(embedded.has_embedded_mtp());
+        assert_eq!(embedded.draft_kind("Qwen3.8-27B-UD-Q4_K_M.gguf"), None);
+
+        let mtp = parse(&header("qwen35-assistant", &[("block_count", 1)], &[])).unwrap();
+        assert!(mtp.is_draft());
+        assert!(!mtp.has_embedded_mtp());
+        assert_eq!(mtp.draft_kind("mtp-Qwen3.8-27B.gguf"), Some(DraftKind::Mtp));
+
+        let dspark = parse(&header("inkling2", &[("block_count", 4)], &[])).unwrap();
+        assert_eq!(dspark.draft_kind("Inkling-2-Mini-dspark-Q8_0.gguf"), Some(DraftKind::Dspark));
+        assert_eq!(dspark.draft_kind("model-dflash-Q8_0.gguf"), Some(DraftKind::Dflash));
+        assert_eq!(dspark.draft_kind("model-eagle3-Q8_0.gguf"), Some(DraftKind::Eagle3));
     }
 }

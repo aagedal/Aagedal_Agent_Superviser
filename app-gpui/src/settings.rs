@@ -139,7 +139,7 @@ impl SettingsWindow {
                     | AppEvent::Reasoning => {
                         cx.notify();
                     }
-                    AppEvent::Acp(_) | AppEvent::Chat(_) => {}
+                    AppEvent::Acp(_) | AppEvent::Chat(_) | AppEvent::Subagent(_) => {}
                 });
             }
         })
