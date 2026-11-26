@@ -3,27 +3,25 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod acp;
-mod agent;
 mod commands;
-mod state;
 mod update;
 
 use std::sync::Arc;
 
+use superviser_backend::{App, AppEvent, LoadState, ServerStatus};
 use superviser_core::sandbox::Isolation;
-use superviser_guard::{CallEvent, Verdict};
+use superviser_guard::Verdict;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
-use crate::state::{App, LoadState, ServerStatus};
-
 const TRAY_ID: &str = "main";
 /// Projects listed in the menu bar menu; the rest are in Settings.
 const MAX_TRAY_PROJECTS: usize = 8;
+/// Origins of the app's own webviews (macOS/Linux, Windows).
+const WEBVIEW_ORIGINS: &[&str] = &["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"];
 
 fn main() {
     tracing_subscriber::fmt()
@@ -51,16 +49,56 @@ fn main() {
             tauri_app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let handle = tauri_app.handle().clone();
+
+            // Bridge all backend events to Tauri webview events and tray updates.
+            let mut rx = app.bus.subscribe();
             let event_handle = handle.clone();
-            let event_app = app.clone();
-            let on_event = Arc::new(move |event: &CallEvent| {
-                event_app.record_event(event);
-                let _ = event_handle.emit("guard-call", event);
-                if matches!(event.verdict, Verdict::Blocked | Verdict::Flagged) {
-                    refresh_tray(&event_handle);
+            tauri::async_runtime::spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        AppEvent::Status(status) => {
+                            let _ = event_handle.emit("status", &status);
+                            refresh_tray(&event_handle);
+                        }
+                        AppEvent::LoadProgress { .. } | AppEvent::Reasoning => {}
+                        AppEvent::GuardCall(call) => {
+                            let blocked = matches!(call.verdict, Verdict::Blocked | Verdict::Flagged);
+                            let _ = event_handle.emit("guard-call", &call);
+                            if blocked {
+                                refresh_tray(&event_handle);
+                            }
+                        }
+                        AppEvent::Discovery => {
+                            refresh_tray(&event_handle);
+                            let _ = event_handle.emit("discovery", ());
+                        }
+                        AppEvent::Projects => {
+                            let _ = event_handle.emit("projects", ());
+                            refresh_tray(&event_handle);
+                        }
+                        AppEvent::Judge => {
+                            refresh_tray(&event_handle);
+                            let _ = event_handle.emit("judge", ());
+                        }
+                        AppEvent::Download(dl) => {
+                            let done = dl.finished || dl.error.is_some();
+                            let _ = event_handle.emit("download", &dl);
+                            if done {
+                                refresh_tray(&event_handle);
+                            }
+                        }
+                        AppEvent::Acp(ev) => {
+                            let _ = event_handle.emit("acp", &ev);
+                        }
+                        AppEvent::Chat(ev) => {
+                            let _ = event_handle.emit("chat", &ev);
+                        }
+                    }
                 }
             });
-            tauri::async_runtime::block_on(app.start_guard(on_event))?;
+
+            let origins = WEBVIEW_ORIGINS.iter().map(|s| s.to_string()).collect();
+            tauri::async_runtime::block_on(app.start_guard(origins))?;
 
             // Killed (Activity Monitor, `kill`, a logout): quit properly, stopping the model servers.
             #[cfg(unix)]
@@ -87,17 +125,14 @@ fn main() {
 
             // Scanning other apps' model caches can touch many GGUFs; keep it off the startup path.
             let scan_app = app.clone();
-            let scan_handle = handle.clone();
             std::thread::spawn(move || {
-                scan_app.rescan();
-                refresh_tray(&scan_handle);
-                let _ = scan_handle.emit("discovery", ());
+                scan_app.rescan_and_notify();
             });
 
             update::start(&handle);
 
             // Until the first-run guide is finished or skipped, open it.
-            if needs_setup(&app) {
+            if app.needs_setup() {
                 open_window(&handle, "setup")?;
             }
             Ok(())
@@ -165,19 +200,9 @@ fn main() {
     builder.build(tauri::generate_context!()).expect("building the app").run(|handle, event| match event {
         // Closing the last window keeps the menu bar app running.
         RunEvent::ExitRequested { api, code: None, .. } => api.prevent_exit(),
-        RunEvent::Exit => handle.state::<Arc<App>>().shutdown(),
+        RunEvent::Exit => tauri::async_runtime::block_on(handle.state::<Arc<App>>().shutdown_async()),
         _ => {}
     });
-}
-
-/// Whether to offer the setup guide: not finished or skipped, and not set up some other way
-/// (a model that fits on this Mac and a project, from Settings).
-fn needs_setup(app: &App) -> bool {
-    let (done, projects) = {
-        let settings = app.settings.lock().unwrap();
-        (settings.setup_done, !settings.projects.is_empty())
-    };
-    !done && !(projects && app.installed().iter().any(|m| app.fit(&m.model).is_some()))
 }
 
 fn status_line(status: &ServerStatus) -> String {
@@ -255,7 +280,7 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
     let in_opencode = Submenu::with_id_and_items(handle, "in-opencode", "Open in OpenCode", cfg!(target_os = "macos") && !opencode_refs.is_empty(), &opencode_refs)?;
     let settings = MenuItem::with_id(handle, "settings", "Settings…", true, Some("CmdOrCtrl+,"))?;
     // Until setup is finished or skipped, a way back to it.
-    let setup = needs_setup(app).then(|| MenuItem::with_id(handle, "setup", "Continue Setup…", true, None::<&str>)).transpose()?;
+    let setup = app.needs_setup().then(|| MenuItem::with_id(handle, "setup", "Continue Setup…", true, None::<&str>)).transpose()?;
     let quit = MenuItem::with_id(handle, "quit", "Quit Agent Superviser", true, Some("CmdOrCtrl+Q"))?;
     let update = handle.state::<update::Updates>().available().map(|(version, installing)| {
         let label = if installing { format!("Installing {version}…") } else { format!("Update to {version} and Restart…") };
@@ -276,19 +301,19 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
         &[
             &top[..],
             &[
-            &status_item,
-            &guard_item,
-            &PredefinedMenuItem::separator(handle)?,
-            &models,
-            &stop,
-            &PredefinedMenuItem::separator(handle)?,
-            &code,
-            &chat,
-            &in_opencode,
-            &opencode,
-            &settings,
-            &PredefinedMenuItem::separator(handle)?,
-            &quit,
+                &status_item,
+                &guard_item,
+                &PredefinedMenuItem::separator(handle)?,
+                &models,
+                &stop,
+                &PredefinedMenuItem::separator(handle)?,
+                &code,
+                &chat,
+                &in_opencode,
+                &opencode,
+                &settings,
+                &PredefinedMenuItem::separator(handle)?,
+                &quit,
             ],
         ]
         .concat(),
@@ -308,18 +333,8 @@ pub fn refresh_tray(handle: &AppHandle) {
     }
 }
 
-/// Tells windows and the tray that the server status changed.
-pub fn status_changed(handle: &AppHandle) {
-    let status = handle.state::<Arc<App>>().status();
-    let _ = handle.emit("status", &status);
-    refresh_tray(handle);
-}
-
-pub async fn load_model(handle: AppHandle, app: Arc<App>, id: String) -> Result<(), String> {
-    let status_handle = handle.clone();
-    let result = app.load_model(&id, || status_changed(&status_handle)).await;
-    status_changed(&handle);
-    result.map_err(|e| format!("{e:#}"))
+pub async fn load_model(app: Arc<App>, id: String) -> Result<(), String> {
+    app.load_model(&id).await.map_err(|e| format!("{e:#}"))
 }
 
 fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
@@ -343,7 +358,6 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
         "stop" => {
             tauri::async_runtime::spawn(async move {
                 app.unload_model(None).await;
-                status_changed(&handle);
             });
         }
         // The Connect tab runs the setup and shows what happened.
@@ -362,27 +376,17 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
             } else if let Some(model) = id.strip_prefix("load:") {
                 // A loaded model's item unloads it.
                 let model = model.to_string();
-                let loaded = app.models().iter().any(|m| m.id == model && !matches!(m.state, LoadState::Failed { .. }));
+                let loaded = app.loading_or_loaded(&model);
                 tauri::async_runtime::spawn(async move {
                     if loaded {
                         app.unload_model(Some(&model)).await;
-                        status_changed(&handle);
-                    } else if let Err(e) = load_model(handle.clone(), app, model).await {
+                    } else if let Err(e) = load_model(app, model).await {
                         show_error(&handle, "Couldn't load the model", &e);
                     }
                 });
             }
         }
     }
-}
-
-/// Opens an https link in the default browser.
-pub fn open_url(url: &str) -> std::io::Result<()> {
-    if !url.starts_with("https://") {
-        return Err(std::io::Error::other("only https links"));
-    }
-    let opener = if cfg!(target_os = "macos") { "/usr/bin/open" } else if cfg!(windows) { "explorer" } else { "xdg-open" };
-    std::process::Command::new(opener).arg(url).status().map(|_| ())
 }
 
 /// Asks for a folder, then opens its project (made if needed) in the chat window.
@@ -397,7 +401,6 @@ pub fn choose_project(handle: &AppHandle) {
             let app = handle_for_pick.state::<Arc<App>>().inner().clone();
             match app.project_for_folder(&path) {
                 Ok(project) => {
-                    refresh_tray(&handle_for_pick);
                     if let Err(e) = open_chat(&handle_for_pick, Some(&project.id)) {
                         tracing::warn!("opening chat: {e}");
                     }
@@ -411,12 +414,8 @@ pub fn choose_project(handle: &AppHandle) {
 /// Opens a project in sandboxed OpenCode, saying why if it can't.
 pub fn open_project(handle: &AppHandle, id: &str) {
     let app = handle.state::<Arc<App>>().inner().clone();
-    match app.open_project(id) {
-        Ok(_) => {
-            let _ = handle.emit("projects", ());
-            refresh_tray(handle);
-        }
-        Err(e) => show_error(handle, "Couldn't open the project", &format!("{e:#}")),
+    if let Err(e) = app.open_project(id) {
+        show_error(handle, "Couldn't open the project", &format!("{e:#}"));
     }
 }
 

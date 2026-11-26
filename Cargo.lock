@@ -114,11 +114,10 @@ name = "agent-superviser"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "futures-util",
- "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "superviser-backend",
  "superviser-core",
  "superviser-guard",
  "tauri",
@@ -140,6 +139,7 @@ dependencies = [
  "muda",
  "serde",
  "serde_json",
+ "superviser-backend",
  "superviser-core",
  "superviser-guard",
  "tokio",
@@ -8648,6 +8648,21 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "superviser-backend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "superviser-core",
+ "superviser-guard",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "superviser-core"

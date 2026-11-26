@@ -1,6 +1,6 @@
 [package]
 name = "agent-superviser-gpui"
-description = "GPUI prototype for Agent Superviser"
+description = "Native GPUI app for Agent Superviser"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 superviser-core.workspace = true
 superviser-guard.workspace = true
+superviser-backend.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

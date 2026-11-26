@@ -5,6 +5,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use serde::Serialize;
 
 use crate::catalog::{KvType, Sampling};
 
@@ -43,6 +44,91 @@ pub struct LlamaServer {
     pub alias: String,
     pub context: u64,
     api_key_file: PathBuf,
+    log_file: PathBuf,
+}
+
+/// Progress reported while `llama-server` loads a model into memory.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LoadProgress {
+    /// Progress fraction in `0.0..=1.0`.
+    pub fraction: f32,
+    /// Human-readable loading stage.
+    pub stage: String,
+}
+
+/// Estimates `llama-server` loading progress from its log output.
+pub fn parse_load_progress(log: &str) -> LoadProgress {
+    let mut fraction: f32 = 0.04;
+    let mut stage = "Starting llama-server…".to_string();
+
+    if log.contains("llama_model_loader:") || log.contains("print_info:") {
+        fraction = fraction.max(0.08);
+        stage = "Reading model metadata…".into();
+    }
+
+    if let Some(idx) = log.find("load_tensors:") {
+        let after = &log[idx..];
+        // llama.cpp prints one `.` per 1% in its default progress callback on lines after
+        // `load_tensors: loading model tensors, this can take a while...`.
+        let mut dots: usize = 0;
+        let mut saw_header = false;
+        for line in after.lines() {
+            let trimmed = line.trim();
+            if !saw_header {
+                if trimmed.contains("loading model tensors") {
+                    saw_header = true;
+                }
+                continue;
+            }
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.bytes().all(|b| b == b'.') {
+                dots += trimmed.len();
+            } else if trimmed.starts_with('.') {
+                let run = trimmed.bytes().take_while(|&b| b == b'.').count();
+                dots += run;
+                break;
+            } else {
+                break;
+            }
+        }
+        let clamped_dots = dots.min(100);
+        let weight_frac = 0.12 + (clamped_dots as f32 / 100.0) * 0.66;
+        if weight_frac > fraction {
+            fraction = weight_frac;
+        }
+        stage = if clamped_dots > 0 && clamped_dots < 100 {
+            format!("Loading weights ({clamped_dots}%)…")
+        } else {
+            "Loading weights…".into()
+        };
+
+        if after.contains("offloaded ") || after.contains("model buffer size") {
+            fraction = fraction.max(0.78);
+            stage = "Loading weights…".into();
+        }
+    }
+
+    if log.contains("llama_context:") || log.contains("llama_kv_cache") || log.contains("sched_reserve:") || log.contains("graph_reserve:") {
+        fraction = fraction.max(0.86);
+        stage = "Allocating context & KV cache…".into();
+    }
+
+    if log.contains("warmup:") {
+        fraction = fraction.max(0.92);
+        stage = "Warming up…".into();
+    }
+
+    if log.contains("server is listening") || log.contains("starting the main loop") {
+        fraction = fraction.max(0.95);
+        stage = "Finishing startup…".into();
+    }
+
+    LoadProgress {
+        fraction: fraction.clamp(0.0, 0.99),
+        stage,
+    }
 }
 
 /// Its conversation as `/slots` describes it.
@@ -152,7 +238,14 @@ impl LlamaServer {
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("starting {}", config.binary.display()))?;
-        Ok(Self { child, port: config.port, alias: config.alias, context: config.context, api_key_file: config.api_key_file })
+        Ok(Self {
+            child,
+            port: config.port,
+            alias: config.alias,
+            context: config.context,
+            api_key_file: config.api_key_file,
+            log_file: config.log_file,
+        })
     }
 
     fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -200,9 +293,20 @@ impl LlamaServer {
 
     /// Waits until the model is loaded (`/health` answers 200) or the process exits.
     pub async fn wait_ready(&mut self, timeout: Duration) -> anyhow::Result<()> {
+        self.wait_ready_with_progress(timeout, |_| {}).await
+    }
+
+    /// Like [`LlamaServer::wait_ready`], calling `on_progress` as loading advances.
+    pub async fn wait_ready_with_progress(
+        &mut self,
+        timeout: Duration,
+        mut on_progress: impl FnMut(LoadProgress),
+    ) -> anyhow::Result<()> {
         let client = reqwest::Client::new();
         let url = format!("{}/health", self.base_url());
         let start = Instant::now();
+        let mut last_frac: f32 = -1.0;
+        let mut last_stage = String::new();
         loop {
             if let Some(status) = self.child.try_wait()? {
                 bail!("llama-server exited while loading ({status})");
@@ -213,10 +317,21 @@ impl LlamaServer {
             {
                 return Ok(());
             }
+            if let Ok(log) = std::fs::read_to_string(&self.log_file) {
+                let mut progress = parse_load_progress(&log);
+                if progress.fraction < last_frac {
+                    progress.fraction = last_frac;
+                }
+                if (progress.fraction - last_frac) >= 0.01 || progress.stage != last_stage {
+                    last_frac = progress.fraction;
+                    last_stage = progress.stage.clone();
+                    on_progress(progress);
+                }
+            }
             if start.elapsed() > timeout {
                 bail!("llama-server did not load the model within {}s", timeout.as_secs());
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
 
@@ -332,5 +447,27 @@ mod tests {
         for pair in [["--spec-type", "ngram-mod"], ["--reasoning-budget", "16384"], ["--temp", "0.6"], ["--top-p", "0.95"], ["--top-k", "20"], ["--min-p", "0"], ["--repeat-penalty", "1"]] {
             assert!(args.windows(2).any(|w| w == pair), "{pair:?} in {args:?}");
         }
+    }
+
+    #[test]
+    fn parses_llama_server_loading_stages_and_dots() {
+        let p0 = parse_load_progress("");
+        assert!(p0.fraction < 0.1);
+
+        let p1 = parse_load_progress("llama_model_loader: loaded meta data\n");
+        assert!(p1.fraction > p0.fraction);
+
+        let log_half = "llama_model_loader: ok\nload_tensors: loading model tensors, this can take a while... (mmap = true)\n..................................................\n";
+        let p2 = parse_load_progress(log_half);
+        assert!((p2.fraction - 0.45).abs() < 0.05, "got {}", p2.fraction);
+        assert!(p2.stage.contains("50%"));
+
+        let log_ctx = format!("{log_half}load_tensors: offloaded 32/32 layers to GPU\nllama_context: constructing llama_context\n");
+        let p3 = parse_load_progress(&log_ctx);
+        assert!(p3.fraction >= 0.85);
+
+        let log_listen = format!("{log_ctx}warmup: warming up\nmain: server is listening on http://127.0.0.1:8080\n");
+        let p4 = parse_load_progress(&log_listen);
+        assert!(p4.fraction >= 0.95);
     }
 }

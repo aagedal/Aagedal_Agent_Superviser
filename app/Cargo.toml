@@ -14,12 +14,11 @@ sha2 = "0.10"
 [dependencies]
 superviser-core.workspace = true
 superviser-guard.workspace = true
+superviser-backend.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-reqwest.workspace = true
-futures-util.workspace = true
 tracing.workspace = true
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-dialog = "2"

@@ -1,47 +1,32 @@
 //! The chat window's engine: OpenCode's Agent Client Protocol server (`opencode acp`), one
 //! per project, run in the project's macOS sandbox or Linux VM and spoken to over its stdin
 //! and stdout (JSON-RPC, a message per line). It reaches the model through the guard on the
-//! project's path, with every provider but ours turned off. What it reports goes to the window as
-//! `acp` events, and its permission requests wait there for the user's answer.
+//! project's path, with every provider but ours turned off. What it reports goes out on
+//! [`EventBus`] as [`AppEvent::Acp`], and its permission requests wait there for the user's answer.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use serde::Serialize;
 use serde_json::{Value, json};
 use superviser_core::awake::Awake;
 use superviser_core::project::{Folder, Project};
 use superviser_core::sandbox::container::{self, Use, Vm};
 use superviser_core::sandbox::{self, Isolation, seatbelt};
 use superviser_core::{opencode, secrets};
-use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
 use tokio::sync::oneshot;
 
+use crate::events::{AcpEvent, AppEvent, EventBus};
 use crate::state::App;
 
 /// How long requests other than prompts may take (OpenCode's first start takes a few seconds).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const PROTOCOL_VERSION: u64 = 1;
-
-/// What the chat window hears, on the `acp` event.
-#[derive(Serialize, Clone)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum Event {
-    /// A `session/update` from OpenCode, as it sent it.
-    Update { project: String, session: String, update: Value },
-    /// OpenCode asks before a call; answer with `acp_permission`.
-    Permission { project: String, session: String, request: String, tool_call: Value, options: Value },
-    /// A prompt started or ended.
-    State { project: String, session: String, busy: bool, stop_reason: Option<String>, error: Option<String> },
-    /// OpenCode is starting slowly for the project: why.
-    Starting { project: String, text: String },
-}
 
 /// The running engines, by project id.
 #[derive(Default)]
@@ -61,8 +46,8 @@ pub struct Engine {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     /// Permission requests waiting for the user: our id → (the JSON-RPC id to answer, session).
     asks: Mutex<HashMap<String, (Value, String)>>,
-    /// Sessions with a prompt in flight.
-    busy: Mutex<HashSet<String>>,
+    /// Sessions with a prompt in flight, mapped to when the turn started.
+    busy: Mutex<HashMap<String, Instant>>,
     /// Sessions this process has open (made or loaded); others must be loaded before a prompt.
     open: Mutex<HashSet<String>>,
     /// Sessions being loaded only to prompt them: their replay isn't shown again.
@@ -89,7 +74,7 @@ impl Engines {
 
     /// The engine for `project`, started (or restarted, when its settings or the model changed
     /// and it's idle) as needed.
-    pub async fn get(&self, handle: &AppHandle, app: &App, project: &Project) -> anyhow::Result<Arc<Engine>> {
+    pub async fn get(&self, app: &App, project: &Project) -> anyhow::Result<Arc<Engine>> {
         let launch = Launch::new(app, project)?;
         if let Some(engine) = self.running.lock().unwrap().get(&project.id).cloned()
             && engine.alive.load(Ordering::SeqCst)
@@ -111,16 +96,21 @@ impl Engines {
             && let Some(vm_stop) = old.stop()
         {
             // Wait for the old VM with the same name to finish stopping before starting the replacement.
-            let _ = tauri::async_runtime::spawn_blocking(move || vm_stop.join()).await;
+            let _ = tokio::task::spawn_blocking(move || vm_stop.join()).await;
         }
-        let engine = Engine::start(handle.clone(), app, project, launch).await?;
+        let engine = Engine::start(app, project, launch).await?;
         self.running.lock().unwrap().insert(project.id.clone(), engine.clone());
         Ok(engine)
     }
 
     /// The engine for a project if one runs.
     pub async fn running(&self, project: &str) -> Option<Arc<Engine>> {
-        self.running.lock().unwrap().get(project).filter(|e| e.alive.load(Ordering::SeqCst)).cloned()
+        self.running
+            .lock()
+            .unwrap()
+            .get(project)
+            .filter(|e| e.alive.load(Ordering::SeqCst))
+            .cloned()
     }
 
     /// Stops one project's engine (e.g. when the project is deleted).
@@ -153,14 +143,25 @@ struct Launch {
 impl Launch {
     fn new(app: &App, project: &Project) -> anyhow::Result<Self> {
         let guard = app.guard_url().context("the guard is not running")?;
-        let main = std::fs::canonicalize(project.main()).with_context(|| format!("{} is gone", project.main().display()))?;
-        let related: Vec<Folder> = project.related().iter().filter_map(|f| Some(Folder { path: std::fs::canonicalize(&f.path).ok()?, writable: f.writable })).collect();
+        let main = std::fs::canonicalize(project.main())
+            .with_context(|| format!("{} is gone", project.main().display()))?;
+        let related: Vec<Folder> = project
+            .related()
+            .iter()
+            .filter_map(|f| Some(Folder { path: std::fs::canonicalize(&f.path).ok()?, writable: f.writable }))
+            .collect();
         let api_key = secrets::local_api_key(&app.paths)?;
         // Every model a chat might use, so a session's recorded model always resolves.
         let models = app
             .installed()
             .into_iter()
-            .filter_map(|m| Some(opencode::SetupModel { context: app.fit(&m.model)?.context, alias: m.alias, name: m.model.name }))
+            .filter_map(|m| {
+                Some(opencode::SetupModel {
+                    context: app.fit(&m.model)?.context,
+                    alias: m.alias,
+                    name: m.model.name,
+                })
+            })
             .collect();
         // No default model: each prompt names the chat's, so switching models needs no restart.
         let setup = match project.isolation {
@@ -184,29 +185,48 @@ impl Launch {
     /// Where OpenCode sees the main folder, and the others.
     fn folders(&self, project: &Project) -> (String, Vec<String>) {
         match project.isolation {
-            Isolation::MacosSandbox => (self.main.display().to_string(), self.related.iter().map(|f| f.path.display().to_string()).collect()),
+            Isolation::MacosSandbox => (
+                self.main.display().to_string(),
+                self.related.iter().map(|f| f.path.display().to_string()).collect(),
+            ),
             Isolation::LinuxVm => container::vm_paths(&self.related),
         }
     }
 
     /// The command that starts OpenCode, isolated as the project says, and the VM it runs
     /// in, if one. A VM's first start builds its image, which takes a few minutes.
-    async fn command(&self, handle: &AppHandle, app: &App, project: &Project) -> anyhow::Result<(std::process::Command, Option<(PathBuf, String)>)> {
+    async fn command(&self, app: &App, project: &Project) -> anyhow::Result<(std::process::Command, Option<(PathBuf, String)>)> {
         std::fs::create_dir_all(app.paths.logs())?;
-        let log = std::fs::OpenOptions::new().create(true).append(true).open(app.paths.logs().join("opencode-acp.log"))?;
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(app.paths.logs().join("opencode-acp.log"))?;
         let (mut command, vm) = match project.isolation {
             Isolation::MacosSandbox => {
                 let binary = opencode::binary().context("OpenCode isn't bundled with this build and isn't installed")?;
-                let profile = seatbelt::write_project_profile(&app.paths, &self.main, &self.related, project.network, &project.blocked_programs, &format!("acp-{}", project.id))?;
+                let profile = seatbelt::write_project_profile(
+                    &app.paths,
+                    &self.main,
+                    &self.related,
+                    project.network,
+                    &project.blocked_programs,
+                    &format!("acp-{}", project.id),
+                )?;
                 let mut command = seatbelt::sandboxed(&profile, &self.main, &binary, &["acp"]);
                 command.env("OPENCODE_CONFIG_CONTENT", self.config.to_string());
                 (command, None)
             }
             Isolation::LinuxVm => {
                 let guard = app.guard_url().context("the guard is not running")?;
-                let (paths, owned, config, main, related) = (app.paths.clone(), project.clone(), self.config.clone(), self.main.clone(), self.related.clone());
+                let (paths, owned, config, main, related) = (
+                    app.paths.clone(),
+                    project.clone(),
+                    self.config.clone(),
+                    self.main.clone(),
+                    self.related.clone(),
+                );
                 // Starting `container`'s services can take a while.
-                let vm = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<Vm> {
+                let vm = tokio::task::spawn_blocking(move || -> anyhow::Result<Vm> {
                     let project = owned;
                     let backend = sandbox::backend(Isolation::LinuxVm);
                     backend.available().map_err(|why| anyhow::anyhow!("The Linux VM isn't available: {why}"))?;
@@ -229,8 +249,12 @@ impl Launch {
                 .await??;
                 if !vm.has_image() {
                     let text = "Building the Linux environment. This happens once and takes a few minutes…".to_string();
-                    let _ = handle.emit("acp", Event::Starting { project: project.id.clone(), text });
-                    let status = tokio::process::Command::from(vm.build_command()).stdout(log.try_clone()?).stderr(log.try_clone()?).status().await?;
+                    app.bus.emit(AppEvent::Acp(AcpEvent::Starting { project: project.id.clone(), text }));
+                    let status = tokio::process::Command::from(vm.build_command())
+                        .stdout(log.try_clone()?)
+                        .stderr(log.try_clone()?)
+                        .status()
+                        .await?;
                     anyhow::ensure!(status.success(), "Building the Linux environment failed; see the opencode-acp log.");
                 }
                 let name = vm.name(Use::Chat);
@@ -246,8 +270,8 @@ impl Launch {
 }
 
 impl Engine {
-    async fn start(handle: AppHandle, app: &App, project: &Project, launch: Launch) -> anyhow::Result<Arc<Self>> {
-        let (command, vm) = launch.command(&handle, app, project).await?;
+    async fn start(app: &App, project: &Project, launch: Launch) -> anyhow::Result<Arc<Self>> {
+        let (command, vm) = launch.command(app, project).await?;
         let (cwd, folders) = launch.folders(project);
         let mut child = tokio::process::Command::from(command)
             .stdin(std::process::Stdio::piped())
@@ -268,17 +292,18 @@ impl Engine {
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             asks: Mutex::new(HashMap::new()),
-            busy: Mutex::new(HashSet::new()),
+            busy: Mutex::new(HashMap::new()),
             alive: AtomicBool::new(true),
             pid: AtomicU32::new(child.id().unwrap_or(0)),
             vm,
         });
         let reader = engine.clone();
-        tauri::async_runtime::spawn(async move {
+        let bus = app.bus.clone();
+        tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 match serde_json::from_str::<Value>(&line) {
-                    Ok(message) => reader.receive(&handle, message).await,
+                    Ok(message) => reader.receive(&bus, message).await,
                     Err(_) => tracing::debug!("opencode acp: {line}"),
                 }
             }
@@ -298,7 +323,7 @@ impl Engine {
         });
         if let Err(e) = engine.request("initialize", init, Some(REQUEST_TIMEOUT)).await.context("OpenCode didn't start") {
             if let Some(vm_stop) = engine.stop() {
-                let _ = tauri::async_runtime::spawn_blocking(move || vm_stop.join()).await;
+                let _ = tokio::task::spawn_blocking(move || vm_stop.join()).await;
             }
             return Err(e);
         }
@@ -349,7 +374,7 @@ impl Engine {
         self.send(json!({ "jsonrpc": "2.0", "method": method, "params": params })).await
     }
 
-    async fn receive(&self, handle: &AppHandle, message: Value) {
+    async fn receive(&self, bus: &EventBus, message: Value) {
         let method = message["method"].as_str().map(str::to_string);
         match (method.as_deref(), message.get("id")) {
             // A response to one of our requests.
@@ -367,30 +392,32 @@ impl Engine {
                 if self.quiet.lock().unwrap().contains(params["sessionId"].as_str().unwrap_or("")) {
                     return;
                 }
-                let _ = handle.emit(
-                    "acp",
-                    Event::Update { project: self.project.clone(), session: params["sessionId"].as_str().unwrap_or("").into(), update: params["update"].clone() },
-                );
+                bus.emit(AppEvent::Acp(AcpEvent::Update {
+                    project: self.project.clone(),
+                    session: params["sessionId"].as_str().unwrap_or("").into(),
+                    update: params["update"].clone(),
+                }));
             }
             (Some("session/request_permission"), Some(id)) => {
                 let params = &message["params"];
                 let request = format!("{}-{}", self.project, id);
                 let session = params["sessionId"].as_str().unwrap_or("").to_string();
                 self.asks.lock().unwrap().insert(request.clone(), (id.clone(), session));
-                let _ = handle.emit(
-                    "acp",
-                    Event::Permission {
-                        project: self.project.clone(),
-                        session: params["sessionId"].as_str().unwrap_or("").into(),
-                        request,
-                        tool_call: params["toolCall"].clone(),
-                        options: params["options"].clone(),
-                    },
-                );
+                bus.emit(AppEvent::Acp(AcpEvent::Permission {
+                    project: self.project.clone(),
+                    session: params["sessionId"].as_str().unwrap_or("").into(),
+                    request,
+                    tool_call: params["toolCall"].clone(),
+                    options: params["options"].clone(),
+                }));
             }
             // We offer no file system or terminal of our own: OpenCode does those itself, in the sandbox.
             (Some(method), Some(id)) => {
-                let error = json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("{method} isn't supported") } });
+                let error = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": format!("{method} isn't supported") }
+                });
                 let _ = self.send(error).await;
             }
             _ => {}
@@ -441,26 +468,37 @@ impl Engine {
     }
 
     pub fn is_busy(&self, session: &str) -> bool {
-        self.busy.lock().unwrap().contains(session)
+        self.busy.lock().unwrap().contains_key(session)
+    }
+
+    pub fn busy_since(&self, session: &str) -> Option<Instant> {
+        self.busy.lock().unwrap().get(session).copied()
     }
 
     /// Sends the user's message, to be answered by `model` (the running one's alias); the reply
-    /// arrives as events, and the end as a `state` event.
-    pub fn prompt(self: &Arc<Self>, handle: AppHandle, session: &str, text: &str, model: &str) -> anyhow::Result<()> {
-        if !self.busy.lock().unwrap().insert(session.to_string()) {
-            bail!("The agent is still working on this chat.");
+    /// arrives as events on `bus`, and the end as a `State` event.
+    pub fn prompt(self: &Arc<Self>, bus: EventBus, session: &str, text: &str, model: &str) -> anyhow::Result<()> {
+        {
+            let mut busy = self.busy.lock().unwrap();
+            if busy.contains_key(session) {
+                bail!("The agent is still working on this chat.");
+            }
+            busy.insert(session.to_string(), Instant::now());
         }
-        let state = |busy: bool, stop_reason: Option<String>, error: Option<String>| Event::State {
+        bus.emit(AppEvent::Acp(AcpEvent::State {
             project: self.project.clone(),
             session: session.to_string(),
-            busy,
-            stop_reason,
-            error,
-        };
-        let _ = handle.emit("acp", state(true, None, None));
+            busy: true,
+            stop_reason: None,
+            error: None,
+        }));
         let engine = self.clone();
-        let (session, text, model) = (session.to_string(), text.to_string(), format!("{}/{model}", opencode::PROVIDER_ID));
-        tauri::async_runtime::spawn(async move {
+        let (session, text, model) = (
+            session.to_string(),
+            text.to_string(),
+            format!("{}/{model}", opencode::PROVIDER_ID),
+        );
+        tokio::spawn(async move {
             // Including the tools it runs between requests to the model.
             let _awake = Awake::hold();
             let result = async {
@@ -476,16 +514,22 @@ impl Engine {
             .await;
             engine.busy.lock().unwrap().remove(&session);
             let event = match result {
-                Ok(result) => Event::State {
+                Ok(result) => AcpEvent::State {
                     project: engine.project.clone(),
                     session,
                     busy: false,
                     stop_reason: result["stopReason"].as_str().map(str::to_string),
                     error: None,
                 },
-                Err(e) => Event::State { project: engine.project.clone(), session, busy: false, stop_reason: None, error: Some(format!("{e:#}")) },
+                Err(e) => AcpEvent::State {
+                    project: engine.project.clone(),
+                    session,
+                    busy: false,
+                    stop_reason: None,
+                    error: Some(format!("{e:#}")),
+                },
             };
-            let _ = handle.emit("acp", event);
+            bus.emit(AppEvent::Acp(event));
         });
         Ok(())
     }
@@ -495,22 +539,33 @@ impl Engine {
         // Questions still open are answered as cancelled, as the protocol asks.
         let open: Vec<Value> = {
             let mut asks = self.asks.lock().unwrap();
-            let keys: Vec<String> = asks.iter().filter(|(_, (_, s))| s == session).map(|(k, _)| k.clone()).collect();
+            let keys: Vec<String> = asks
+                .iter()
+                .filter(|(_, (_, s))| s == session)
+                .map(|(k, _)| k.clone())
+                .collect();
             keys.into_iter().filter_map(|k| asks.remove(&k)).map(|(id, _)| id).collect()
         };
         for id in open {
-            self.send(json!({ "jsonrpc": "2.0", "id": id, "result": { "outcome": { "outcome": "cancelled" } } })).await?;
+            self.send(json!({ "jsonrpc": "2.0", "id": id, "result": { "outcome": { "outcome": "cancelled" } } }))
+                .await?;
         }
         self.notify("session/cancel", json!({ "sessionId": session })).await
     }
 
     /// Answers a permission request with one of its options, or `None` to cancel it.
     pub async fn answer(&self, request: &str, option: Option<&str>) -> anyhow::Result<()> {
-        let (id, _) = self.asks.lock().unwrap().remove(request).context("that question was already answered")?;
+        let (id, _) = self
+            .asks
+            .lock()
+            .unwrap()
+            .remove(request)
+            .context("that question was already answered")?;
         let outcome = match option {
             Some(option) => json!({ "outcome": "selected", "optionId": option }),
             None => json!({ "outcome": "cancelled" }),
         };
-        self.send(json!({ "jsonrpc": "2.0", "id": id, "result": { "outcome": outcome } })).await
+        self.send(json!({ "jsonrpc": "2.0", "id": id, "result": { "outcome": outcome } }))
+            .await
     }
 }

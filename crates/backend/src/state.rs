@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,7 @@ use superviser_core::catalog::{self, Catalog, CatalogModel, Fit, KvType};
 use superviser_core::conversations::{self, Conversations};
 use superviser_core::discover::{self, Discovery, Locations};
 use superviser_core::hardware::Hardware;
+use superviser_core::hub::Hub;
 use superviser_core::installed::{self, InstalledModel, Source};
 use superviser_core::paths::{PROTECTED_NAMES, Paths};
 use superviser_core::project::Project;
@@ -22,7 +23,14 @@ use superviser_guard::journal::Journal;
 use superviser_guard::selfprotect::SelfProtection;
 use superviser_guard::{CallEvent, GuardServer, Judge, JudgeOptions, ProjectRules, ProxyOptions};
 
+use crate::events::{AppEvent, DownloadEvent, EventBus};
+
 pub const DEFAULT_GUARD_PORT: u16 = 8787;
+/// The download id of the judge's model.
+pub const JUDGE_DOWNLOAD: &str = "judge";
+/// How downloads of the judge's model are named in the windows.
+pub const JUDGE_NAME: &str = "the safety check model";
+
 const MAX_EVENTS: usize = 200;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long the Mac stays awake after a model call through the guard: long enough for an agent
@@ -35,14 +43,65 @@ struct AwakeAfter(Option<Awake>);
 impl Drop for AwakeAfter {
     fn drop(&mut self) {
         let awake = self.0.take();
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(AWAKE_AFTER_CALL).await;
-            drop(awake);
-        });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                tokio::time::sleep(AWAKE_AFTER_CALL).await;
+                drop(awake);
+            });
+        }
     }
 }
-/// Origins of the app's own webviews (macOS/Linux, Windows).
-const WEBVIEW_ORIGINS: &[&str] = &["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"];
+
+/// Preferred reasoning depth for a model, injected by the guard on requests that don't specify one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningLevel {
+    /// Keep the model's template default.
+    #[default]
+    Default,
+    /// Disable thinking (`reasoning_effort = "none"`, `enable_thinking = false`).
+    Off,
+    /// Light thinking (`reasoning_effort = "low"`).
+    Low,
+    /// Balanced thinking (`reasoning_effort = "medium"`).
+    Medium,
+    /// Deep thinking (`reasoning_effort = "high"`).
+    High,
+}
+
+impl ReasoningLevel {
+    pub const ALL: &'static [Self] = &[Self::Default, Self::Off, Self::Low, Self::Medium, Self::High];
+
+    pub fn api_value(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::Off => Some("none"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Off => "Off",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Default => "Think: Auto",
+            Self::Off => "Think: Off",
+            Self::Low => "Think: Low",
+            Self::Medium => "Think: Med",
+            Self::High => "Think: High",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -67,6 +126,9 @@ pub struct Settings {
     /// Save each model's last conversation to disk when it's unloaded, and load it back when
     /// the model starts again.
     pub save_conversations: bool,
+    /// Remembered reasoning level per installed model id.
+    #[serde(default)]
+    pub model_reasoning: HashMap<String, ReasoningLevel>,
     /// Before projects: internet access for every folder, the folders opened, and how each
     /// was isolated. Read once to make projects of them, never written.
     #[serde(skip_serializing)]
@@ -90,6 +152,7 @@ impl Default for Settings {
             projects: Vec::new(),
             setup_done: false,
             save_conversations: true,
+            model_reasoning: HashMap::new(),
             sandbox_network: Network::default(),
             recent_projects: Vec::new(),
             project_isolation: HashMap::new(),
@@ -117,7 +180,14 @@ impl Settings {
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum ServerStatus {
     Stopped,
-    Loading { model: String, name: String },
+    Loading {
+        model: String,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        progress: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stage: Option<String>,
+    },
     Running { model: String, name: String, context: u64 },
     Failed { model: String, error: String },
 }
@@ -143,7 +213,12 @@ pub struct LoadedModel {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum LoadState {
-    Loading,
+    Loading {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        progress: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stage: Option<String>,
+    },
     Running { context: u64 },
     Failed { error: String },
 }
@@ -181,6 +256,8 @@ pub struct App {
     pub catalog: Catalog,
     pub settings: Mutex<Settings>,
     pub guard: Mutex<Option<GuardServer>>,
+    /// UI-agnostic event bus for Tauri and GPUI windows + tray controllers.
+    pub bus: EventBus,
     /// The model servers, by installed model id.
     running: tokio::sync::Mutex<HashMap<String, Running>>,
     /// Loaded, loading and failed models, most recently used first.
@@ -190,7 +267,10 @@ pub struct App {
     loading_pids: Mutex<HashMap<u64, u32>>,
     judge_server: tokio::sync::Mutex<Option<LlamaServer>>,
     pub judge_status: Mutex<JudgeStatus>,
+    /// Active download cancellation flags, by download id.
     pub downloads: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Latest progress snapshot of every in-flight download, for newly opened windows.
+    active_downloads: Mutex<HashMap<String, DownloadEvent>>,
     pub events: Mutex<VecDeque<CallEvent>>,
     /// Models other apps downloaded, from the last scan.
     pub discovery: Mutex<Discovery>,
@@ -233,6 +313,7 @@ impl App {
             catalog: Catalog::bundled(),
             settings: Mutex::new(settings),
             guard: Mutex::new(None),
+            bus: EventBus::new(),
             running: tokio::sync::Mutex::new(HashMap::new()),
             models: Mutex::new(Vec::new()),
             next_load_id: AtomicU64::new(1),
@@ -240,14 +321,46 @@ impl App {
             judge_server: tokio::sync::Mutex::new(None),
             judge_status: Mutex::new(JudgeStatus::Idle),
             downloads: Mutex::new(HashMap::new()),
+            active_downloads: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             discovery: Mutex::new(Discovery::default()),
             chats: crate::agent::Chats::default(),
             engines: crate::acp::Engines::default(),
-            chat_models: Mutex::new(std::fs::read_to_string(paths.chat_models()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()),
-            archived_chats: Mutex::new(std::fs::read_to_string(paths.archived_chats()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()),
+            chat_models: Mutex::new(
+                std::fs::read_to_string(paths.chat_models())
+                    .ok()
+                    .and_then(|t| serde_json::from_str(&t).ok())
+                    .unwrap_or_default(),
+            ),
+            archived_chats: Mutex::new(
+                std::fs::read_to_string(paths.archived_chats())
+                    .ok()
+                    .and_then(|t| serde_json::from_str(&t).ok())
+                    .unwrap_or_default(),
+            ),
             paths,
         })
+    }
+
+    pub fn hub() -> Hub {
+        Hub::new(secrets::hf_token())
+    }
+
+    /// Whether to offer the setup guide: not finished or skipped, and not set up some other way
+    /// (a model that fits on this Mac and a project, from Settings).
+    pub fn needs_setup(&self) -> bool {
+        let (done, projects) = {
+            let settings = self.settings.lock().unwrap();
+            (settings.setup_done, !settings.projects.is_empty())
+        };
+        !done && !(projects && self.installed().iter().any(|m| self.fit(&m.model).is_some()))
+    }
+
+    /// Whether `model` is loaded, or on its way.
+    pub fn loading_or_loaded(&self, id: &str) -> bool {
+        self.models()
+            .iter()
+            .any(|m| m.id == id && !matches!(m.state, LoadState::Failed { .. }))
     }
 
     /// Looks for models other apps downloaded (if allowed), replacing the last scan.
@@ -261,6 +374,12 @@ impl App {
         *self.discovery.lock().unwrap() = discovery;
     }
 
+    /// Rescans other apps' caches and notifies subscribers.
+    pub fn rescan_and_notify(&self) {
+        self.rescan();
+        self.bus.emit(AppEvent::Discovery);
+    }
+
     /// The memory budgets chat models get: what the judge leaves when it is on.
     pub fn model_hardware(&self) -> Hardware {
         match &self.catalog.judge {
@@ -271,7 +390,10 @@ impl App {
 
     /// Whether the judge fits beside at least one curated model at its smallest context.
     pub fn judge_fits(&self) -> bool {
-        self.catalog.judge.as_ref().is_some_and(|judge| !self.catalog.offers(&self.hardware.less(judge.judge_required())).is_empty())
+        self.catalog
+            .judge
+            .as_ref()
+            .is_some_and(|judge| !self.catalog.offers(&self.hardware.less(judge.judge_required())).is_empty())
     }
 
     /// The judge's model, if downloaded.
@@ -300,6 +422,7 @@ impl App {
         }
         self.save_settings()?;
         self.sync_judge().await;
+        self.bus.emit(AppEvent::Judge);
         Ok(())
     }
 
@@ -320,10 +443,12 @@ impl App {
             }
             self.set_guard_judge(None);
             *self.judge_status.lock().unwrap() = JudgeStatus::Idle;
+            self.bus.emit(AppEvent::Judge);
             return;
         };
         if server.as_mut().is_none_or(|s| !s.is_running()) {
             *self.judge_status.lock().unwrap() = JudgeStatus::Loading;
+            self.bus.emit(AppEvent::Judge);
             match self.start_judge(&model).await {
                 Ok(started) => {
                     *server = Some(started);
@@ -333,6 +458,7 @@ impl App {
                     *server = None;
                     self.set_guard_judge(None);
                     *self.judge_status.lock().unwrap() = JudgeStatus::Failed { error: format!("{e:#}") };
+                    self.bus.emit(AppEvent::Judge);
                     return;
                 }
             }
@@ -342,6 +468,7 @@ impl App {
         let key = secrets::upstream_api_key(&self.paths).ok();
         self.set_guard_judge(Some(Judge::new(reqwest::Client::new(), &base, key, options)));
         *self.judge_status.lock().unwrap() = JudgeStatus::Running;
+        self.bus.emit(AppEvent::Judge);
     }
 
     async fn start_judge(&self, model: &InstalledModel) -> anyhow::Result<LlamaServer> {
@@ -386,9 +513,21 @@ impl App {
         Ok(())
     }
 
+    /// Generates a new local API key and updates the running guard server.
+    pub fn regenerate_api_key(&self) -> anyhow::Result<String> {
+        let key = secrets::regenerate_local_api_key(&self.paths)?;
+        if let Some(guard) = self.guard.lock().unwrap().as_ref() {
+            guard.set_api_key(Some(key.clone()));
+        }
+        Ok(key)
+    }
+
     /// Strings that name the app's state directory, however a shell might spell it.
     fn state_markers(&self) -> Vec<String> {
-        let mut markers = vec!["me.aagedal.AgentSuperviser".to_string(), self.paths.data.display().to_string()];
+        let mut markers = vec![
+            "me.aagedal.AgentSuperviser".to_string(),
+            self.paths.data.display().to_string(),
+        ];
         if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from)
             && let Ok(rel) = self.paths.data.strip_prefix(&home)
         {
@@ -400,7 +539,8 @@ impl App {
     }
 
     /// Starts the guard on the configured port (or any free one if it is taken).
-    pub async fn start_guard(&self, on_event: superviser_guard::guard::EventSink) -> anyhow::Result<()> {
+    /// Guard call events are recorded in `self.events` and emitted on `self.bus`.
+    pub async fn start_guard(self: &Arc<Self>, cors_origins: Vec<String>) -> anyhow::Result<()> {
         let port = self.settings.lock().unwrap().guard_port;
         let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
             Ok(listener) => listener,
@@ -410,6 +550,11 @@ impl App {
             }
         };
         let names: Vec<String> = PROTECTED_NAMES.iter().map(|s| s.to_string()).collect();
+        let event_app = self.clone();
+        let on_event: superviser_guard::guard::EventSink = Arc::new(move |event: &CallEvent| {
+            event_app.record_event(event);
+            event_app.bus.emit(AppEvent::GuardCall(event.clone()));
+        });
         let config = superviser_guard::Config {
             block: self.settings.lock().unwrap().block,
             self_protection: Some(SelfProtection::new(&names, &self.state_markers())),
@@ -420,7 +565,7 @@ impl App {
         let options = ProxyOptions {
             api_key: Some(secrets::local_api_key(&self.paths)?),
             upstream_api_key: Some(secrets::upstream_api_key(&self.paths)?),
-            cors_origins: WEBVIEW_ORIGINS.iter().map(|s| s.to_string()).collect(),
+            cors_origins,
             // Set once the judge's server runs (`sync_judge`).
             judge: None,
             // Agents run tools between model calls, so the Mac stays awake a while after each.
@@ -447,7 +592,12 @@ impl App {
             .projects
             .iter()
             .map(|p| {
-                let rules = ProjectRules { name: p.name.clone(), allowed_hosts: p.allowed_hosts.clone(), blocked_tools: p.blocked_tools(), blocked_programs: p.blocked_programs.clone() };
+                let rules = ProjectRules {
+                    name: p.name.clone(),
+                    allowed_hosts: p.allowed_hosts.clone(),
+                    blocked_tools: p.blocked_tools(),
+                    blocked_programs: p.blocked_programs.clone(),
+                };
                 (p.id.clone(), rules)
             })
             .collect();
@@ -464,6 +614,154 @@ impl App {
         let mut events = self.events.lock().unwrap();
         events.push_front(event.clone());
         events.truncate(MAX_EVENTS);
+    }
+
+    /// Starts downloading `model` on the current Tokio runtime and emits `AppEvent::Download` updates.
+    pub fn start_download_model(self: &Arc<Self>, model: CatalogModel) -> anyhow::Result<String> {
+        installed::validate_model(&model)?;
+        if self.fit(&model).is_none() {
+            bail!("This model is too large for this machine's memory.");
+        }
+        let id = installed::model_id(&model);
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut downloads = self.downloads.lock().unwrap();
+            if downloads.contains_key(&id) {
+                bail!("already downloading");
+            }
+            downloads.insert(id.clone(), cancel.clone());
+        }
+        let needs = self.fit(&model).map(|fit| fit.required);
+        let name = model.name.clone();
+        let initial = DownloadEvent {
+            id: id.clone(),
+            name: name.clone(),
+            needs,
+            done: 0,
+            total: model.quant.size,
+            finished: false,
+            error: None,
+        };
+        self.active_downloads.lock().unwrap().insert(id.clone(), initial.clone());
+        self.bus.emit(AppEvent::Download(initial));
+
+        let app = self.clone();
+        let task_id = id.clone();
+        tokio::spawn(async move {
+            let _awake = Awake::hold();
+            let mut last = Instant::now();
+            let result = installed::install(&Self::hub(), &app.paths, &model, cancel, |p| {
+                if last.elapsed().as_millis() >= 250 || p.done == p.total {
+                    last = Instant::now();
+                    let ev = DownloadEvent {
+                        id: task_id.clone(),
+                        name: name.clone(),
+                        needs,
+                        done: p.done,
+                        total: p.total,
+                        finished: false,
+                        error: None,
+                    };
+                    app.active_downloads.lock().unwrap().insert(task_id.clone(), ev.clone());
+                    app.bus.emit(AppEvent::Download(ev));
+                }
+            })
+            .await;
+            app.downloads.lock().unwrap().remove(&task_id);
+            app.active_downloads.lock().unwrap().remove(&task_id);
+            let (finished, error) = match result {
+                Ok(_) => (true, None),
+                Err(e) => (false, Some(format!("{e:#}"))),
+            };
+            app.bus.emit(AppEvent::Download(DownloadEvent {
+                id: task_id,
+                name,
+                needs,
+                done: 0,
+                total: 0,
+                finished,
+                error,
+            }));
+        });
+        Ok(id)
+    }
+
+    /// Starts downloading the judge's model on the current Tokio runtime, then starts it if enabled.
+    pub fn start_download_judge(self: &Arc<Self>) -> anyhow::Result<()> {
+        let model = self.catalog.judge.clone().context("this version has no judge model")?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut downloads = self.downloads.lock().unwrap();
+            if downloads.contains_key(JUDGE_DOWNLOAD) {
+                bail!("already downloading");
+            }
+            downloads.insert(JUDGE_DOWNLOAD.into(), cancel.clone());
+        }
+        let initial = DownloadEvent {
+            id: JUDGE_DOWNLOAD.into(),
+            name: JUDGE_NAME.into(),
+            needs: None,
+            done: 0,
+            total: model.quant.size,
+            finished: false,
+            error: None,
+        };
+        self.active_downloads.lock().unwrap().insert(JUDGE_DOWNLOAD.into(), initial.clone());
+        self.bus.emit(AppEvent::Download(initial));
+
+        let app = self.clone();
+        tokio::spawn(async move {
+            let _awake = Awake::hold();
+            let mut last = Instant::now();
+            let dir = installed::judge_dir(&app.paths, &model);
+            let result = installed::install_to(&Self::hub(), &dir, &model, cancel, |p| {
+                if last.elapsed().as_millis() >= 250 || p.done == p.total {
+                    last = Instant::now();
+                    let ev = DownloadEvent {
+                        id: JUDGE_DOWNLOAD.into(),
+                        name: JUDGE_NAME.into(),
+                        needs: None,
+                        done: p.done,
+                        total: p.total,
+                        finished: false,
+                        error: None,
+                    };
+                    app.active_downloads.lock().unwrap().insert(JUDGE_DOWNLOAD.into(), ev.clone());
+                    app.bus.emit(AppEvent::Download(ev));
+                }
+            })
+            .await;
+            app.downloads.lock().unwrap().remove(JUDGE_DOWNLOAD);
+            app.active_downloads.lock().unwrap().remove(JUDGE_DOWNLOAD);
+            let (finished, error) = match result {
+                Ok(_) => (true, None),
+                Err(e) => (false, Some(format!("{e:#}"))),
+            };
+            app.bus.emit(AppEvent::Download(DownloadEvent {
+                id: JUDGE_DOWNLOAD.into(),
+                name: JUDGE_NAME.into(),
+                needs: None,
+                done: 0,
+                total: 0,
+                finished,
+                error,
+            }));
+            if finished {
+                app.sync_judge().await;
+            }
+            app.bus.emit(AppEvent::Judge);
+        });
+        Ok(())
+    }
+
+    pub fn cancel_download(&self, id: &str) {
+        if let Some(cancel) = self.downloads.lock().unwrap().get(id) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn active_downloads(&self) -> Vec<DownloadEvent> {
+        self.active_downloads.lock().unwrap().values().cloned().collect()
     }
 
     /// The app's own models, then those found from other apps (an id the app has wins).
@@ -488,12 +786,17 @@ impl App {
 
     /// Deletes one of the app's own models. Other apps' files are never touched.
     pub fn delete_model(&self, id: &str) -> anyhow::Result<()> {
+        if self.models().iter().any(|m| m.id == id && !matches!(m.state, LoadState::Failed { .. })) {
+            bail!("Unload the model before deleting it.");
+        }
         let model = self.find_installed(id).with_context(|| format!("{id} is not installed"))?;
         if model.source != Source::App {
             bail!("{} belongs to {}; remove it there.", model.model.name, model.source.label());
         }
         self.conversations.forget(id);
-        installed::remove(&self.paths, id)
+        installed::remove(&self.paths, id)?;
+        self.bus.emit(AppEvent::Discovery);
+        Ok(())
     }
 
     pub fn fit(&self, model: &CatalogModel) -> Option<Fit> {
@@ -514,8 +817,14 @@ impl App {
             let LoadState::Running { context } = m.state else { unreachable!() };
             return ServerStatus::Running { model: m.id.clone(), name: m.name.clone(), context };
         }
-        if let Some(m) = pick(|s| *s == LoadState::Loading) {
-            return ServerStatus::Loading { model: m.id.clone(), name: m.name.clone() };
+        if let Some(m) = pick(|s| matches!(s, LoadState::Loading { .. })) {
+            let LoadState::Loading { progress, stage } = &m.state else { unreachable!() };
+            return ServerStatus::Loading {
+                model: m.id.clone(),
+                name: m.name.clone(),
+                progress: *progress,
+                stage: stage.clone(),
+            };
         }
         if let Some(m) = pick(|s| matches!(s, LoadState::Failed { .. })) {
             let LoadState::Failed { error } = &m.state else { unreachable!() };
@@ -535,13 +844,27 @@ impl App {
 
     /// The most recently used loaded model.
     pub fn latest_model(&self) -> Option<(InstalledModel, u64)> {
-        let id = self.models.lock().unwrap().iter().find(|m| matches!(m.state, LoadState::Running { .. }))?.id.clone();
+        let id = self
+            .models
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| matches!(m.state, LoadState::Running { .. }))?
+            .id
+            .clone();
         self.loaded(&id)
     }
 
     /// Every loaded model, most recently used first.
     pub fn loaded_models(&self) -> Vec<(InstalledModel, u64)> {
-        let ids: Vec<String> = self.models.lock().unwrap().iter().filter(|m| matches!(m.state, LoadState::Running { .. })).map(|m| m.id.clone()).collect();
+        let ids: Vec<String> = self
+            .models
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| matches!(m.state, LoadState::Running { .. }))
+            .map(|m| m.id.clone())
+            .collect();
         ids.iter().filter_map(|id| self.loaded(id)).collect()
     }
 
@@ -556,7 +879,10 @@ impl App {
 
     /// Memory the loaded and loading models take besides `except`: (model budget, RAM).
     fn used(models: &[LoadedModel], except: &str) -> (u64, u64) {
-        models.iter().filter(|m| m.id != except && !matches!(m.state, LoadState::Failed { .. })).fold((0, 0), |(gpu, ram), m| (gpu + m.memory, ram + m.ram))
+        models
+            .iter()
+            .filter(|m| m.id != except && !matches!(m.state, LoadState::Failed { .. }))
+            .fold((0, 0), |(gpu, ram), m| (gpu + m.memory, ram + m.ram))
     }
 
     /// How `model` fits beside the loaded models.
@@ -573,7 +899,9 @@ impl App {
     pub fn room_for(&self, id: &str) -> anyhow::Result<Room> {
         let model = self.find_installed(id).with_context(|| format!("{id} is not installed"))?;
         let mut models = self.models.lock().unwrap().clone();
-        if models.iter().any(|m| m.id == id && m.state != LoadState::Loading && !matches!(m.state, LoadState::Failed { .. })) || self.fit_beside(&models, &model.model, id).is_some() {
+        if models.iter().any(|m| m.id == id && !matches!(m.state, LoadState::Loading { .. } | LoadState::Failed { .. }))
+            || self.fit_beside(&models, &model.model, id).is_some()
+        {
             return Ok(Room { fits: true, unload: Vec::new() });
         }
         // Unload the least recently used until it fits.
@@ -584,7 +912,11 @@ impl App {
                 return Ok(Room { fits: false, unload });
             }
         }
-        let loading: Vec<String> = models.iter().filter(|m| m.id != id && m.state == LoadState::Loading).map(|m| m.name.clone()).collect();
+        let loading: Vec<String> = models
+            .iter()
+            .filter(|m| m.id != id && matches!(m.state, LoadState::Loading { .. }))
+            .map(|m| m.name.clone())
+            .collect();
         if !loading.is_empty() && self.fit(&model.model).is_some() {
             bail!("{} is still loading; wait for it or unload it first", loading.join(" and "));
         }
@@ -593,15 +925,23 @@ impl App {
 
     /// Safe unique file stem for a model id (avoids alias collisions in `.pid` and `.log` files).
     fn model_file_key(id: &str) -> String {
-        let key: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' }).collect();
+        let key: String = id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+            .collect();
         if key.is_empty() || key == "." || key == ".." { "model".into() } else { key }
     }
 
+    fn emit_status(&self) {
+        self.bus.emit(AppEvent::Status(self.status()));
+    }
+
     /// Loads `id` in its own llama-server beside the loaded models, if it fits, and points the
-    /// guard (and OpenCode) at it. `changed` is told when its state changes.
-    pub async fn load_model(&self, id: &str, mut changed: impl FnMut()) -> anyhow::Result<()> {
+    /// guard (and OpenCode) at it. Emits `AppEvent::Status` on every state change.
+    pub async fn load_model(&self, id: &str) -> anyhow::Result<()> {
         let model = self.find_installed(id).with_context(|| format!("{id} is not installed"))?;
-        let binary = runtime::find_llama_server().context("llama-server was not found (install llama.cpp, or set SUPERVISER_LLAMA_SERVER)")?;
+        let binary = runtime::find_llama_server()
+            .context("llama-server was not found (install llama.cpp, or set SUPERVISER_LLAMA_SERVER)")?;
         let entry = model.entry_path().context("model has no entry file")?;
         secrets::upstream_api_key(&self.paths)?;
         let load_id = self.next_load_id.fetch_add(1, Ordering::Relaxed);
@@ -612,7 +952,7 @@ impl App {
             if let Some(existing) = models.iter().find(|m| m.id == id) {
                 match existing.state {
                     LoadState::Running { .. } => break 'claim None,
-                    LoadState::Loading => bail!("{} is already loading", model.model.name),
+                    LoadState::Loading { .. } => bail!("{} is already loading", model.model.name),
                     LoadState::Failed { .. } => {}
                 }
             }
@@ -631,19 +971,41 @@ impl App {
                 }
             };
             let (_, ram_used) = Self::used(&models, id);
-            let prompt_cache = model.model.prompt_cache(&fit, self.model_hardware().ram_budget.saturating_sub(ram_used));
+            let prompt_cache = model
+                .model
+                .prompt_cache(&fit, self.model_hardware().ram_budget.saturating_sub(ram_used));
             models.retain(|m| m.id != id);
-            let state = LoadState::Loading;
-            models.insert(0, LoadedModel { id: id.to_string(), name: model.model.name.clone(), alias: model.alias.clone(), state, memory: fit.required, ram: fit.required + prompt_cache, load_id });
+            let state = LoadState::Loading {
+                progress: Some(0.03),
+                stage: Some("Starting llama-server…".into()),
+            };
+            models.insert(
+                0,
+                LoadedModel {
+                    id: id.to_string(),
+                    name: model.model.name.clone(),
+                    alias: model.alias.clone(),
+                    state,
+                    memory: fit.required,
+                    ram: fit.required + prompt_cache,
+                    load_id,
+                },
+            );
             Some((fit, prompt_cache))
         };
         let Some((mut fit, mut prompt_cache)) = claimed else {
             self.touch(id);
             self.sync_upstreams().await;
+            self.emit_status();
             return Ok(());
         };
-        changed();
-        tracing::info!("{}: {}k context, {} MiB for saved conversations", model.alias, fit.context / 1024, prompt_cache >> 20);
+        self.emit_status();
+        tracing::info!(
+            "{}: {}k context, {} MiB for saved conversations",
+            model.alias,
+            fit.context / 1024,
+            prompt_cache >> 20
+        );
         let log_file = self.paths.logs().join(format!("llama-server-{file_key}.log"));
         let curated = self.catalog.curated(&model.model.repo);
         let save_conversations = self.settings.lock().unwrap().save_conversations;
@@ -678,7 +1040,29 @@ impl App {
                     self.loading_pids.lock().unwrap().insert(load_id, pid);
                     self.remember_pid(&file_key, Some(pid));
                 }
-                match server.wait_ready(LOAD_TIMEOUT).await {
+                match server
+                    .wait_ready_with_progress(LOAD_TIMEOUT, |p| {
+                        if let Some(m) = self
+                            .models
+                            .lock()
+                            .unwrap()
+                            .iter_mut()
+                            .find(|m| m.id == id && m.load_id == load_id)
+                        {
+                            m.state = LoadState::Loading {
+                                progress: Some(p.fraction),
+                                stage: Some(p.stage.clone()),
+                            };
+                        }
+                        self.bus.emit(AppEvent::LoadProgress {
+                            model: id.to_string(),
+                            name: model.model.name.clone(),
+                            progress: p.fraction,
+                            stage: p.stage,
+                        });
+                    })
+                    .await
+                {
                     Ok(()) => break anyhow::Ok(server),
                     // A model llama.cpp can't draft for may stop while loading: once more without.
                     Err(e) if config.speculative && !server.is_running() => {
@@ -694,17 +1078,27 @@ impl App {
                         self.remember_pid(&file_key, None);
                         let mut models = self.models.lock().unwrap();
                         let Some(f16) = self.fit_beside_with(&models, &model.model, id, KvType::F16) else {
-                            break Err(e.context(format!("{} needs a 16-bit context cache here, which doesn't fit beside the loaded models", model.model.name)));
+                            break Err(e.context(format!(
+                                "{} needs a 16-bit context cache here, which doesn't fit beside the loaded models",
+                                model.model.name
+                            )));
                         };
-                        tracing::warn!("{}: {e:#}; loading it again with a 16-bit cache at {}k context", model.alias, f16.context / 1024);
+                        tracing::warn!(
+                            "{}: {e:#}; loading it again with a 16-bit cache at {}k context",
+                            model.alias,
+                            f16.context / 1024
+                        );
                         let (_, ram_used) = Self::used(&models, id);
                         fit = f16;
-                        prompt_cache = model.model.prompt_cache(&fit, self.model_hardware().ram_budget.saturating_sub(ram_used));
+                        prompt_cache = model
+                            .model
+                            .prompt_cache(&fit, self.model_hardware().ram_budget.saturating_sub(ram_used));
                         if let Some(m) = models.iter_mut().find(|m| m.id == id && m.load_id == load_id) {
                             (m.memory, m.ram) = (fit.required, fit.required + prompt_cache);
                         }
                         drop(models);
-                        (config.kv, config.context, config.prompt_cache, config.speculative) = (fit.kv, fit.context, prompt_cache, true);
+                        (config.kv, config.context, config.prompt_cache, config.speculative) =
+                            (fit.kv, fit.context, prompt_cache, true);
                         config.port = runtime::free_port()?;
                     }
                     Err(e) => {
@@ -730,13 +1124,27 @@ impl App {
                     self.loading_pids.lock().unwrap().remove(&load_id);
                     self.remember_pid(&file_key, None);
                     server.stop().await;
+                    self.emit_status();
                     bail!("{} was unloaded while it loaded", model.model.name);
                 }
-                let key = slot_dir.as_ref().and_then(|_| conversations::Key::of(&model.entry_path()?, fit.kv, fit.context));
-                if let Some(key) = &key
-                    && let Some(tokens) = self.conversations.restore(&server, id, key).await
-                {
-                    tracing::info!("{}: picked up its last conversation ({tokens} tokens)", model.alias);
+                let key = slot_dir
+                    .as_ref()
+                    .and_then(|_| conversations::Key::of(&model.entry_path()?, fit.kv, fit.context));
+                if let Some(key) = &key {
+                    let stage = "Restoring saved conversation…".to_string();
+                    set_state(LoadState::Loading {
+                        progress: Some(0.96),
+                        stage: Some(stage.clone()),
+                    });
+                    self.bus.emit(AppEvent::LoadProgress {
+                        model: id.to_string(),
+                        name: model.model.name.clone(),
+                        progress: 0.96,
+                        stage,
+                    });
+                    if let Some(tokens) = self.conversations.restore(&server, id, key).await {
+                        tracing::info!("{}: picked up its last conversation ({tokens} tokens)", model.alias);
+                    }
                 }
                 // Re-check under the `running` lock so an unload during `restore()` can never
                 // leave an orphaned server invisible to `self.models`.
@@ -747,6 +1155,7 @@ impl App {
                         self.loading_pids.lock().unwrap().remove(&load_id);
                         self.remember_pid(&file_key, None);
                         server.stop().await;
+                        self.emit_status();
                         bail!("{} was unloaded while it loaded", model.model.name);
                     }
                     running.insert(id.to_string(), Running { server, model: model.model.clone(), key });
@@ -754,7 +1163,7 @@ impl App {
                     set_state(LoadState::Running { context: fit.context });
                 }
                 self.sync_upstreams().await;
-                changed();
+                self.emit_status();
                 self.settings.lock().unwrap().last_model = Some(id.to_string());
                 self.save_settings()?;
                 self.sync_judge().await;
@@ -768,7 +1177,7 @@ impl App {
             Err(e) => {
                 self.loading_pids.lock().unwrap().remove(&load_id);
                 set_state(LoadState::Failed { error: format!("{e:#}") });
-                changed();
+                self.emit_status();
                 Err(e)
             }
         }
@@ -778,9 +1187,27 @@ impl App {
     pub async fn unload_model(&self, id: Option<&str>) {
         let stopping: Vec<(String, Running)> = {
             let mut running = self.running.lock().await;
-            let ids: Vec<String> = running.keys().filter(|k| id.is_none_or(|id| id == k.as_str())).cloned().collect();
+            let ids: Vec<String> = running
+                .keys()
+                .filter(|k| id.is_none_or(|id| id == k.as_str()))
+                .cloned()
+                .collect();
             ids.into_iter().filter_map(|k| running.remove(&k).map(|r| (k, r))).collect()
         };
+        // Kill any mid-load processes matching the unloaded model(s) too.
+        let cancel_load_ids: Vec<u64> = self
+            .models
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| id.is_none_or(|id| id == m.id))
+            .map(|m| m.load_id)
+            .collect();
+        for load_id in cancel_load_ids {
+            if let Some(pid) = self.loading_pids.lock().unwrap().remove(&load_id) {
+                let _ = std::process::Command::new("/bin/kill").arg(pid.to_string()).status();
+            }
+        }
         self.models.lock().unwrap().retain(|m| id.is_some_and(|id| id != m.id));
         for (model_id, mut running) in stopping {
             self.save_conversation(&model_id, &running).await;
@@ -789,6 +1216,7 @@ impl App {
         }
         self.sync_upstreams().await;
         self.sync_judge().await;
+        self.emit_status();
     }
 
     /// Saves a model's conversation before it stops, if conversations are saved.
@@ -797,8 +1225,17 @@ impl App {
         if !self.settings.lock().unwrap().save_conversations {
             return;
         }
-        match self.conversations.save(&running.server, id, key, |tokens| running.model.saved_bytes(tokens, key.kv)).await {
-            Ok(Some(saved)) => tracing::info!("{}: saved its conversation ({} tokens, {} MB)", running.server.alias, saved.tokens, saved.bytes / 1_000_000),
+        match self
+            .conversations
+            .save(&running.server, id, key, |tokens| running.model.saved_bytes(tokens, key.kv))
+            .await
+        {
+            Ok(Some(saved)) => tracing::info!(
+                "{}: saved its conversation ({} tokens, {} MB)",
+                running.server.alias,
+                saved.tokens,
+                saved.bytes / 1_000_000
+            ),
             Ok(None) => {}
             Err(e) => tracing::warn!("{}: saving its conversation: {e:#}", running.server.alias),
         }
@@ -831,12 +1268,73 @@ impl App {
     /// Points the guard at every loaded model's server, by alias; requests naming none of
     /// them go to the most recently loaded. Iterates LRU→MRU so a newer model wins alias collisions.
     pub async fn sync_upstreams(&self) {
-        let urls: HashMap<String, String> = self.running.lock().await.iter().map(|(id, r)| (id.clone(), r.server.base_url())).collect();
+        let urls: HashMap<String, String> = self
+            .running
+            .lock()
+            .await
+            .iter()
+            .map(|(id, r)| (id.clone(), r.server.base_url()))
+            .collect();
         let models = self.models();
-        let by_alias: HashMap<String, String> = models.iter().rev().filter_map(|m| Some((m.alias.clone(), urls.get(&m.id)?.clone()))).collect();
+        let by_alias: HashMap<String, String> = models
+            .iter()
+            .rev()
+            .filter_map(|m| Some((m.alias.clone(), urls.get(&m.id)?.clone())))
+            .collect();
         let default = models.iter().find_map(|m| urls.get(&m.id).cloned());
         if let Some(guard) = self.guard.lock().unwrap().as_ref() {
             guard.set_upstreams(by_alias, default);
+        }
+        self.sync_reasoning();
+    }
+
+    /// Remembered reasoning level for an installed model (`Default` if unset).
+    pub fn model_reasoning(&self, id: &str) -> ReasoningLevel {
+        self.settings
+            .lock()
+            .unwrap()
+            .model_reasoning
+            .get(id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Sets and persists the reasoning level for `id`, updating the live guard immediately.
+    pub fn set_model_reasoning(&self, id: &str, level: ReasoningLevel) -> anyhow::Result<()> {
+        {
+            let mut settings = self.settings.lock().unwrap();
+            if level == ReasoningLevel::Default {
+                settings.model_reasoning.remove(id);
+            } else {
+                settings.model_reasoning.insert(id.to_string(), level);
+            }
+        }
+        self.save_settings()?;
+        self.sync_reasoning();
+        self.bus.emit(AppEvent::Reasoning);
+        Ok(())
+    }
+
+    /// Pushes each loaded model's remembered reasoning level into the running guard proxy.
+    pub fn sync_reasoning(&self) {
+        let models = self.models();
+        let levels = self.settings.lock().unwrap().model_reasoning.clone();
+        let by_alias: HashMap<String, String> = models
+            .iter()
+            .rev()
+            .filter(|m| matches!(m.state, LoadState::Running { .. }))
+            .filter_map(|m| {
+                let api = levels.get(&m.id).copied().unwrap_or_default().api_value()?;
+                Some((m.alias.clone(), api.to_string()))
+            })
+            .collect();
+        let default = models
+            .iter()
+            .find(|m| matches!(m.state, LoadState::Running { .. }))
+            .and_then(|m| levels.get(&m.id).copied().unwrap_or_default().api_value())
+            .map(str::to_string);
+        if let Some(guard) = self.guard.lock().unwrap().as_ref() {
+            guard.set_reasoning(by_alias, default);
         }
     }
 
@@ -849,7 +1347,14 @@ impl App {
         let setup = opencode::Setup {
             base_url,
             api_key_file: self.paths.local_api_key(),
-            models: loaded.iter().map(|(m, context)| opencode::SetupModel { alias: m.alias.clone(), name: m.model.name.clone(), context: *context }).collect(),
+            models: loaded
+                .iter()
+                .map(|(m, context)| opencode::SetupModel {
+                    alias: m.alias.clone(),
+                    name: m.model.name.clone(),
+                    context: *context,
+                })
+                .collect(),
             default_model: Some(latest.alias.clone()),
         };
         opencode::install(&setup)
@@ -875,7 +1380,12 @@ impl App {
     /// A project's archived chats.
     pub fn archived_chats(&self, project: &str) -> Vec<String> {
         let prefix = format!("{project}/");
-        self.archived_chats.lock().unwrap().iter().filter_map(|key| key.strip_prefix(&prefix).map(str::to_string)).collect()
+        self.archived_chats
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
+            .collect()
     }
 
     /// Archives a chat, or puts it back in the list.
@@ -884,7 +1394,10 @@ impl App {
         let key = format!("{project}/{chat}");
         let changed = if archived { chats.insert(key) } else { chats.remove(&key) };
         if changed {
-            superviser_core::paths::write_private(&self.paths.archived_chats(), serde_json::to_string(&*chats)?.as_bytes())?;
+            superviser_core::paths::write_private(
+                &self.paths.archived_chats(),
+                serde_json::to_string(&*chats)?.as_bytes(),
+            )?;
         }
         Ok(())
     }
@@ -915,6 +1428,7 @@ impl App {
         }
         self.save_settings()?;
         self.sync_projects();
+        self.bus.emit(AppEvent::Projects);
         Ok(project)
     }
 
@@ -928,7 +1442,10 @@ impl App {
             let before = chat_models.len();
             chat_models.retain(|key, _| !key.starts_with(&format!("{id}/")));
             if chat_models.len() != before {
-                superviser_core::paths::write_private(&self.paths.chat_models(), serde_json::to_string(&*chat_models)?.as_bytes())?;
+                superviser_core::paths::write_private(
+                    &self.paths.chat_models(),
+                    serde_json::to_string(&*chat_models)?.as_bytes(),
+                )?;
             }
         }
         for chat in self.archived_chats(id) {
@@ -936,6 +1453,7 @@ impl App {
         }
         self.save_settings()?;
         self.sync_projects();
+        self.bus.emit(AppEvent::Projects);
         Ok(())
     }
 
@@ -957,7 +1475,11 @@ impl App {
         }
         self.setup_opencode()?;
         let guard_url = self.guard_url().context("the guard is not running")?;
-        let model = self.latest_model().map(|(m, context)| opencode::SetupModel { alias: m.alias, name: m.model.name, context });
+        let model = self.latest_model().map(|(m, context)| opencode::SetupModel {
+            alias: m.alias,
+            name: m.model.name,
+            context,
+        });
         let launch = sandbox::Launch {
             project: &project,
             model,
@@ -974,35 +1496,40 @@ impl App {
             }
         }
         self.save_settings()?;
+        self.bus.emit(AppEvent::Projects);
         Ok(launched)
     }
 
-    pub fn shutdown(&self) {
+    /// Async shutdown: saves conversations, stops model servers, judge, engines, chats, and guard.
+    pub async fn shutdown_async(&self) {
         self.chats.stop_all();
         self.engines.stop_all();
         // Stop any llama-server processes still mid-load before waiting on locks.
         for (_, pid) in self.loading_pids.lock().unwrap().drain() {
             let _ = std::process::Command::new("/bin/kill").arg(pid.to_string()).status();
         }
-        tauri::async_runtime::block_on(async {
-            if let Ok(mut running) = tokio::time::timeout(Duration::from_secs(5), self.running.lock()).await {
-                for (id, mut running) in running.drain() {
-                    self.save_conversation(&id, &running).await;
-                    self.remember_pid(&Self::model_file_key(&id), None);
-                    running.server.stop().await;
-                }
+        if let Ok(mut running) = tokio::time::timeout(Duration::from_secs(5), self.running.lock()).await {
+            for (id, mut running) in running.drain() {
+                self.save_conversation(&id, &running).await;
+                self.remember_pid(&Self::model_file_key(&id), None);
+                running.server.stop().await;
             }
-            if let Ok(mut judge) = tokio::time::timeout(Duration::from_secs(2), self.judge_server.lock()).await
-                && let Some(mut judge) = judge.take()
-            {
-                self.remember_pid("judge", None);
-                judge.stop().await;
-            }
-        });
+        }
+        if let Ok(mut judge) = tokio::time::timeout(Duration::from_secs(2), self.judge_server.lock()).await
+            && let Some(mut judge) = judge.take()
+        {
+            self.remember_pid("judge", None);
+            judge.stop().await;
+        }
         // Catch any server whose lock timed out (e.g. mid-`start_judge`).
         runtime::stop_leftovers(&self.paths.run(), &self.paths.upstream_api_key().display().to_string());
         if let Some(guard) = self.guard.lock().unwrap().as_mut() {
             guard.stop();
         }
+    }
+
+    /// Synchronous shutdown helper for UI quit callbacks.
+    pub fn shutdown(&self, handle: &tokio::runtime::Handle) {
+        handle.block_on(self.shutdown_async());
     }
 }
