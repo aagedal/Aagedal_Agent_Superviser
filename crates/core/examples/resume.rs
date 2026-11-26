@@ -27,7 +27,7 @@ async fn start(model: &Path, work: &Path, conversations: &Conversations, kv: KvT
         prompt_cache: 2 << 30,
         decision: false,
         sampling: None,
-        speculative: true,
+        speculative: superviser_core::runtime::Speculative::Ngram,
         reasoning_budget: None,
         kv,
         slot_dir: Some(conversations.prepare()?.to_path_buf()),

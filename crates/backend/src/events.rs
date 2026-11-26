@@ -11,6 +11,7 @@ use superviser_guard::CallEvent;
 use tokio::sync::mpsc;
 
 use crate::state::ServerStatus;
+use crate::subagents::SubagentRecord;
 
 /// What a chat window hears from OpenCode over ACP.
 #[derive(Debug, Clone, Serialize)]
@@ -68,6 +69,7 @@ pub enum AppEvent {
     Download(DownloadEvent),
     Acp(AcpEvent),
     Chat(ChatEvent),
+    Subagent(SubagentRecord),
 }
 
 /// Lossless fan-out event bus backed by per-subscriber unbounded mpsc channels.

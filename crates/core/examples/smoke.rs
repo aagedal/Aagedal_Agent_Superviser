@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
         reasoning_budget: catalog.curated(&installed.model.repo).and_then(|m| m.reasoning_budget),
         kv: superviser_core::catalog::KvType::Q8,
         slot_dir: None,
-        speculative: true,
+        speculative: superviser_core::runtime::Speculative::Ngram,
     })
     .await?;
     server.wait_ready(Duration::from_secs(120)).await?;

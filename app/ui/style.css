@@ -295,3 +295,28 @@ button.starter:hover { border-color: var(--accent); }
 .menu-item { display: block; width: 100%; text-align: left; border: none; background: none; padding: 6px 10px; border-radius: 5px; }
 .menu-item:hover { background: var(--accent); color: var(--accent-text); }
 .menu-note { padding: 6px 10px; font-size: 12px; color: var(--muted); }
+
+/* Host Git bar (Commit / Push / PR) */
+.git-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 16px; background: var(--bg); border-bottom: 1px solid var(--line); }
+.git-bar-left, .git-bar-actions { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.git-branch { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; padding: 2px 8px; border-radius: 5px; background: var(--chip); border: none; color: var(--text); }
+.git-panel { padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; }
+.git-panel .row { margin: 0; }
+.git-panel textarea { width: 100%; font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); resize: vertical; min-height: 58px; }
+.git-files { display: flex; flex-wrap: wrap; gap: 4px; }
+.git-notice { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 16px; font-size: 12px; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--good) 14%, transparent); }
+.git-notice.bad { background: color-mix(in srgb, var(--bad) 14%, transparent); color: var(--bad); }
+
+/* First-class Sub-Agent strip & inspector drawer */
+.subagent-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 5px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.subagent-pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--chip); font-size: 12px; color: var(--text); }
+.subagent-pill.active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.subagent-pill .dot-running { color: var(--accent); }
+.subagent-pill .dot-completed { color: var(--good); }
+.subagent-pill .dot-failed { color: var(--bad); }
+.subagent-pill .dot-cancelled { color: var(--muted); }
+.subagent-inspector { max-height: 280px; display: flex; flex-direction: column; background: var(--bg); border-bottom: 1px solid var(--accent); }
+.subagent-inspector-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.subagent-inspector-body { overflow: auto; padding: 10px 16px; display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
+.subagent-step { display: flex; align-items: center; gap: 8px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel); }
+.subagent-step code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: none; padding: 0; }

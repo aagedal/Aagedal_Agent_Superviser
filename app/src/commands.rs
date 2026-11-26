@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use superviser_backend::files::{self, FileInfo};
-use superviser_backend::{App, JUDGE_DOWNLOAD, JudgeStatus, LoadedModel, Room, ServerStatus};
+use superviser_backend::git::{self, CommitResult, GitStatus, PrDraft, PullRequestInfo, PushResult};
+use superviser_backend::{App, JUDGE_DOWNLOAD, JudgeStatus, LoadedModel, Room, ServerStatus, SubagentRecord};
 use superviser_core::agent::{Chat, ChatSummary};
 use superviser_core::catalog::{Catalog, CatalogModel, Fit, Offer, Pick};
 use superviser_core::discover::{Locations, MlxModel, Skipped};
@@ -616,4 +617,64 @@ pub fn open_window(handle: AppHandle, name: String) -> Result<()> {
         return Err(format!("no window called {name}"));
     }
     crate::open_window(&handle, &name).map_err(err)
+}
+
+// --- Host-side Git & GitHub PR actions (outside the agent's sandbox) ---
+
+#[tauri::command]
+pub async fn git_status(app: State<'_, Arc<App>>, project: String, check_pr: Option<bool>) -> Result<GitStatus> {
+    let proj = self::project(&app, &project)?;
+    let root = proj.main().to_path_buf();
+    let mut st = git::status(&root).await;
+    if check_pr.unwrap_or(false) && st.is_repo && st.has_remote && st.gh_available && !st.detached {
+        st.open_pr = git::current_pr(&root).await;
+    }
+    Ok(st)
+}
+
+#[tauri::command]
+pub async fn git_commit(app: State<'_, Arc<App>>, project: String, message: String, stage_all: Option<bool>) -> Result<CommitResult> {
+    let proj = self::project(&app, &project)?;
+    git::commit(proj.main(), &message, stage_all.unwrap_or(true)).await.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub async fn git_push(app: State<'_, Arc<App>>, project: String) -> Result<PushResult> {
+    let proj = self::project(&app, &project)?;
+    git::push(proj.main()).await.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub async fn git_create_pr(app: State<'_, Arc<App>>, project: String, title: String, body: String, draft: Option<bool>) -> Result<PullRequestInfo> {
+    let proj = self::project(&app, &project)?;
+    git::create_pr(proj.main(), &title, &body, draft.unwrap_or(false)).await.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub async fn git_generate_commit_message(app: State<'_, Arc<App>>, project: String, model: Option<String>) -> Result<String> {
+    let proj = self::project(&app, &project)?;
+    git::generate_commit_message(&app, proj.main(), model.as_deref()).await.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub async fn git_generate_pr_draft(app: State<'_, Arc<App>>, project: String, model: Option<String>) -> Result<PrDraft> {
+    let proj = self::project(&app, &project)?;
+    git::generate_pr_draft(&app, proj.main(), model.as_deref()).await.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub fn open_external_url(url: String) -> Result<()> {
+    files::open_url(&url).map_err(err)
+}
+
+// --- First-class Sub-Agent tracking ---
+
+#[tauri::command]
+pub fn subagents_list(app: State<'_, Arc<App>>, project: String, session: String) -> Vec<SubagentRecord> {
+    app.subagents.for_session(&project, &session)
+}
+
+#[tauri::command]
+pub fn subagent_cancel(app: State<'_, Arc<App>>, id: String) -> bool {
+    app.subagents.cancel(&id, &app.bus)
 }

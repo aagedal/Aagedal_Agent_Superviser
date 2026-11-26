@@ -8,9 +8,185 @@ use anyhow::{Context, bail};
 use serde::Serialize;
 
 use crate::catalog::{KvType, Sampling};
+use crate::gguf::{self, DraftKind};
+use crate::quant;
 
 /// Overrides where llama-server is found.
 pub const BINARY_ENV: &str = "SUPERVISER_LLAMA_SERVER";
+
+/// Unsloth's recommended draft depth (`--spec-draft-n-max`) for MTP and DSpark on local GPUs
+/// and Apple Silicon: keeps draft latency low while still delivering 1.4x–2.2x decode speedups.
+pub const DEFAULT_SPEC_DRAFT_N_MAX: u32 = 2;
+
+/// Extra headroom reserved beyond a companion draft file's weights for its KV cache and buffers.
+const DRAFT_OVERHEAD_BYTES: u64 = 256 << 20;
+
+/// Speculative decoding strategy passed to `llama-server`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Speculative {
+    #[default]
+    None,
+    /// Draft from n-grams already in the conversation (`--spec-type ngram-mod`). Zero extra
+    /// memory; speeds up code edits that re-emit existing text ~6–7x with identical output.
+    Ngram,
+    /// Neural drafter (embedded MTP head or companion MTP / DSpark / DFlash / Eagle-3 file),
+    /// optionally stacked with `ngram-mod` so both new-code generation and code edits accelerate.
+    Draft {
+        kind: DraftKind,
+        model_path: Option<PathBuf>,
+        n_max: u32,
+        with_ngram: bool,
+    },
+}
+
+impl Speculative {
+    /// Steps down to the next safer strategy if `llama-server` rejects the current one on load:
+    /// `Draft + ngram-mod` → `Draft` → `ngram-mod` → `None`.
+    pub fn downgrade(&self) -> Option<Self> {
+        match self {
+            Self::Draft { kind, model_path, n_max, with_ngram: true } => Some(Self::Draft {
+                kind: *kind,
+                model_path: model_path.clone(),
+                n_max: *n_max,
+                with_ngram: false,
+            }),
+            Self::Draft { with_ngram: false, .. } => Some(Self::Ngram),
+            Self::Ngram => Some(Self::None),
+            Self::None => None,
+        }
+    }
+
+    /// Short human-readable label for logs and UI indicators (e.g. `"MTP + n-gram"`, `"n-gram"`).
+    pub fn label(&self) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::Ngram => Some("n-gram".into()),
+            Self::Draft { kind, with_ngram, .. } => Some(if *with_ngram {
+                format!("{} + n-gram", kind.label())
+            } else {
+                kind.label().into()
+            }),
+        }
+    }
+
+    /// Extra disk/weight bytes occupied by an external companion draft file, if any.
+    pub fn draft_bytes(&self) -> u64 {
+        match self {
+            Self::Draft { model_path: Some(path), .. } => {
+                std::fs::metadata(path).map_or(0, |m| m.len())
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// A companion speculative-decoding draft GGUF discovered next to a main model on disk
+/// (for example Unsloth's `mtp-Qwen3.8-27B.gguf` or a DSpark drafter).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionDraft {
+    pub kind: DraftKind,
+    pub path: PathBuf,
+    pub size: u64,
+}
+
+/// Searches the main model's directory (and its immediate parent if the model lives in a
+/// subfolder like `Q4_K_M/` or `Mainline_Support/`) for a companion MTP / DSpark / DFlash /
+/// Eagle-3 draft GGUF.
+pub fn find_companion_draft(entry_path: &Path) -> Option<CompanionDraft> {
+    let entry_canon = std::fs::canonicalize(entry_path).unwrap_or_else(|_| entry_path.to_path_buf());
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = entry_path.parent() {
+        dirs.push(dir.to_path_buf());
+        if let Some(parent) = dir.parent() {
+            let folder_name = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            // Only climb out of quant/layout subdirs, never out of a shared flat directory like `llama.cpp/`.
+            let is_model_subdir = folder_name == "mainline_support"
+                || quant::allowed(&folder_name)
+                || folder_name.starts_with("ud-");
+            if is_model_subdir {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+    }
+
+    let mut found: Vec<CompanionDraft> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
+                continue;
+            }
+            let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if canon == entry_canon {
+                continue;
+            }
+            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if quant::is_auxiliary(filename) || !quant::is_entry_file(filename) {
+                continue;
+            }
+            let Ok(info) = gguf::read_file(&path) else { continue };
+            let Some(kind) = info.draft_kind(filename) else { continue };
+            let size = std::fs::metadata(&path).map_or(0, |m| m.len());
+            found.push(CompanionDraft { kind, path, size });
+        }
+    }
+    // Prefer DSpark > MTP > DFlash > Eagle3, then smaller draft file for lowest latency.
+    found.sort_by_key(|d| {
+        let rank = match d.kind {
+            DraftKind::Dspark => 0u8,
+            DraftKind::Mtp => 1,
+            DraftKind::Dflash => 2,
+            DraftKind::Eagle3 => 3,
+        };
+        (rank, d.size)
+    });
+    found.into_iter().next()
+}
+
+/// Chooses the best speculative-decoding configuration for `entry_path` given `spare_memory`
+/// (unused bytes of `model_budget`). Returns the strategy and any extra memory it reserves.
+pub fn detect_speculative(entry_path: &Path, spare_memory: u64, n_max: u32) -> (Speculative, u64) {
+    if let Some(draft) = find_companion_draft(entry_path) {
+        let reserve = draft.size.saturating_add(DRAFT_OVERHEAD_BYTES);
+        if reserve <= spare_memory {
+            return (
+                Speculative::Draft {
+                    kind: draft.kind,
+                    model_path: Some(draft.path),
+                    n_max,
+                    with_ngram: true,
+                },
+                reserve,
+            );
+        }
+        tracing::info!(
+            "skipping companion {} draft ({:.1} GB): only {:.1} GB spare memory",
+            draft.kind.label(),
+            reserve as f64 / 1e9,
+            spare_memory as f64 / 1e9
+        );
+    }
+    if gguf::read_file(entry_path).is_ok_and(|info| info.has_embedded_mtp()) {
+        return (
+            Speculative::Draft {
+                kind: DraftKind::Mtp,
+                model_path: None,
+                n_max,
+                with_ngram: true,
+            },
+            0,
+        );
+    }
+    (Speculative::Ngram, 0)
+}
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -28,9 +204,8 @@ pub struct ServerConfig {
     pub decision: bool,
     /// The server's defaults; requests can still set their own.
     pub sampling: Option<Sampling>,
-    /// Draft from n-grams already in the conversation. Coding agents re-emit much of what they
-    /// read (whole files in edits), which this speeds up about sixfold, with the same output.
-    pub speculative: bool,
+    /// Speculative decoding strategy (MTP / DSpark / n-gram).
+    pub speculative: Speculative,
     /// Thinking tokens before the model is told to answer; `None` is unlimited.
     pub reasoning_budget: Option<u32>,
     pub kv: KvType,
@@ -192,6 +367,7 @@ pub fn args(config: &ServerConfig) -> Vec<String> {
         config.api_key_file.display().to_string(),
     ];
     if config.kv != KvType::F16 {
+        args.extend(["--flash-attn".into(), "on".into()]);
         for flag in ["--cache-type-k", "--cache-type-v"] {
             args.extend([flag.to_string(), config.kv.llama_name().to_string()]);
         }
@@ -204,8 +380,32 @@ pub fn args(config: &ServerConfig) -> Vec<String> {
             args.extend([flag.to_string(), config.context.to_string()]);
         }
     }
-    if config.speculative {
-        args.extend(["--spec-type".into(), "ngram-mod".into()]);
+    match &config.speculative {
+        Speculative::None => {}
+        Speculative::Ngram => {
+            args.extend(["--spec-type".into(), "ngram-mod".into()]);
+        }
+        Speculative::Draft { kind, model_path, n_max, with_ngram } => {
+            let spec_type = if *with_ngram {
+                format!("{},ngram-mod", kind.llama_spec_type())
+            } else {
+                kind.llama_spec_type().to_string()
+            };
+            args.extend([
+                "--spec-type".into(),
+                spec_type,
+                "--spec-draft-n-max".into(),
+                n_max.to_string(),
+            ]);
+            if let Some(draft_path) = model_path {
+                args.extend(["--spec-draft-model".into(), draft_path.display().to_string()]);
+                if config.kv != KvType::F16 {
+                    for flag in ["--spec-draft-type-k", "--spec-draft-type-v"] {
+                        args.extend([flag.to_string(), config.kv.llama_name().to_string()]);
+                    }
+                }
+            }
+        }
     }
     if let Some(budget) = config.reasoning_budget {
         args.extend(["--reasoning-budget".into(), budget.to_string(), "--reasoning-budget-message".into(), BUDGET_MESSAGE.into()]);
@@ -403,15 +603,15 @@ mod tests {
             prompt_cache: 1536 << 20,
             decision: false,
             sampling: None,
-            speculative: false,
+            speculative: Speculative::None,
             reasoning_budget: None,
             kv: KvType::F16,
             slot_dir: None,
         };
         assert!(!args(&config).iter().any(|a| a == "--ubatch-size"));
-        assert!(!args(&config).iter().any(|a| a == "--cache-type-k" || a == "--slot-save-path"));
+        assert!(!args(&config).iter().any(|a| a == "--cache-type-k" || a == "--slot-save-path" || a == "--flash-attn"));
         let q8 = args(&ServerConfig { kv: KvType::Q8, slot_dir: Some("/c/slots".into()), ..config.clone() });
-        for pair in [["--cache-type-k", "q8_0"], ["--cache-type-v", "q8_0"], ["--slot-save-path", "/c/slots"]] {
+        for pair in [["--flash-attn", "on"], ["--cache-type-k", "q8_0"], ["--cache-type-v", "q8_0"], ["--slot-save-path", "/c/slots"]] {
             assert!(q8.windows(2).any(|w| w == pair), "{pair:?} in {q8:?}");
         }
         let decision = args(&ServerConfig { decision: true, ..config.clone() });
@@ -438,7 +638,7 @@ mod tests {
             prompt_cache: 0,
             decision: false,
             sampling: Some(sampling),
-            speculative: true,
+            speculative: Speculative::Ngram,
             reasoning_budget: Some(16384),
             kv: KvType::Q8,
             slot_dir: None,
@@ -447,6 +647,109 @@ mod tests {
         for pair in [["--spec-type", "ngram-mod"], ["--reasoning-budget", "16384"], ["--temp", "0.6"], ["--top-p", "0.95"], ["--top-k", "20"], ["--min-p", "0"], ["--repeat-penalty", "1"]] {
             assert!(args.windows(2).any(|w| w == pair), "{pair:?} in {args:?}");
         }
+    }
+
+    #[test]
+    fn speculative_draft_stacks_with_ngram_and_downgrades() {
+        let mtp = Speculative::Draft {
+            kind: DraftKind::Mtp,
+            model_path: Some("/m/mtp-Qwen3.8-27B.gguf".into()),
+            n_max: DEFAULT_SPEC_DRAFT_N_MAX,
+            with_ngram: true,
+        };
+        let config = ServerConfig {
+            binary: "llama-server".into(),
+            model_path: "/m/Qwen3.8-27B-UD-Q4_K_M.gguf".into(),
+            alias: "qwen3.8-27b".into(),
+            context: 65536,
+            port: 1234,
+            api_key_file: "/k/key".into(),
+            log_file: "/l/log".into(),
+            prompt_cache: 0,
+            decision: false,
+            sampling: None,
+            speculative: mtp.clone(),
+            reasoning_budget: None,
+            kv: KvType::Q8,
+            slot_dir: None,
+        };
+        let built = args(&config);
+        for pair in [
+            ["--spec-type", "draft-mtp,ngram-mod"],
+            ["--spec-draft-n-max", "2"],
+            ["--spec-draft-model", "/m/mtp-Qwen3.8-27B.gguf"],
+            ["--spec-draft-type-k", "q8_0"],
+            ["--spec-draft-type-v", "q8_0"],
+        ] {
+            assert!(built.windows(2).any(|w| w == pair), "{pair:?} in {built:?}");
+        }
+        assert_eq!(mtp.label().as_deref(), Some("MTP + n-gram"));
+        let step1 = mtp.downgrade().unwrap();
+        assert_eq!(step1.label().as_deref(), Some("MTP"));
+        let step2 = step1.downgrade().unwrap();
+        assert_eq!(step2, Speculative::Ngram);
+        let step3 = step2.downgrade().unwrap();
+        assert_eq!(step3, Speculative::None);
+        assert_eq!(step3.downgrade(), None);
+    }
+
+    #[test]
+    fn detects_companion_and_embedded_mtp_drafts() {
+        let dir = std::env::temp_dir().join(format!("superviser-spec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let main_path = dir.join("Qwen3.8-27B-UD-Q4_K_M.gguf");
+        let main_embedded = gguf::tests::header(
+            "qwen35",
+            &[("block_count", 64), ("nextn_predict_layers", 1), ("context_length", 262_144)],
+            &[],
+        );
+        std::fs::write(&main_path, &main_embedded).unwrap();
+
+        // Embedded MTP detected when no companion file is present.
+        let (spec, reserve) = detect_speculative(&main_path, 4 << 30, 2);
+        assert_eq!(
+            spec,
+            Speculative::Draft {
+                kind: DraftKind::Mtp,
+                model_path: None,
+                n_max: 2,
+                with_ngram: true,
+            }
+        );
+        assert_eq!(reserve, 0);
+
+        // Companion mtp-*.gguf next to the main model is picked up when spare memory allows.
+        let mtp_path = dir.join("mtp-Qwen3.8-27B.gguf");
+        let mtp_header = gguf::tests::header("qwen35-assistant", &[("block_count", 1)], &[]);
+        std::fs::write(&mtp_path, &mtp_header).unwrap();
+        let (spec, reserve) = detect_speculative(&main_path, 4 << 30, 2);
+        assert!(matches!(
+            spec,
+            Speculative::Draft {
+                kind: DraftKind::Mtp,
+                model_path: Some(ref p),
+                n_max: 2,
+                with_ngram: true,
+            } if p == &mtp_path
+        ));
+        assert!(reserve >= DRAFT_OVERHEAD_BYTES);
+
+        // If spare memory is too tight for the companion draft, falls back to embedded MTP.
+        let (spec_tight, reserve_tight) = detect_speculative(&main_path, 1 << 20, 2);
+        assert_eq!(
+            spec_tight,
+            Speculative::Draft {
+                kind: DraftKind::Mtp,
+                model_path: None,
+                n_max: 2,
+                with_ngram: true,
+            }
+        );
+        assert_eq!(reserve_tight, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

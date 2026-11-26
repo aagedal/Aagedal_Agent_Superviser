@@ -19,8 +19,24 @@
     <div class="chat">
       <header>
         <div class="chat-title"><strong id="title">New chat</strong> <span class="muted small" id="where"></span></div>
-        <span class="muted small"><span id="usage"></span> <select id="chat-model" title="The model this chat uses"></select> <button class="icon" id="unload" title="Unload the model, freeing its memory" hidden>Unload</button> <button class="icon" id="archive" title="Archive this chat: keep it, out of the list" hidden>Archive</button></span>
+        <span class="muted small"><span id="usage"></span> <span class="chip" id="spec-badge" hidden></span> <select id="chat-model" title="The model this chat uses"></select> <button class="icon" id="unload" title="Unload the model, freeing its memory" hidden>Unload</button> <button class="icon" id="archive" title="Archive this chat: keep it, out of the list" hidden>Archive</button></span>
       </header>
+      <div class="git-bar" id="git-bar" hidden>
+        <div class="git-bar-left">
+          <button type="button" class="git-branch" id="git-branch" title="Click to refresh Git status"></button>
+          <span class="small muted" id="git-summary"></span>
+          <span class="small" id="git-busy" hidden></span>
+        </div>
+        <div class="git-bar-actions">
+          <button type="button" class="small" id="git-commit-btn">Commit</button>
+          <button type="button" class="small" id="git-push-btn">Push</button>
+          <button type="button" class="small" id="git-pr-btn">PR</button>
+        </div>
+      </div>
+      <div class="git-panel" id="git-panel" hidden></div>
+      <div class="git-notice" id="git-notice" hidden></div>
+      <div class="subagent-strip" id="subagent-strip" hidden></div>
+      <div class="subagent-inspector" id="subagent-inspector" hidden></div>
       <div class="messages" id="messages"></div>
       <div class="working" id="working" hidden><span class="pulse"></span><span id="working-text">Working…</span></div>
       <div class="banner notice" id="notice" hidden></div>

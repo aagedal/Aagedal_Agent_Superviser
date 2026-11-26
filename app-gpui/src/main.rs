@@ -192,7 +192,8 @@ fn main() {
                         AppEvent::LoadProgress { .. }
                         | AppEvent::Reasoning
                         | AppEvent::Acp(_)
-                        | AppEvent::Chat(_) => false,
+                        | AppEvent::Chat(_)
+                        | AppEvent::Subagent(_) => false,
                     };
                     if refresh {
                         cx.update(|cx| {

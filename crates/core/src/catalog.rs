@@ -72,6 +72,10 @@ pub struct CatalogModel {
     /// they can get stuck in reasoning loops. Set in `sources.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_budget: Option<u32>,
+    /// Optional override for `--spec-draft-n-max` when neural speculative decoding (MTP / DSpark)
+    /// is active. Defaults to Unsloth's recommended `2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_draft_n_max: Option<u32>,
     pub quant: QuantGroup,
 }
 
@@ -319,6 +323,7 @@ impl CatalogModel {
             kv_fixed_bytes: kv.map_or(0, |kv| kv.fixed),
             sampling: None,
             reasoning_budget: None,
+            spec_draft_n_max: None,
             quant: group,
         })
     }

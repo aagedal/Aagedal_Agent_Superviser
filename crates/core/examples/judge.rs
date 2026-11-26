@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
         prompt_cache: 0,
         decision: true,
         sampling: None,
-        speculative: false,
+        speculative: superviser_core::runtime::Speculative::None,
         reasoning_budget: None,
         kv: superviser_core::catalog::KvType::F16,
         slot_dir: None,

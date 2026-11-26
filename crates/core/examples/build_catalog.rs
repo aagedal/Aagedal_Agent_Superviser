@@ -23,6 +23,7 @@ struct Source {
     active_params: Option<f32>,
     sampling: Option<Sampling>,
     reasoning_budget: Option<u32>,
+    spec_draft_n_max: Option<u32>,
 }
 
 #[tokio::main]
@@ -57,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
         model.active_params = source.active_params;
         model.sampling = source.sampling;
         model.reasoning_budget = source.reasoning_budget;
+        model.spec_draft_n_max = source.spec_draft_n_max;
         eprintln!(
             "{:<50} {:<11} {:>6.1} GiB  kv {:>7} B/token  ctx {:?}  {}",
             model.repo,

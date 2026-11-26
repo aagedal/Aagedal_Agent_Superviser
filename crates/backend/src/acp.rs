@@ -23,6 +23,7 @@ use tokio::sync::oneshot;
 
 use crate::events::{AcpEvent, AppEvent, EventBus};
 use crate::state::App;
+use crate::subagents::SubagentTracker;
 
 /// How long requests other than prompts may take (OpenCode's first start takes a few seconds).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -52,6 +53,10 @@ pub struct Engine {
     open: Mutex<HashSet<String>>,
     /// Sessions being loaded only to prompt them: their replay isn't shown again.
     quiet: Mutex<HashSet<String>>,
+    /// Most recent model alias/name sent on each session (for sub-agent tracking badges).
+    session_models: Mutex<HashMap<String, String>>,
+    /// First-class sub-agent tracker shared with the app.
+    subagents: Arc<SubagentTracker>,
     /// The project's main folder and its others, where OpenCode sees them.
     cwd: String,
     folders: Vec<String>,
@@ -177,6 +182,15 @@ impl Launch {
         if let (Some(config), Value::Object(ours)) = (config.as_object_mut(), opencode::only_ours(&setup)) {
             config.extend(ours);
         }
+        // When a user has multiple models loaded at once, point OpenCode's lightweight helper
+        // `small_model` at the lightest loaded model so title/helper calls avoid evicting the
+        // main model's KV cache.
+        let loaded = app.loaded_models();
+        if loaded.len() >= 2
+            && let Some((lightest, _)) = loaded.iter().min_by_key(|(m, _)| m.model.quant.size)
+        {
+            config["small_model"] = json!(format!("{}/{}", opencode::PROVIDER_ID, lightest.alias));
+        }
         let binary = opencode::binary();
         let fingerprint = json!({ "project": project, "config": config, "binary": binary, "key": api_key }).to_string();
         Ok(Self { config, fingerprint, main, related })
@@ -285,6 +299,8 @@ impl Engine {
             project: project.id.clone(),
             open: Mutex::new(HashSet::new()),
             quiet: Mutex::new(HashSet::new()),
+            session_models: Mutex::new(HashMap::new()),
+            subagents: app.subagents.clone(),
             cwd,
             folders,
             fingerprint: launch.fingerprint,
@@ -389,13 +405,23 @@ impl Engine {
             }
             (Some("session/update"), None) => {
                 let params = &message["params"];
-                if self.quiet.lock().unwrap().contains(params["sessionId"].as_str().unwrap_or("")) {
+                let session = params["sessionId"].as_str().unwrap_or("");
+                if self.quiet.lock().unwrap().contains(session) {
                     return;
                 }
+                let update = &params["update"];
+                let default_model = self.session_models.lock().unwrap().get(session).cloned();
+                self.subagents.ingest_acp_update(
+                    &self.project,
+                    session,
+                    update,
+                    default_model,
+                    bus,
+                );
                 bus.emit(AppEvent::Acp(AcpEvent::Update {
                     project: self.project.clone(),
-                    session: params["sessionId"].as_str().unwrap_or("").into(),
-                    update: params["update"].clone(),
+                    session: session.into(),
+                    update: update.clone(),
                 }));
             }
             (Some("session/request_permission"), Some(id)) => {
@@ -493,6 +519,10 @@ impl Engine {
             error: None,
         }));
         let engine = self.clone();
+        self.session_models
+            .lock()
+            .unwrap()
+            .insert(session.to_string(), model.to_string());
         let (session, text, model) = (
             session.to_string(),
             text.to_string(),

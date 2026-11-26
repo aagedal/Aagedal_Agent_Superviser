@@ -16,7 +16,7 @@ use superviser_core::hub::Hub;
 use superviser_core::installed::{self, InstalledModel, Source};
 use superviser_core::paths::{PROTECTED_NAMES, Paths};
 use superviser_core::project::Project;
-use superviser_core::runtime::{self, LlamaServer, ServerConfig};
+use superviser_core::runtime::{self, DEFAULT_SPEC_DRAFT_N_MAX, LlamaServer, ServerConfig, Speculative};
 use superviser_core::sandbox::{self, Isolation, Network};
 use superviser_core::{opencode, secrets};
 use superviser_guard::journal::Journal;
@@ -202,6 +202,9 @@ pub struct LoadedModel {
     pub state: LoadState,
     /// Of the memory a model may take (weights, context, buffers).
     pub memory: u64,
+    /// Active speculative decoding mode once running (e.g. `"MTP + n-gram"`, `"n-gram"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speculative: Option<String>,
     /// Of system memory, with the conversations it keeps.
     #[serde(skip)]
     ram: u64,
@@ -278,6 +281,8 @@ pub struct App {
     pub chats: crate::agent::Chats,
     /// OpenCode, run headless for the chat window, by project.
     pub engines: crate::acp::Engines,
+    /// First-class sub-agents triggered in OpenCode ACP or the built-in agent.
+    pub subagents: Arc<crate::subagents::SubagentTracker>,
     /// The model each chat uses, by `project/chat`: switching a chat's model makes the next
     /// reply read the whole chat again, so each keeps its own.
     chat_models: Mutex<HashMap<String, String>>,
@@ -326,6 +331,7 @@ impl App {
             discovery: Mutex::new(Discovery::default()),
             chats: crate::agent::Chats::default(),
             engines: crate::acp::Engines::default(),
+            subagents: Arc::new(crate::subagents::SubagentTracker::default()),
             chat_models: Mutex::new(
                 std::fs::read_to_string(paths.chat_models())
                     .ok()
@@ -485,7 +491,7 @@ impl App {
             prompt_cache: 0,
             decision: true,
             sampling: None,
-            speculative: false,
+            speculative: Speculative::None,
             reasoning_budget: None,
             // The judge's threshold was set with a 16-bit cache.
             kv: KvType::F16,
@@ -946,6 +952,8 @@ impl App {
         secrets::upstream_api_key(&self.paths)?;
         let load_id = self.next_load_id.fetch_add(1, Ordering::Relaxed);
         let file_key = Self::model_file_key(id);
+        let curated = self.catalog.curated(&model.model.repo);
+        let spec_n_max = curated.and_then(|m| m.spec_draft_n_max).unwrap_or(DEFAULT_SPEC_DRAFT_N_MAX);
         // Check the room and claim it in one go, so two loads can't both take it.
         let claimed = 'claim: {
             let mut models = self.models.lock().unwrap();
@@ -970,10 +978,14 @@ impl App {
                     bail!("{} doesn't fit beside {}; unload one first", model.model.name, others.join(" and "));
                 }
             };
-            let (_, ram_used) = Self::used(&models, id);
+            let (gpu_used, ram_used) = Self::used(&models, id);
+            let hw = self.model_hardware();
+            let spare_gpu = hw.model_budget.saturating_sub(gpu_used.saturating_add(fit.required));
+            let (speculative, draft_reserve) = runtime::detect_speculative(&entry, spare_gpu, spec_n_max);
+            let model_memory = fit.required.saturating_add(draft_reserve);
             let prompt_cache = model
                 .model
-                .prompt_cache(&fit, self.model_hardware().ram_budget.saturating_sub(ram_used));
+                .prompt_cache(&fit, hw.ram_budget.saturating_sub(ram_used.saturating_add(draft_reserve)));
             models.retain(|m| m.id != id);
             let state = LoadState::Loading {
                 progress: Some(0.03),
@@ -986,14 +998,15 @@ impl App {
                     name: model.model.name.clone(),
                     alias: model.alias.clone(),
                     state,
-                    memory: fit.required,
-                    ram: fit.required + prompt_cache,
+                    memory: model_memory,
+                    speculative: speculative.label(),
+                    ram: model_memory.saturating_add(prompt_cache),
                     load_id,
                 },
             );
-            Some((fit, prompt_cache))
+            Some((fit, prompt_cache, speculative, draft_reserve))
         };
-        let Some((mut fit, mut prompt_cache)) = claimed else {
+        let Some((mut fit, mut prompt_cache, initial_speculative, mut draft_reserve)) = claimed else {
             self.touch(id);
             self.sync_upstreams().await;
             self.emit_status();
@@ -1001,13 +1014,13 @@ impl App {
         };
         self.emit_status();
         tracing::info!(
-            "{}: {}k context, {} MiB for saved conversations",
+            "{}: {}k context, {} MiB for saved conversations, speculative: {}",
             model.alias,
             fit.context / 1024,
-            prompt_cache >> 20
+            prompt_cache >> 20,
+            initial_speculative.label().as_deref().unwrap_or("off"),
         );
         let log_file = self.paths.logs().join(format!("llama-server-{file_key}.log"));
-        let curated = self.catalog.curated(&model.model.repo);
         let save_conversations = self.settings.lock().unwrap().save_conversations;
         let slot_dir = match save_conversations.then(|| self.conversations.prepare()) {
             Some(Ok(dir)) => Some(dir.to_path_buf()),
@@ -1020,7 +1033,7 @@ impl App {
         let started = async {
             let mut config = ServerConfig {
                 binary,
-                model_path: entry,
+                model_path: entry.clone(),
                 alias: model.alias.clone(),
                 context: fit.context,
                 port: runtime::free_port()?,
@@ -1030,7 +1043,7 @@ impl App {
                 decision: false,
                 sampling: curated.and_then(|m| m.sampling),
                 reasoning_budget: curated.and_then(|m| m.reasoning_budget),
-                speculative: true,
+                speculative: initial_speculative,
                 kv: fit.kv,
                 slot_dir: slot_dir.clone(),
             };
@@ -1063,13 +1076,47 @@ impl App {
                     })
                     .await
                 {
-                    Ok(()) => break anyhow::Ok(server),
-                    // A model llama.cpp can't draft for may stop while loading: once more without.
-                    Err(e) if config.speculative && !server.is_running() => {
+                    Ok(()) => {
+                        let active_spec = config.speculative.label();
+                        if let Some(m) = self
+                            .models
+                            .lock()
+                            .unwrap()
+                            .iter_mut()
+                            .find(|m| m.id == id && m.load_id == load_id)
+                        {
+                            m.speculative = active_spec.clone();
+                        }
+                        if let Some(spec) = active_spec {
+                            tracing::info!("{}: active speculative decoding: {spec}", model.alias);
+                        }
+                        break anyhow::Ok(server);
+                    }
+                    // Step down speculative decoding (`Draft+ngram` → `Draft` → `ngram` → `none`)
+                    // if llama.cpp rejects the current strategy while loading.
+                    Err(e) if !server.is_running() && config.speculative.downgrade().is_some() => {
+                        let next_spec = config.speculative.downgrade().unwrap();
                         self.loading_pids.lock().unwrap().remove(&load_id);
                         self.remember_pid(&file_key, None);
-                        tracing::warn!("{}: {e:#}; loading it again without speculative decoding", model.alias);
-                        config.speculative = false;
+                        tracing::warn!(
+                            "{}: {e:#}; retrying speculative decoding as {}",
+                            model.alias,
+                            next_spec.label().as_deref().unwrap_or("off")
+                        );
+                        if !matches!(next_spec, Speculative::Draft { model_path: Some(_), .. }) && draft_reserve > 0 {
+                            draft_reserve = 0;
+                            if let Some(m) = self
+                                .models
+                                .lock()
+                                .unwrap()
+                                .iter_mut()
+                                .find(|m| m.id == id && m.load_id == load_id)
+                            {
+                                m.memory = fit.required;
+                                m.ram = fit.required.saturating_add(prompt_cache);
+                            }
+                        }
+                        config.speculative = next_spec;
                         config.port = runtime::free_port()?;
                     }
                     // Nor one whose attention can't use an 8-bit cache: with a 16-bit one, if it fits.
@@ -1088,17 +1135,27 @@ impl App {
                             model.alias,
                             f16.context / 1024
                         );
-                        let (_, ram_used) = Self::used(&models, id);
+                        let (gpu_used, ram_used) = Self::used(&models, id);
+                        let hw = self.model_hardware();
                         fit = f16;
+                        let spare_gpu = hw.model_budget.saturating_sub(gpu_used.saturating_add(fit.required));
+                        let (speculative, new_draft_reserve) =
+                            runtime::detect_speculative(&entry, spare_gpu, spec_n_max);
+                        draft_reserve = new_draft_reserve;
+                        let model_memory = fit.required.saturating_add(draft_reserve);
                         prompt_cache = model
                             .model
-                            .prompt_cache(&fit, self.model_hardware().ram_budget.saturating_sub(ram_used));
+                            .prompt_cache(&fit, hw.ram_budget.saturating_sub(ram_used.saturating_add(draft_reserve)));
                         if let Some(m) = models.iter_mut().find(|m| m.id == id && m.load_id == load_id) {
-                            (m.memory, m.ram) = (fit.required, fit.required + prompt_cache);
+                            (m.memory, m.ram, m.speculative) = (
+                                model_memory,
+                                model_memory.saturating_add(prompt_cache),
+                                speculative.label(),
+                            );
                         }
                         drop(models);
                         (config.kv, config.context, config.prompt_cache, config.speculative) =
-                            (fit.kv, fit.context, prompt_cache, true);
+                            (fit.kv, fit.context, prompt_cache, speculative);
                         config.port = runtime::free_port()?;
                     }
                     Err(e) => {

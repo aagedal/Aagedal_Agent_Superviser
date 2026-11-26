@@ -526,9 +526,20 @@ async function showChat(id) {
   usage = null;
   if (!awaiting) pending.length = 0;
   clearView();
+  subagents = [];
+  inspectedSubagent = null;
+  renderSubagents();
   $("usage").textContent = "";
   $("title").textContent = "New chat";
   if (id && proj) {
+    invoke("subagents_list", { project: proj.id, session: id })
+      .then((list) => {
+        if (mine === chatGen) {
+          subagents = list || [];
+          renderSubagents();
+        }
+      })
+      .catch(() => {});
     try {
       const isBusy = await engines[engine].open(id, proj.id);
       if (mine !== chatGen) return;
@@ -648,7 +659,12 @@ async function openProject(id) {
   project = projects.find((p) => p.id === id) || projects.find((p) => p.id === project?.id) || projects[0] || null;
   $("project").value = project?.id || "";
   $("where").textContent = project ? `· ${project.folders[0].path}` : "";
+  gitPanel = null;
+  gitNotice = null;
+  gitState = null;
+  renderGit();
   await showChat(null);
+  refreshGit(true);
 }
 window.openProject = openProject;
 
@@ -708,6 +724,12 @@ function renderModelPicker() {
   select.disabled = busy || !models.length;
   $("unload").hidden = !isLoaded(chatModel);
   $("unload").title = `Unload ${modelName(chatModel)}, freeing its memory`;
+  const running = loadedModels.find((m) => m.id === chatModel && m.state === "running");
+  const spec = $("spec-badge");
+  if (spec) {
+    spec.textContent = running?.speculative ? `⚡ ${running.speculative}` : "";
+    spec.hidden = !running?.speculative;
+  }
 }
 
 $("unload").addEventListener("click", async () => {
@@ -820,6 +842,7 @@ function finished(error, stopReason) {
   if (stopReason === "cancelled") list().append(el("div", { class: "small muted stopped" }, "Stopped."));
   if (error) list().append(el("div", { class: "banner bad" }, error));
   renderChatList();
+  refreshGit(false);
   scrollDown();
   update();
 }
@@ -874,6 +897,7 @@ function deliver(handler) {
 }
 listen("acp", deliver(onOpencode));
 listen("chat", deliver(onBuiltin));
+listen("subagent", deliver(onSubagent));
 listen("status", refreshStatus);
 listen("discovery", loadModels);
 listen("projects", async () => {
@@ -1030,6 +1054,387 @@ $("new-chat").addEventListener("click", () => showChat(null));
 $("archive").addEventListener("click", () => session && archiveChat(session, true));
 $("project").addEventListener("change", () => openProject($("project").value));
 $("manage").addEventListener("click", () => invoke("open_window", { name: "settings" }));
+
+// --- Host-side Git & GitHub PR bar ---
+
+let gitState = null;
+let gitGen = 0;
+let gitPanel = null; // null | "commit" | "pr"
+let gitBusy = null;
+let gitNotice = null; // null | { text, url?, error? }
+
+async function refreshGit(checkPr = false) {
+  const proj = project;
+  if (!proj) {
+    gitState = null;
+    renderGit();
+    return;
+  }
+  const mine = ++gitGen;
+  try {
+    const st = await invoke("git_status", { project: proj.id, checkPr: false });
+    if (mine !== gitGen || project?.id !== proj.id) return;
+    if (!checkPr && gitState && gitState.branch === st.branch) st.open_pr = gitState.open_pr;
+    gitState = st.is_repo ? st : null;
+    renderGit();
+    if (checkPr && st.is_repo && st.has_remote && st.gh_available && !st.detached) {
+      const full = await invoke("git_status", { project: proj.id, checkPr: true });
+      if (mine !== gitGen || project?.id !== proj.id) return;
+      gitState = full.is_repo ? full : null;
+      renderGit();
+    }
+  } catch {
+    if (mine === gitGen) {
+      gitState = null;
+      renderGit();
+    }
+  }
+}
+
+function renderGit() {
+  const bar = $("git-bar");
+  const panel = $("git-panel");
+  const notice = $("git-notice");
+  if (!gitState?.is_repo) {
+    bar.hidden = true;
+    panel.hidden = true;
+    notice.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  const st = gitState;
+  const dirty = st.dirty_files.length;
+  $("git-branch").textContent = `⎇ ${st.detached ? "detached HEAD" : st.branch || "HEAD"}`;
+  const parts = [];
+  if (dirty > 0) parts.push(`${dirty} changed`);
+  else if (st.ahead === 0 && st.behind === 0) parts.push("Clean");
+  if (st.ahead > 0) parts.push(`↑${st.ahead}`);
+  if (st.behind > 0) parts.push(`↓${st.behind}`);
+  $("git-summary").textContent = parts.join(" · ");
+  $("git-busy").textContent = gitBusy || "";
+  $("git-busy").hidden = !gitBusy;
+
+  const commitBtn = $("git-commit-btn");
+  commitBtn.textContent = dirty > 0 ? `Commit (${dirty})` : "Commit";
+  commitBtn.classList.toggle("primary", dirty > 0);
+  commitBtn.disabled = dirty === 0 || !!gitBusy;
+
+  const pushBtn = $("git-push-btn");
+  pushBtn.textContent = st.ahead > 0 ? `Push ↑${st.ahead}` : !st.upstream && st.has_remote ? "Push branch" : "Push";
+  pushBtn.classList.toggle("primary", dirty === 0 && (st.ahead > 0 || !st.upstream) && st.has_remote && !st.detached);
+  pushBtn.disabled = !st.has_remote || st.detached || !!gitBusy;
+
+  const prBtn = $("git-pr-btn");
+  if (st.open_pr) {
+    prBtn.textContent = st.open_pr.number ? `PR #${st.open_pr.number} ↗` : "Open PR ↗";
+    prBtn.disabled = false;
+  } else {
+    prBtn.textContent = "PR";
+    prBtn.disabled = !st.has_remote || st.detached || !!gitBusy;
+  }
+
+  if (gitNotice) {
+    notice.hidden = false;
+    notice.classList.toggle("bad", !!gitNotice.error);
+    notice.replaceChildren(
+      el("span", {}, gitNotice.text),
+      el(
+        "span",
+        { class: "git-bar-actions" },
+        gitNotice.url ? el("button", { type: "button", class: "small primary", onclick: () => invoke("open_external_url", { url: gitNotice.url }) }, "Open PR ↗") : null,
+        el("button", { type: "button", class: "small", onclick: () => { gitNotice = null; renderGit(); } }, "Dismiss"),
+      ),
+    );
+  } else {
+    notice.hidden = true;
+  }
+
+  if (!gitPanel) {
+    panel.hidden = true;
+    panel.replaceChildren();
+  }
+}
+
+function openCommitPanel() {
+  if (gitPanel === "commit") {
+    gitPanel = null;
+    renderGit();
+    return;
+  }
+  gitPanel = "commit";
+  gitNotice = null;
+  const st = gitState;
+  const panel = $("git-panel");
+  const input = el("input", { type: "text", placeholder: "Commit message (e.g. Fix login redirect)" });
+  const draftBtn = el("button", {
+    type: "button",
+    class: "small",
+    onclick: async () => {
+      draftBtn.disabled = true;
+      draftBtn.textContent = "Drafting…";
+      try {
+        input.value = await invoke("git_generate_commit_message", { project: project.id, model: chatModel });
+      } catch (e) {
+        gitNotice = { text: String(e), error: true };
+        renderGit();
+      } finally {
+        draftBtn.disabled = false;
+        draftBtn.textContent = "Draft message";
+      }
+    },
+  }, "Draft message");
+  const runCommit = async (alsoPush) => {
+    const message = input.value.trim();
+    if (!message) {
+      gitNotice = { text: "Enter a commit message first.", error: true };
+      renderGit();
+      return;
+    }
+    gitBusy = alsoPush ? "Committing & pushing…" : "Committing…";
+    gitNotice = null;
+    renderGit();
+    try {
+      const c = await invoke("git_commit", { project: project.id, message, stageAll: true });
+      if (alsoPush) {
+        const p = await invoke("git_push", { project: project.id });
+        gitNotice = { text: `Committed ${c.hash} and pushed to ${p.remote}/${p.branch}` };
+      } else {
+        gitNotice = { text: `Committed ${c.hash} — ${c.summary}` };
+      }
+      gitPanel = null;
+    } catch (e) {
+      gitNotice = { text: String(e), error: true };
+    } finally {
+      gitBusy = null;
+      await refreshGit(alsoPush);
+    }
+  };
+  input.addEventListener("keydown", (e) => e.key === "Enter" && runCommit(false));
+  const shown = (st?.dirty_files || []).slice(0, 8);
+  const extra = (st?.dirty_files || []).length - shown.length;
+  panel.replaceChildren(
+    el("div", { class: "git-files" }, ...shown.map((f) => el("code", {}, `${f.status} ${f.path}`)), extra > 0 ? el("span", { class: "small muted" }, `+${extra} more`) : null),
+    el("div", { class: "row" }, input, isLoaded(chatModel) ? draftBtn : null),
+    el(
+      "div",
+      { class: "row", style: "justify-content: flex-end;" },
+      el("button", { type: "button", class: "small", onclick: () => { gitPanel = null; renderGit(); } }, "Cancel"),
+      el("button", { type: "button", class: "small", onclick: () => runCommit(false) }, "Commit"),
+      st?.has_remote && !st.detached ? el("button", { type: "button", class: "small primary", onclick: () => runCommit(true) }, "Commit & Push") : null,
+    ),
+  );
+  panel.hidden = false;
+  renderGit();
+  input.focus();
+}
+
+async function openPrPanel() {
+  if (gitState?.open_pr?.url) {
+    invoke("open_external_url", { url: gitState.open_pr.url }).catch((e) => {
+      gitNotice = { text: String(e), error: true };
+      renderGit();
+    });
+    return;
+  }
+  if (gitPanel === "pr") {
+    gitPanel = null;
+    renderGit();
+    return;
+  }
+  gitPanel = "pr";
+  gitNotice = null;
+  const panel = $("git-panel");
+  const titleInput = el("input", { type: "text", placeholder: "Pull request title" });
+  const bodyInput = el("textarea", { placeholder: "Short summary of what changed (optional)" });
+  const draftCheck = el("input", { type: "checkbox" });
+  const submitBtn = el("button", {
+    type: "button",
+    class: "small primary",
+    disabled: !gitState?.gh_available,
+    onclick: async () => {
+      const title = titleInput.value.trim();
+      if (!title) {
+        gitNotice = { text: "Enter a pull request title first.", error: true };
+        renderGit();
+        return;
+      }
+      gitBusy = "Creating PR…";
+      gitNotice = null;
+      renderGit();
+      try {
+        const pr = await invoke("git_create_pr", { project: project.id, title, body: bodyInput.value.trim(), draft: draftCheck.checked });
+        gitPanel = null;
+        gitNotice = { text: pr.number ? `Created PR #${pr.number}: ${pr.title}` : `Created PR: ${pr.title}`, url: pr.url || null };
+      } catch (e) {
+        gitNotice = { text: String(e), error: true };
+      } finally {
+        gitBusy = null;
+        await refreshGit(true);
+      }
+    },
+  }, "Create PR");
+  panel.replaceChildren(
+    !gitState?.gh_available ? el("div", { class: "small warn-text" }, "GitHub CLI (gh) not found on PATH. Install it with `brew install gh` and run `gh auth login`.") : null,
+    el("div", { class: "row" }, titleInput),
+    bodyInput,
+    el(
+      "div",
+      { class: "row" },
+      el("label", { class: "check small" }, draftCheck, "Draft PR"),
+      el("button", { type: "button", class: "small", onclick: () => { gitPanel = null; renderGit(); } }, "Cancel"),
+      submitBtn,
+    ),
+  );
+  panel.hidden = false;
+  renderGit();
+  titleInput.focus();
+  invoke("git_generate_pr_draft", { project: project.id, model: chatModel })
+    .then((draft) => {
+      if (gitPanel === "pr" && !titleInput.value) {
+        titleInput.value = draft.title || "";
+        bodyInput.value = draft.body || "";
+      }
+    })
+    .catch(() => {});
+}
+
+$("git-branch").addEventListener("click", () => refreshGit(true));
+$("git-commit-btn").addEventListener("click", openCommitPanel);
+$("git-push-btn").addEventListener("click", async () => {
+  if (!project || gitBusy) return;
+  gitBusy = "Pushing…";
+  gitNotice = null;
+  renderGit();
+  try {
+    const p = await invoke("git_push", { project: project.id });
+    gitNotice = { text: `Pushed ${p.branch} to ${p.remote}${p.set_upstream ? " (upstream set)" : ""}` };
+  } catch (e) {
+    gitNotice = { text: String(e), error: true };
+  } finally {
+    gitBusy = null;
+    await refreshGit(true);
+  }
+});
+$("git-pr-btn").addEventListener("click", openPrPanel);
+
+// --- First-class Sub-Agent strip & inspector drawer ---
+
+let subagents = [];
+let inspectedSubagent = null;
+let subagentTimer = null;
+
+function formatElapsedMs(startMs, endMs) {
+  const secs = Math.max(0, Math.floor(((endMs || Date.now()) - startMs) / 1000));
+  return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${secs % 60}s`;
+}
+
+function subagentGlyph(state) {
+  return { running: "●", completed: "✓", failed: "✕", cancelled: "○" }[state] || "●";
+}
+
+function onSubagent(rec) {
+  if (!rec || rec.project !== project?.id || rec.parent_session !== session) return;
+  const idx = subagents.findIndex((s) => s.id === rec.id);
+  if (idx >= 0) subagents[idx] = rec;
+  else subagents.push(rec);
+  renderSubagents();
+}
+
+function renderSubagents() {
+  const strip = $("subagent-strip");
+  const drawer = $("subagent-inspector");
+  if (!subagents.length) {
+    strip.hidden = true;
+    drawer.hidden = true;
+    clearInterval(subagentTimer);
+    subagentTimer = null;
+    return;
+  }
+  const anyRunning = subagents.some((s) => s.state === "running");
+  if (anyRunning && !subagentTimer) subagentTimer = setInterval(renderSubagents, 1000);
+  else if (!anyRunning && subagentTimer) {
+    clearInterval(subagentTimer);
+    subagentTimer = null;
+  }
+
+  const runningCount = subagents.filter((s) => s.state === "running").length;
+  const heading = runningCount > 0 ? `Sub-agents (${runningCount}/${subagents.length} active)` : `Sub-agents (${subagents.length})`;
+  strip.hidden = false;
+  strip.replaceChildren(
+    el("span", { class: "small muted" }, heading),
+    ...subagents.map((rec) => {
+      const active = inspectedSubagent === rec.id;
+      const elapsed = formatElapsedMs(rec.started_ms, rec.finished_ms);
+      const steps = rec.steps?.length ? ` · ${rec.steps.length} steps` : "";
+      return el(
+        "button",
+        {
+          type: "button",
+          class: `subagent-pill${active ? " active" : ""}`,
+          onclick: () => {
+            inspectedSubagent = active ? null : rec.id;
+            renderSubagents();
+          },
+        },
+        el("span", { class: `dot-${rec.state}` }, subagentGlyph(rec.state)),
+        el("strong", {}, rec.role),
+        el("span", { class: "muted" }, rec.title),
+        el("span", { class: "muted" }, `${elapsed}${steps}`),
+      );
+    }),
+  );
+
+  const selected = subagents.find((s) => s.id === inspectedSubagent);
+  if (!selected) {
+    drawer.hidden = true;
+    drawer.replaceChildren();
+    return;
+  }
+  const elapsed = formatElapsedMs(selected.started_ms, selected.finished_ms);
+  const outputText = selected.result || selected.live_text || "";
+  drawer.hidden = false;
+  drawer.replaceChildren(
+    el(
+      "div",
+      { class: "subagent-inspector-head" },
+      el(
+        "div",
+        { class: "git-bar-left" },
+        el("span", { class: `dot-${selected.state}` }, subagentGlyph(selected.state)),
+        el("span", { class: "chip" }, selected.role),
+        el("strong", {}, selected.title),
+      ),
+      el(
+        "div",
+        { class: "git-bar-actions" },
+        selected.model ? el("span", { class: "chip" }, selected.model) : null,
+        el("span", { class: "small muted" }, `${selected.state} · ${elapsed}`),
+        selected.child_session && engine === "opencode"
+          ? el("button", { type: "button", class: "small", onclick: () => showChat(selected.child_session) }, "Open session")
+          : null,
+        selected.state === "running" && selected.cancellable
+          ? el("button", { type: "button", class: "small danger", onclick: () => invoke("subagent_cancel", { id: selected.id }) }, "Stop")
+          : null,
+        el("button", { type: "button", class: "small", onclick: () => { inspectedSubagent = null; renderSubagents(); } }, "Close"),
+      ),
+    ),
+    el(
+      "div",
+      { class: "subagent-inspector-body" },
+      selected.prompt ? el("div", {}, el("div", { class: "muted" }, "Task"), el("div", { class: "banner" }, selected.prompt)) : null,
+      selected.steps?.length
+        ? el(
+            "div",
+            {},
+            el("div", { class: "muted" }, `Steps (${selected.steps.length})`),
+            ...selected.steps.map((st) => el("div", { class: "subagent-step" }, el("strong", {}, st.verb), el("code", {}, st.subject || ""), el("span", { class: "muted" }, st.status))),
+          )
+        : null,
+      selected.error ? el("div", { class: "banner bad" }, selected.error) : null,
+      outputText ? el("div", {}, el("div", { class: "muted" }, selected.result ? "Result" : "Live output"), el("div", { class: "banner" }, richText(outputText))) : null,
+    ),
+  );
+}
 
 (async () => {
   engine = await invoke("chat_engine");

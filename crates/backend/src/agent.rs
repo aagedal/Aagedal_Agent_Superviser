@@ -19,9 +19,12 @@ use tokio::sync::{oneshot, watch};
 
 use crate::events::{AppEvent, ChatEvent, EventBus};
 use crate::state::App;
+use crate::subagents::{SubagentRecord, SubagentState, SubagentStep, now_ms, title_case_role};
 
 /// Model replies in one turn before the agent stops and hands back to the user.
 const MAX_STEPS: usize = 60;
+/// Maximum steps an isolated read-only sub-agent may take before summarizing.
+const MAX_SUBAGENT_STEPS: usize = 12;
 /// How often the reply being written is sent to the window.
 const DELTA_EVERY: Duration = Duration::from_millis(50);
 const DECLINED: &str = "The user declined this call. Ask what they'd like instead, or find another way they'd accept.";
@@ -189,7 +192,10 @@ async fn turn(
         .chain(related.iter().cloned())
         .collect();
     let workspace = Workspace::new(&folders, profile, edits)?;
-    let tools = workspace.definitions();
+    let mut tools = workspace.definitions();
+    if project.allows("subagents") {
+        tools.push(subagent_tool_definition());
+    }
     let system = json!({ "role": "system", "content": system_prompt(project, &main, &related, commands, edits) });
     let guard = app.guard_url().context("the guard is not running")?;
     let url = format!("{}{}/v1/chat/completions", guard.trim_end_matches("/v1"), project.guard_path());
@@ -228,6 +234,8 @@ async fn turn(
         for call in &reply.calls {
             let result = if *stopped.borrow() {
                 NOT_RUN.to_string()
+            } else if call.name == "subagent" && project.allows("subagents") {
+                run_subagent(app, project, &chat.id, model, &folders, call, stopped.clone()).await
             } else if !asks(project.approvals, &call.name) || approved(app, &chat.id, call, &mut stopped).await {
                 workspace.run(&call.name, &call.arguments, stopped.clone()).await
             } else if *stopped.borrow() {
@@ -239,6 +247,302 @@ async fn turn(
         }
     }
     bail!("The agent took {MAX_STEPS} steps without finishing; send a message to let it continue.")
+}
+
+fn subagent_tool_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "subagent",
+            "description": "Delegate a focused read-only investigation or analysis task (e.g. searching files, tracing how a feature works, reviewing code) to an isolated sub-agent with its own fresh context window. Returns a concise summary so your main context stays compact.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "role": { "type": "string", "description": "Short role name such as Explore, Research, or Review" },
+                    "description": { "type": "string", "description": "Short 3-8 word label for the subtask" },
+                    "prompt": { "type": "string", "description": "Clear, self-contained instructions for what the sub-agent should inspect and report back" }
+                },
+                "required": ["description", "prompt"]
+            }
+        }
+    })
+}
+
+/// Picks the best currently-loaded model for a sub-agent: if the machine has another lighter
+/// model loaded alongside `parent_alias`, route the sub-agent there to avoid evicting the
+/// main model's KV cache; otherwise stay on `parent_alias`.
+fn pick_subagent_model(app: &App, parent_alias: &str) -> (String, String) {
+    let loaded = app.loaded_models();
+    if let Some((other, _)) = loaded
+        .iter()
+        .filter(|(m, _)| m.alias != parent_alias)
+        .min_by_key(|(m, _)| m.model.quant.size)
+    {
+        return (other.alias.clone(), other.model.name.clone());
+    }
+    let name = loaded
+        .iter()
+        .find(|(m, _)| m.alias == parent_alias)
+        .map(|(m, _)| m.model.name.clone())
+        .unwrap_or_else(|| parent_alias.to_string());
+    (parent_alias.to_string(), name)
+}
+
+/// Runs an isolated read-only sub-agent turn, streaming its live status, tool steps, and
+/// final summary through `app.subagents`.
+async fn run_subagent(
+    app: &App,
+    project: &Project,
+    parent_chat_id: &str,
+    parent_model_alias: &str,
+    folders: &[Folder],
+    call: &Call,
+    mut parent_stopped: watch::Receiver<bool>,
+) -> String {
+    let args: Value = serde_json::from_str(if call.arguments.trim().is_empty() {
+        "{}"
+    } else {
+        &call.arguments
+    })
+    .unwrap_or_else(|_| json!({}));
+    let role = title_case_role(args["role"].as_str().unwrap_or("Explore"));
+    let title = args["description"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("Investigate codebase")
+        .trim()
+        .to_string();
+    let prompt = args["prompt"]
+        .as_str()
+        .or_else(|| args["task"].as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if prompt.is_empty() {
+        return "Error: subagent requires a non-empty `prompt`.".into();
+    }
+
+    let (model_alias, model_name) = pick_subagent_model(app, parent_model_alias);
+    let sub_id = call.id.clone();
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    app.subagents.register_cancel(&sub_id, cancel_tx);
+
+    app.subagents.upsert(
+        SubagentRecord {
+            id: sub_id.clone(),
+            project: project.id.clone(),
+            parent_session: parent_chat_id.to_string(),
+            child_session: None,
+            role: role.clone(),
+            title: title.clone(),
+            prompt: prompt.clone(),
+            model: Some(model_name),
+            state: SubagentState::Running,
+            started_ms: now_ms(),
+            finished_ms: None,
+            steps: Vec::new(),
+            live_text: None,
+            result: None,
+            error: None,
+            cancellable: true,
+        },
+        &app.bus,
+    );
+
+    let outcome: anyhow::Result<(SubagentState, String)> = async {
+        // Read-only workspace (no edits, no shell) keeps sub-agents safe and conflict-free.
+        let workspace = Workspace::new(folders, None, false)?;
+        let tools = workspace.definitions();
+        let guard = app.guard_url().context("the guard is not running")?;
+        let url = format!(
+            "{}{}/v1/chat/completions",
+            guard.trim_end_matches("/v1"),
+            project.guard_path()
+        );
+        let key = secrets::local_api_key(&app.paths)?;
+        let client = reqwest::Client::new();
+        let system = json!({
+            "role": "system",
+            "content": format!(
+                "You are a focused read-only sub-agent ({role}) helping a parent coding agent on project \"{}\". \
+                 Use `read`, `glob`, and `grep` to gather exact facts, file paths, and line numbers, then return a concise, structured summary directly answering the task.",
+                project.name
+            )
+        });
+        let mut messages = vec![system, json!({ "role": "user", "content": prompt })];
+
+        for _ in 0..MAX_SUBAGENT_STEPS {
+            if *parent_stopped.borrow() || *cancel_rx.borrow() {
+                return Ok((SubagentState::Cancelled, NOT_RUN.to_string()));
+            }
+            let body = json!({
+                "model": model_alias,
+                "messages": messages,
+                "tools": tools,
+                "stream": true
+            });
+            let reply = tokio::select! {
+                r = stream_subagent_reply(app, &sub_id, &client, &url, &key, &body) => r?,
+                _ = parent_stopped.wait_for(|s| *s) => return Ok((SubagentState::Cancelled, NOT_RUN.to_string())),
+                _ = cancel_rx.wait_for(|s| *s) => return Ok((SubagentState::Cancelled, "Stopped by user.".to_string())),
+            };
+            let mut msg = json!({ "role": "assistant", "content": reply.content });
+            if !reply.calls.is_empty() {
+                msg["tool_calls"] = json!(
+                    reply
+                        .calls
+                        .iter()
+                        .map(|c| json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": { "name": c.name, "arguments": c.arguments }
+                        }))
+                        .collect::<Vec<_>>()
+                );
+            }
+            messages.push(msg);
+            if reply.calls.is_empty() {
+                return Ok((SubagentState::Completed, reply.content.trim().to_string()));
+            }
+            for sub_call in &reply.calls {
+                if *parent_stopped.borrow() || *cancel_rx.borrow() {
+                    return Ok((SubagentState::Cancelled, "Stopped by user.".to_string()));
+                }
+                let (verb, subject) = summarize_builtin_call(sub_call);
+                app.subagents.update_with(&sub_id, &app.bus, |rec| {
+                    rec.steps.push(SubagentStep {
+                        id: sub_call.id.clone(),
+                        verb,
+                        subject,
+                        status: "in_progress".into(),
+                        output: None,
+                    });
+                });
+                let tool_out = workspace
+                    .run(&sub_call.name, &sub_call.arguments, cancel_rx.clone())
+                    .await;
+                let failed = tool_out.starts_with("Error:");
+                app.subagents.update_with(&sub_id, &app.bus, |rec| {
+                    if let Some(step) = rec.steps.iter_mut().find(|s| s.id == sub_call.id) {
+                        step.status = if failed { "failed" } else { "completed" }.into();
+                        let preview: String = tool_out.chars().take(600).collect();
+                        step.output = Some(preview);
+                    }
+                });
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": sub_call.id,
+                    "content": tool_out
+                }));
+            }
+        }
+        Ok((
+            SubagentState::Completed,
+            "Sub-agent reached its step limit without a final summary.".to_string(),
+        ))
+    }
+    .await;
+
+    app.subagents.unregister_cancel(&sub_id);
+
+    match outcome {
+        Ok((SubagentState::Completed, text)) => {
+            app.subagents.update_with(&sub_id, &app.bus, |rec| {
+                rec.state = SubagentState::Completed;
+                rec.finished_ms = Some(now_ms());
+                rec.cancellable = false;
+                rec.live_text = None;
+                rec.result = Some(text.clone());
+            });
+            text
+        }
+        Ok((SubagentState::Cancelled, msg)) => {
+            app.subagents.update_with(&sub_id, &app.bus, |rec| {
+                rec.state = SubagentState::Cancelled;
+                rec.finished_ms = Some(now_ms());
+                rec.cancellable = false;
+                rec.error = Some(msg.clone());
+            });
+            msg
+        }
+        Ok((_, text)) => text,
+        Err(e) => {
+            let err = format!("Sub-agent error: {e:#}");
+            app.subagents.update_with(&sub_id, &app.bus, |rec| {
+                rec.state = SubagentState::Failed;
+                rec.finished_ms = Some(now_ms());
+                rec.cancellable = false;
+                rec.error = Some(err.clone());
+            });
+            err
+        }
+    }
+}
+
+fn summarize_builtin_call(call: &Call) -> (String, String) {
+    let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+    let verb = match call.name.as_str() {
+        "read" => "Read",
+        "glob" | "grep" => "Search",
+        other => other,
+    }
+    .to_string();
+    let subject = args["path"]
+        .as_str()
+        .or_else(|| args["pattern"].as_str())
+        .unwrap_or("")
+        .to_string();
+    (verb, subject)
+}
+
+async fn stream_subagent_reply(
+    app: &App,
+    sub_id: &str,
+    client: &reqwest::Client,
+    url: &str,
+    key: &str,
+    body: &Value,
+) -> anyhow::Result<Reply> {
+    let response = client
+        .post(url)
+        .bearer_auth(key)
+        .json(body)
+        .send()
+        .await
+        .context("couldn't reach the guard")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        bail!("the model server said {status}: {text}");
+    }
+    let mut reply = Reply::default();
+    let mut calls: Vec<Call> = Vec::new();
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut last = Instant::now();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        buffer.extend_from_slice(&chunk.context("the sub-agent reply was cut off")?);
+        while let Some((start, end)) = find_sse_event_end(&buffer) {
+            let event: Vec<u8> = buffer.drain(..end).collect();
+            consume_sse_event(&event[..start], &mut reply, &mut calls)?;
+        }
+        if last.elapsed() >= Duration::from_millis(120) && !reply.content.is_empty() {
+            app.subagents.update_with(sub_id, &app.bus, |rec| {
+                rec.live_text = Some(reply.content.clone());
+            });
+            last = Instant::now();
+        }
+    }
+    if !buffer.is_empty() {
+        consume_sse_event(&buffer, &mut reply, &mut calls)?;
+    }
+    for (i, call) in calls.iter_mut().enumerate() {
+        if call.id.is_empty() {
+            call.id = format!("subcall_{i}");
+        }
+    }
+    reply.calls = calls.into_iter().filter(|c| !c.name.is_empty()).collect();
+    Ok(reply)
 }
 
 /// A saved message as the model gets it: without our own fields.

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use superviser_core::catalog::Catalog;
 use superviser_core::paths::Paths;
-use superviser_core::runtime::{self, LlamaServer, ServerConfig};
+use superviser_core::runtime::{self, DEFAULT_SPEC_DRAFT_N_MAX, LlamaServer, ServerConfig};
 use superviser_core::{installed, secrets};
 use superviser_guard::{CallEvent, Config, GuardServer, ProxyOptions};
 
@@ -19,9 +19,11 @@ async fn main() -> anyhow::Result<()> {
     let client_key = std::fs::read_to_string(&args[2])?.trim().to_string();
     let model = installed::list(&paths).into_iter().next().expect("an installed model");
     let catalog = Catalog::bundled();
+    let entry = model.entry_path().unwrap();
+    let (speculative, _) = runtime::detect_speculative(&entry, u64::MAX, DEFAULT_SPEC_DRAFT_N_MAX);
     let mut server = LlamaServer::start(ServerConfig {
         binary: runtime::find_llama_server().expect("llama-server"),
-        model_path: model.entry_path().unwrap(),
+        model_path: entry,
         alias: model.alias.clone(),
         context: 32768,
         port: runtime::free_port()?,
@@ -33,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
         reasoning_budget: catalog.curated(&model.model.repo).and_then(|m| m.reasoning_budget),
         kv: superviser_core::catalog::KvType::Q8,
         slot_dir: None,
-        speculative: true,
+        speculative,
     })
     .await?;
     server.wait_ready(Duration::from_secs(120)).await?;
