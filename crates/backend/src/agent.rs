@@ -1,6 +1,6 @@
 //! The built-in agent's loop. It sends a chat to the model through the guard, on the
 //! project's path so the project's rules apply, runs the tool calls that come back (asking
-//! the user first when the project says to), and tells the chat window as it goes.
+//! the user first when the project says to), and emits updates on [`EventBus`] as it goes.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
-use serde::Serialize;
 use serde_json::{Value, json};
 use superviser_core::agent::tools::{self, Kind, Workspace};
 use superviser_core::agent::{Chat, system_prompt};
@@ -16,9 +15,9 @@ use superviser_core::awake::Awake;
 use superviser_core::project::{Approvals, Folder, Project};
 use superviser_core::sandbox::{Isolation, seatbelt};
 use superviser_core::secrets;
-use tauri::{AppHandle, Emitter};
 use tokio::sync::{oneshot, watch};
 
+use crate::events::{AppEvent, ChatEvent, EventBus};
 use crate::state::App;
 
 /// Model replies in one turn before the agent stops and hands back to the user.
@@ -28,11 +27,17 @@ const DELTA_EVERY: Duration = Duration::from_millis(50);
 const DECLINED: &str = "The user declined this call. Ask what they'd like instead, or find another way they'd accept.";
 const NOT_RUN: &str = "Not run: the user stopped the agent.";
 
+struct RunningTurn {
+    project: String,
+    started_at: Instant,
+    stop: watch::Sender<bool>,
+}
+
 /// Turns in progress and calls waiting for the user.
 #[derive(Default)]
 pub struct Chats {
-    /// By chat id: (project id, sender where `true` stops the turn).
-    running: Mutex<HashMap<String, (String, watch::Sender<bool>)>>,
+    /// By chat id: running turn metadata and stop signal.
+    running: Mutex<HashMap<String, RunningTurn>>,
     /// Chats deleted while a turn was stopping, so the exiting turn never recreates their file.
     deleted: Mutex<HashSet<String>>,
     /// By `chat:call`.
@@ -44,18 +49,22 @@ impl Chats {
         self.running.lock().unwrap().contains_key(chat)
     }
 
+    pub fn busy_since(&self, chat: &str) -> Option<Instant> {
+        self.running.lock().unwrap().get(chat).map(|turn| turn.started_at)
+    }
+
     pub fn stop(&self, chat: &str) {
-        if let Some((_, stop)) = self.running.lock().unwrap().get(chat) {
-            let _ = stop.send(true);
+        if let Some(turn) = self.running.lock().unwrap().get(chat) {
+            let _ = turn.stop.send(true);
         }
     }
 
     /// Stops `chat` and marks it deleted so an active turn won't save its file back to disk.
     pub fn stop_and_delete(&self, chat: &str) {
         let running = self.running.lock().unwrap();
-        if let Some((_, stop)) = running.get(chat) {
+        if let Some(turn) = running.get(chat) {
             self.deleted.lock().unwrap().insert(chat.to_string());
-            let _ = stop.send(true);
+            let _ = turn.stop.send(true);
         }
     }
 
@@ -63,18 +72,18 @@ impl Chats {
     pub fn stop_project(&self, project: &str) {
         let running = self.running.lock().unwrap();
         let mut deleted = self.deleted.lock().unwrap();
-        for (chat, (proj, stop)) in running.iter() {
-            if proj == project {
+        for (chat, turn) in running.iter() {
+            if turn.project == project {
                 deleted.insert(chat.clone());
-                let _ = stop.send(true);
+                let _ = turn.stop.send(true);
             }
         }
     }
 
     /// Stops every active turn (when the app quits).
     pub fn stop_all(&self) {
-        for (_, stop) in self.running.lock().unwrap().values() {
-            let _ = stop.send(true);
+        for turn in self.running.lock().unwrap().values() {
+            let _ = turn.stop.send(true);
         }
     }
 
@@ -89,30 +98,14 @@ impl Chats {
     }
 }
 
-/// What the chat window hears about, on the `chat` event.
-#[derive(Serialize, Clone)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum Event<'a> {
-    /// A message was added to the chat.
-    Message { chat: &'a str, message: &'a Value },
-    /// The reply so far.
-    Delta { chat: &'a str, content: &'a str, reasoning: &'a str },
-    /// A call waits for the user's yes or no.
-    Approval { chat: &'a str, call: &'a str, name: &'a str, arguments: &'a str },
-    /// The turn started or ended (with what went wrong, if something did).
-    State { chat: &'a str, busy: bool, error: Option<String> },
-}
-
-fn emit(handle: &AppHandle, event: Event) {
-    let _ = handle.emit("chat", event);
-}
-
 /// Adds the user's message to a chat (a new one without `chat`) and starts the agent on it.
-/// Returns the chat's id at once; the rest arrives as events.
-pub fn send(handle: AppHandle, app: Arc<App>, project: &str, chat: Option<&str>, text: &str, model: &str) -> anyhow::Result<String> {
+/// Returns the chat's id at once; the rest arrives as [`AppEvent::Chat`] events on `app.bus`.
+pub fn send(app: Arc<App>, project: &str, chat: Option<&str>, text: &str, model: &str) -> anyhow::Result<String> {
     let project = app.project(project).context("that project no longer exists")?;
     if project.isolation != Isolation::MacosSandbox {
-        bail!("The built-in agent runs projects in the macOS sandbox only; the chat runs Linux VM projects with OpenCode, which this build doesn't include. Open this one in OpenCode, or switch it to the macOS sandbox in Projects.");
+        bail!(
+            "The built-in agent runs projects in the macOS sandbox only; the chat runs Linux VM projects with OpenCode, which this build doesn't include. Open this one in OpenCode, or switch it to the macOS sandbox in Projects."
+        );
     }
     let (model, _) = app.loaded(model).context("Load the chat's model first.")?;
     app.touch(&model.id);
@@ -126,7 +119,14 @@ pub fn send(handle: AppHandle, app: Arc<App>, project: &str, chat: Option<&str>,
         if running.contains_key(&chat.id) {
             bail!("The agent is still working on this chat.");
         }
-        running.insert(chat.id.clone(), (project.id.clone(), stop));
+        running.insert(
+            chat.id.clone(),
+            RunningTurn {
+                project: project.id.clone(),
+                started_at: Instant::now(),
+                stop,
+            },
+        );
     }
     app.chats.deleted.lock().unwrap().remove(&chat.id);
     let message = json!({ "role": "user", "content": text });
@@ -136,34 +136,58 @@ pub fn send(handle: AppHandle, app: Arc<App>, project: &str, chat: Option<&str>,
         return Err(e);
     }
     let id = chat.id.clone();
-    emit(&handle, Event::State { chat: &id, busy: true, error: None });
-    emit(&handle, Event::Message { chat: &id, message: &message });
+    app.bus.emit(AppEvent::Chat(ChatEvent::State { chat: id.clone(), busy: true, error: None }));
+    app.bus.emit(AppEvent::Chat(ChatEvent::Message { chat: id.clone(), message }));
     let sync_app = app.clone();
-    tauri::async_runtime::spawn(async move {
+    tokio::spawn(async move {
         sync_app.sync_upstreams().await;
     });
-    tauri::async_runtime::spawn(async move {
+    tokio::spawn(async move {
         let _awake = Awake::hold();
-        let result = turn(&handle, &app, &project, &model.alias, &mut chat, stopped).await;
+        let result = turn(&app, &project, &model.alias, &mut chat, stopped).await;
         app.chats.running.lock().unwrap().remove(&chat.id);
         app.chats.deleted.lock().unwrap().remove(&chat.id);
-        emit(&handle, Event::State { chat: &chat.id, busy: false, error: result.err().map(|e| format!("{e:#}")) });
+        app.bus.emit(AppEvent::Chat(ChatEvent::State {
+            chat: chat.id.clone(),
+            busy: false,
+            error: result.err().map(|e| format!("{e:#}")),
+        }));
     });
     Ok(id)
 }
 
 /// The model's replies and the calls they make, until it answers without calls, the user
 /// stops it, or it has taken [`MAX_STEPS`].
-async fn turn(handle: &AppHandle, app: &App, project: &Project, model: &str, chat: &mut Chat, mut stopped: watch::Receiver<bool>) -> anyhow::Result<()> {
-    let main = std::fs::canonicalize(project.main()).with_context(|| format!("{} is gone", project.main().display()))?;
-    let related: Vec<Folder> = project.related().iter().filter_map(|f| Some(Folder { path: std::fs::canonicalize(&f.path).ok()?, writable: f.writable })).collect();
+async fn turn(
+    app: &App,
+    project: &Project,
+    model: &str,
+    chat: &mut Chat,
+    mut stopped: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let main = std::fs::canonicalize(project.main())
+        .with_context(|| format!("{} is gone", project.main().display()))?;
+    let related: Vec<Folder> = project
+        .related()
+        .iter()
+        .filter_map(|f| Some(Folder { path: std::fs::canonicalize(&f.path).ok()?, writable: f.writable }))
+        .collect();
     let (commands, edits) = (project.allows("commands"), project.allows("edits"));
     let profile = if commands {
-        Some(seatbelt::write_project_profile(&app.paths, &main, &related, project.network, &project.blocked_programs, &format!("chat-{}", project.id))?)
+        Some(seatbelt::write_project_profile(
+            &app.paths,
+            &main,
+            &related,
+            project.network,
+            &project.blocked_programs,
+            &format!("chat-{}", project.id),
+        )?)
     } else {
         None
     };
-    let folders: Vec<Folder> = std::iter::once(Folder { path: main.clone(), writable: true }).chain(related.iter().cloned()).collect();
+    let folders: Vec<Folder> = std::iter::once(Folder { path: main.clone(), writable: true })
+        .chain(related.iter().cloned())
+        .collect();
     let workspace = Workspace::new(&folders, profile, edits)?;
     let tools = workspace.definitions();
     let system = json!({ "role": "system", "content": system_prompt(project, &main, &related, commands, edits) });
@@ -176,10 +200,12 @@ async fn turn(handle: &AppHandle, app: &App, project: &Project, model: &str, cha
         if *stopped.borrow() {
             return Ok(());
         }
-        let messages: Vec<Value> = std::iter::once(system.clone()).chain(chat.messages.iter().map(for_model)).collect();
+        let messages: Vec<Value> = std::iter::once(system.clone())
+            .chain(chat.messages.iter().map(for_model))
+            .collect();
         let body = json!({ "model": model, "messages": messages, "tools": tools, "stream": true });
         let reply = tokio::select! {
-            reply = stream_reply(handle, &client, &url, &key, &body, &chat.id) => reply?,
+            reply = stream_reply(&app.bus, &client, &url, &key, &body, &chat.id) => reply?,
             _ = stopped.wait_for(|s| *s) => return Ok(()),
         };
         let mut message = json!({ "role": "assistant", "content": reply.content });
@@ -187,23 +213,29 @@ async fn turn(handle: &AppHandle, app: &App, project: &Project, model: &str, cha
             message["reasoning"] = json!(reply.reasoning);
         }
         if !reply.calls.is_empty() {
-            message["tool_calls"] = json!(reply.calls.iter().map(|c| json!({ "id": c.id, "type": "function", "function": { "name": c.name, "arguments": c.arguments } })).collect::<Vec<_>>());
+            message["tool_calls"] = json!(
+                reply
+                    .calls
+                    .iter()
+                    .map(|c| json!({ "id": c.id, "type": "function", "function": { "name": c.name, "arguments": c.arguments } }))
+                    .collect::<Vec<_>>()
+            );
         }
-        add(handle, app, chat, message)?;
+        add(app, chat, message)?;
         if reply.calls.is_empty() {
             return Ok(());
         }
         for call in &reply.calls {
             let result = if *stopped.borrow() {
                 NOT_RUN.to_string()
-            } else if !asks(project.approvals, &call.name) || approved(handle, app, &chat.id, call, &mut stopped).await {
+            } else if !asks(project.approvals, &call.name) || approved(app, &chat.id, call, &mut stopped).await {
                 workspace.run(&call.name, &call.arguments, stopped.clone()).await
             } else if *stopped.borrow() {
                 NOT_RUN.to_string()
             } else {
                 DECLINED.to_string()
             };
-            add(handle, app, chat, json!({ "role": "tool", "tool_call_id": call.id, "content": result }))?;
+            add(app, chat, json!({ "role": "tool", "tool_call_id": call.id, "content": result }))?;
         }
     }
     bail!("The agent took {MAX_STEPS} steps without finishing; send a message to let it continue.")
@@ -218,11 +250,14 @@ fn for_model(message: &Value) -> Value {
     message
 }
 
-fn add(handle: &AppHandle, app: &App, chat: &mut Chat, message: Value) -> anyhow::Result<()> {
+fn add(app: &App, chat: &mut Chat, message: Value) -> anyhow::Result<()> {
     if app.chats.is_deleted(&chat.id) {
         return Ok(());
     }
-    emit(handle, Event::Message { chat: &chat.id, message: &message });
+    app.bus.emit(AppEvent::Chat(ChatEvent::Message {
+        chat: chat.id.clone(),
+        message: message.clone(),
+    }));
     chat.messages.push(message);
     chat.save(&app.paths)
 }
@@ -237,11 +272,16 @@ fn asks(approvals: Approvals, tool: &str) -> bool {
 }
 
 /// Asks the user about `call`; false if they decline or stop the agent.
-async fn approved(handle: &AppHandle, app: &App, chat: &str, call: &Call, stopped: &mut watch::Receiver<bool>) -> bool {
+async fn approved(app: &App, chat: &str, call: &Call, stopped: &mut watch::Receiver<bool>) -> bool {
     let (answer, answered) = oneshot::channel();
     let key = format!("{chat}:{}", call.id);
     app.chats.approvals.lock().unwrap().insert(key.clone(), answer);
-    emit(handle, Event::Approval { chat, call: &call.id, name: &call.name, arguments: &call.arguments });
+    app.bus.emit(AppEvent::Chat(ChatEvent::Approval {
+        chat: chat.to_string(),
+        call: call.id.clone(),
+        name: call.name.clone(),
+        arguments: call.arguments.clone(),
+    }));
     let allowed = tokio::select! {
         answer = answered => answer.unwrap_or(false),
         _ = stopped.wait_for(|s| *s) => false,
@@ -265,12 +305,28 @@ struct Reply {
 }
 
 /// Sends one request and reads the streamed reply, passing it on to the window as it comes.
-async fn stream_reply(handle: &AppHandle, client: &reqwest::Client, url: &str, key: &str, body: &Value, chat: &str) -> anyhow::Result<Reply> {
-    let response = client.post(url).bearer_auth(key).json(body).send().await.context("couldn't reach the guard")?;
+async fn stream_reply(
+    bus: &EventBus,
+    client: &reqwest::Client,
+    url: &str,
+    key: &str,
+    body: &Value,
+    chat: &str,
+) -> anyhow::Result<Reply> {
+    let response = client
+        .post(url)
+        .bearer_auth(key)
+        .json(body)
+        .send()
+        .await
+        .context("couldn't reach the guard")?;
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        let message = serde_json::from_str::<Value>(&text).ok().and_then(|v| v["error"]["message"].as_str().map(str::to_string)).unwrap_or(text);
+        let message = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+            .unwrap_or(text);
         bail!("the model server said {status}: {message}");
     }
     let mut reply = Reply::default();
@@ -285,7 +341,11 @@ async fn stream_reply(handle: &AppHandle, client: &reqwest::Client, url: &str, k
             consume_sse_event(&event[..start], &mut reply, &mut calls)?;
         }
         if last.elapsed() >= DELTA_EVERY {
-            emit(handle, Event::Delta { chat, content: &reply.content, reasoning: &reply.reasoning });
+            bus.emit(AppEvent::Chat(ChatEvent::Delta {
+                chat: chat.to_string(),
+                content: reply.content.clone(),
+                reasoning: reply.reasoning.clone(),
+            }));
             last = Instant::now();
         }
     }

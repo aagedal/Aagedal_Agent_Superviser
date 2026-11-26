@@ -72,11 +72,25 @@ impl Upstreams {
     }
 }
 
+/// Per-model default `reasoning_effort` injected when the client didn't specify one.
+#[derive(Default)]
+struct ReasoningDefaults {
+    by_model: HashMap<String, String>,
+    default: Option<String>,
+}
+
+impl ReasoningDefaults {
+    fn pick(&self, model: Option<&str>) -> Option<String> {
+        model.and_then(|m| self.by_model.get(m)).or(self.default.as_ref()).cloned()
+    }
+}
+
 struct AppState {
     config: Arc<Config>,
     options: ProxyOptions,
     api_key: RwLock<Option<String>>,
     upstreams: RwLock<Upstreams>,
+    reasoning: RwLock<ReasoningDefaults>,
     judge: RwLock<Option<Judge>>,
     /// Rules of the projects served at `/projects/<id>/`, by id.
     projects: RwLock<HashMap<String, Arc<ProjectRules>>>,
@@ -121,7 +135,16 @@ impl GuardServer {
             .map_err(std::io::Error::other)?;
         let api_key = RwLock::new(options.api_key.clone());
         let judge = RwLock::new(options.judge.clone());
-        let state = Arc::new(AppState { config: Arc::new(config), options, api_key, upstreams: RwLock::new(Upstreams::default()), judge, projects: RwLock::new(HashMap::new()), client });
+        let state = Arc::new(AppState {
+            config: Arc::new(config),
+            options,
+            api_key,
+            upstreams: RwLock::new(Upstreams::default()),
+            reasoning: RwLock::new(ReasoningDefaults::default()),
+            judge,
+            projects: RwLock::new(HashMap::new()),
+            client,
+        });
         let shutdown = serve(listener, state.clone());
         Ok(Self { addr, state, shutdown: Some(shutdown), unix: std::sync::Mutex::new(None) })
     }
@@ -157,6 +180,12 @@ impl GuardServer {
     pub fn set_upstreams(&self, by_model: HashMap<String, String>, default: Option<String>) {
         let trim = |u: String| u.trim_end_matches('/').to_string();
         *self.state.upstreams.write().unwrap() = Upstreams { by_model: by_model.into_iter().map(|(m, u)| (m, trim(u))).collect(), default: default.map(trim) };
+    }
+
+    /// Sets per-model `reasoning_effort` defaults (`"none"`, `"low"`, `"medium"`, `"high"`),
+    /// injected on model requests that don't already specify `reasoning_effort`.
+    pub fn set_reasoning(&self, by_model: HashMap<String, String>, default: Option<String>) {
+        *self.state.reasoning.write().unwrap() = ReasoningDefaults { by_model, default };
     }
 
     /// Replaces the key clients must send.
@@ -290,9 +319,29 @@ async fn forward_inner(state: &Arc<AppState>, request: Request) -> Response {
     if request_json.is_none() && is_model_endpoint && !json_slice.iter().all(u8::is_ascii_whitespace) {
         return error(StatusCode::BAD_REQUEST, "request body must be a valid JSON object");
     }
-    let model = request_json.as_ref().and_then(|r| r.get("model")).and_then(Value::as_str);
-    let Some(upstream) = state.upstreams.read().unwrap().pick(model) else {
+    let model = request_json.as_ref().and_then(|r| r.get("model")).and_then(Value::as_str).map(str::to_string);
+    let Some(upstream) = state.upstreams.read().unwrap().pick(model.as_deref()) else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "no model is loaded; load one from the Agent Superviser menu");
+    };
+    let reasoning_level = state.reasoning.read().unwrap().pick(model.as_deref());
+    let (body, request_json) = match (request_json, reasoning_level) {
+        (Some(mut req), Some(level)) if is_model_endpoint && req.get("reasoning_effort").is_none() => {
+            if let Some(obj) = req.as_object_mut() {
+                obj.insert("reasoning_effort".into(), Value::String(level.clone()));
+                // Also set `chat_template_kwargs.enable_thinking` when not explicitly set so
+                // hybrid models whose template checks `enable_thinking` honor Off/Low/Med/High.
+                let enable = level != "none";
+                let kwargs = obj.entry("chat_template_kwargs").or_insert_with(|| json!({}));
+                if let Some(map) = kwargs.as_object_mut()
+                    && !map.contains_key("enable_thinking")
+                {
+                    map.insert("enable_thinking".into(), Value::Bool(enable));
+                }
+            }
+            let new_body = Bytes::from(crate::compact_json(&req));
+            (new_body, Some(req))
+        }
+        (req, _) => (body, req),
     };
     let judge = state.judge.read().unwrap().clone();
     let guard = request_json.map(|r| {
@@ -599,5 +648,76 @@ mod tests {
         assert_eq!(response.headers()["access-control-allow-origin"], "tauri://localhost");
         let other = client.get(&url).bearer_auth("client-key").header("origin", "https://evil.example").send().await.unwrap();
         assert!(other.headers().get("access-control-allow-origin").is_none());
+    }
+
+    #[tokio::test]
+    async fn injects_per_model_reasoning_effort_without_overriding_client() {
+        let echo_app = axum::Router::new().fallback(|body: Bytes| async move {
+            let received: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let reply = json!({
+                "choices": [{ "message": { "role": "assistant", "content": received.to_string() }, "finish_reason": "stop" }]
+            });
+            ([(header::CONTENT_TYPE, "application/json")], reply.to_string())
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, echo_app).await.unwrap() });
+        let upstream = format!("http://{addr}");
+
+        let server = guard_server(Some(upstream.clone())).await;
+        server.set_upstreams(
+            HashMap::from([("model-a".into(), upstream.clone()), ("model-b".into(), upstream)]),
+            None,
+        );
+        server.set_reasoning(
+            HashMap::from([("model-a".into(), "none".into()), ("model-b".into(), "high".into())]),
+            None,
+        );
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/v1/chat/completions", server.addr);
+
+        // model-a ("none"): injects reasoning_effort=none and enable_thinking=false.
+        let r1: Value = client
+            .post(&url)
+            .bearer_auth("client-key")
+            .json(&json!({ "model": "model-a", "messages": [{"role": "user", "content": "hi"}] }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let seen1: Value = serde_json::from_str(r1["choices"][0]["message"]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(seen1["reasoning_effort"], "none");
+        assert_eq!(seen1["chat_template_kwargs"]["enable_thinking"], false);
+
+        // model-b ("high"): injects reasoning_effort=high and enable_thinking=true.
+        let r2: Value = client
+            .post(&url)
+            .bearer_auth("client-key")
+            .json(&json!({ "model": "model-b", "messages": [{"role": "user", "content": "hi"}] }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let seen2: Value = serde_json::from_str(r2["choices"][0]["message"]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(seen2["reasoning_effort"], "high");
+        assert_eq!(seen2["chat_template_kwargs"]["enable_thinking"], true);
+
+        // Explicit client reasoning_effort is preserved untouched.
+        let r3: Value = client
+            .post(&url)
+            .bearer_auth("client-key")
+            .json(&json!({ "model": "model-a", "reasoning_effort": "low", "messages": [{"role": "user", "content": "hi"}] }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let seen3: Value = serde_json::from_str(r3["choices"][0]["message"]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(seen3["reasoning_effort"], "low");
     }
 }

@@ -1,0 +1,18 @@
+[package]
+name = "superviser-backend"
+description = "Shared UI-agnostic application runtime for Agent Superviser (llama-server, guard, downloads, OpenCode ACP, built-in agent)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+superviser-core.workspace = true
+superviser-guard.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+tracing.workspace = true

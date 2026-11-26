@@ -65,7 +65,9 @@ App data lives in `~/Library/Application Support/me.aagedal.AgentSuperviser` on 
 | `crates/core` | Catalog and memory fit, quant policy, GGUF header parsing, Hub client, installed models, llama-server, OpenCode config, secrets |
 | `crates/guard` | The guard proxy (safeagents port; see `crates/guard/NOTICE.md`) |
 | `crates/scan` | The scanner (atif-scan port; see `crates/scan/NOTICE.md`) and its parity harness |
+| `crates/backend` | Shared UI-agnostic application runtime (`App`, model lifecycle, downloads, judge, OpenCode ACP, built-in agent, event bus) |
 | `app` | Tauri 2 menu bar app; `app/ui` is plain HTML/JS with no build step |
+| `app-gpui` | Native GPUI menu bar app sharing `crates/backend` |
 | `catalog` | `sources.json` (hand-edited) → `curated.json` (generated) |
 
 ## License

@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use muda::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use superviser_backend::{App, LoadState, ServerStatus};
 use superviser_core::installed::Source;
+use superviser_core::sandbox::Isolation;
+use superviser_guard::Verdict;
 use tokio::sync::mpsc;
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
@@ -15,6 +18,7 @@ const MAX_TRAY_PROJECTS: usize = 8;
 #[derive(Debug, Clone)]
 pub enum TrayAction {
     OpenChat(Option<String>),
+    OpenProjectInOpenCode(String),
     OpenSettings(Option<usize>),
     OpenSetup,
     ChooseProjectFolder,
@@ -30,11 +34,11 @@ pub struct TrayController {
 impl TrayController {
     pub fn new(backend: &Arc<Backend>) -> Result<(Self, mpsc::UnboundedReceiver<TrayAction>)> {
         let icon = load_tray_icon()?;
-        let menu = build_menu(backend)?;
+        let menu = build_menu(&backend.app)?;
         let tray = TrayIconBuilder::new()
             .with_icon(icon)
             .with_icon_as_template(true)
-            .with_tooltip("Agent Superviser (GPUI Prototype)")
+            .with_tooltip("Agent Superviser")
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(true)
             .build()
@@ -57,8 +61,8 @@ impl TrayController {
         Ok((Self { tray }, rx))
     }
 
-    pub fn refresh(&self, backend: &Backend) {
-        match build_menu(backend) {
+    pub fn refresh(&self, app: &App) {
+        match build_menu(app) {
             Ok(menu) => self.tray.set_menu(Some(Box::new(menu))),
             Err(e) => tracing::warn!("failed to rebuild tray menu: {e:#}"),
         }
@@ -79,13 +83,15 @@ fn parse_menu_id(id: &str) -> Option<TrayAction> {
         "quit" => Some(TrayAction::Quit),
         "chat" => Some(TrayAction::OpenChat(None)),
         "settings" => Some(TrayAction::OpenSettings(None)),
-        "connect" => Some(TrayAction::OpenSettings(Some(3))),
+        "opencode" => Some(TrayAction::OpenSettings(Some(3))),
         "setup" => Some(TrayAction::OpenSetup),
         "choose-project" => Some(TrayAction::ChooseProjectFolder),
         "stop" => Some(TrayAction::UnloadAll),
         _ => {
             if let Some(proj) = id.strip_prefix("chat:") {
                 Some(TrayAction::OpenChat(Some(proj.to_string())))
+            } else if let Some(proj) = id.strip_prefix("project:") {
+                Some(TrayAction::OpenProjectInOpenCode(proj.to_string()))
             } else {
                 id.strip_prefix("load:")
                     .map(|model| TrayAction::ToggleModel(model.to_string()))
@@ -94,22 +100,43 @@ fn parse_menu_id(id: &str) -> Option<TrayAction> {
     }
 }
 
-fn build_menu(backend: &Backend) -> Result<Menu> {
-    let active_id = backend.active_model_id();
-    let installed = backend.installed();
-    let active_name = active_id.as_deref().and_then(|id| {
-        installed
-            .iter()
-            .find(|m| m.id == id)
-            .map(|m| m.model.name.clone())
-    });
+fn status_line(status: &ServerStatus) -> String {
+    match status {
+        ServerStatus::Stopped => "No model running".into(),
+        ServerStatus::Loading { name, .. } => format!("Loading {name}…"),
+        ServerStatus::Running { name, context, .. } => {
+            format!("● {name} ({}k context)", context / 1024)
+        }
+        ServerStatus::Failed { error, .. } => {
+            format!("Failed: {}", error.chars().take(60).collect::<String>())
+        }
+    }
+}
 
-    let status_text = match &active_name {
-        Some(name) => format!("● {name} (prototype active)"),
-        None => "No model running".into(),
+fn build_menu(app: &App) -> Result<Menu> {
+    let status = app.status();
+    let loaded = app.models();
+    let running_count = loaded
+        .iter()
+        .filter(|m| matches!(m.state, LoadState::Running { .. }))
+        .count();
+    let any_active = loaded
+        .iter()
+        .any(|m| !matches!(m.state, LoadState::Failed { .. }));
+    let blocked = app
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e.verdict, Verdict::Blocked | Verdict::Flagged))
+        .count();
+
+    let status_text = if running_count > 1 {
+        format!("● {running_count} models loaded")
+    } else {
+        status_line(&status)
     };
-    let blocked = backend.blocked_count();
-    let guard_text = match backend.guard_url() {
+    let guard_text = match app.guard_url() {
         Some(url) => format!("Guard on at {url} · {blocked} blocked"),
         None => "Guard is not running".into(),
     };
@@ -117,21 +144,29 @@ fn build_menu(backend: &Backend) -> Result<Menu> {
     let status_item = MenuItem::with_id("status", status_text, false, None);
     let guard_item = MenuItem::with_id("guard", guard_text, false, None);
 
+    let installed = app.installed();
     let model_items: Vec<CheckMenuItem> = installed
         .iter()
         .map(|m| {
             let label = match m.source {
                 Source::App => format!("{} · {}", m.model.name, m.model.quant.label),
-                other => format!("{} · {} ({})", m.model.name, m.model.quant.label, other.label()),
+                other => format!(
+                    "{} · {} ({})",
+                    m.model.name,
+                    m.model.quant.label,
+                    other.label()
+                ),
             };
-            let fits = backend.fit(&m.model).is_some();
-            let checked = active_id.as_deref() == Some(m.id.as_str());
-            CheckMenuItem::with_id(format!("load:{}", m.id), label, fits, checked, None)
+            let fits = app.fit(&m.model).is_some();
+            let on = loaded
+                .iter()
+                .any(|l| l.id == m.id && !matches!(l.state, LoadState::Failed { .. }));
+            CheckMenuItem::with_id(format!("load:{}", m.id), label, fits || on, on, None)
         })
         .collect();
     let none_item = MenuItem::with_id(
         "none",
-        "No models yet. Open Settings to browse catalog.",
+        "No models yet. Open Settings to download one.",
         false,
         None,
     );
@@ -141,17 +176,33 @@ fn build_menu(backend: &Backend) -> Result<Menu> {
         model_items.iter().map(|i| i as &dyn IsMenuItem).collect()
     };
     let models_sub = Submenu::with_id_and_items("models", "Load Model", true, &model_refs)?;
-    let stop_item = MenuItem::with_id("stop", "Unload Model", active_id.is_some(), None);
+    let stop_label = if running_count > 1 {
+        "Unload All Models"
+    } else {
+        "Unload Model"
+    };
+    let stop_item = MenuItem::with_id("stop", stop_label, any_active, None);
 
-    let projects = backend.projects();
-    let project_items: Vec<MenuItem> = projects
+    let is_running = matches!(status, ServerStatus::Running { .. });
+    let projects = app.settings.lock().unwrap().projects.clone();
+    let chat_in_vm = superviser_core::opencode::binary().is_some();
+
+    let chat_items: Vec<MenuItem> = projects
         .iter()
         .take(MAX_TRAY_PROJECTS)
-        .map(|p| MenuItem::with_id(format!("chat:{}", p.id), &p.name, true, None))
+        .map(|p| match p.isolation {
+            Isolation::LinuxVm if !chat_in_vm => MenuItem::with_id(
+                format!("project:{}", p.id),
+                format!("{} (OpenCode, Linux VM)", p.name),
+                is_running,
+                None,
+            ),
+            _ => MenuItem::with_id(format!("chat:{}", p.id), &p.name, true, None),
+        })
         .collect();
     let sep_proj = PredefinedMenuItem::separator();
     let choose_item = MenuItem::with_id("choose-project", "New Project from Folder…", true, None);
-    let mut proj_refs: Vec<&dyn IsMenuItem> = project_items
+    let mut proj_refs: Vec<&dyn IsMenuItem> = chat_items
         .iter()
         .map(|i| i as &dyn IsMenuItem)
         .collect();
@@ -159,15 +210,41 @@ fn build_menu(backend: &Backend) -> Result<Menu> {
         proj_refs.push(&sep_proj);
     }
     proj_refs.push(&choose_item);
-    let code_sub = Submenu::with_id_and_items("code", "Code in a Project", true, &proj_refs)?;
+    let code_sub = Submenu::with_id_and_items(
+        "code",
+        "Code in a Project",
+        cfg!(target_os = "macos"),
+        &proj_refs,
+    )?;
+
+    let opencode_items: Vec<MenuItem> = projects
+        .iter()
+        .take(MAX_TRAY_PROJECTS)
+        .map(|p| MenuItem::with_id(format!("project:{}", p.id), &p.name, is_running, None))
+        .collect();
+    let opencode_refs: Vec<&dyn IsMenuItem> = opencode_items
+        .iter()
+        .map(|i| i as &dyn IsMenuItem)
+        .collect();
+    let in_opencode_sub = Submenu::with_id_and_items(
+        "in-opencode",
+        "Open in OpenCode",
+        cfg!(target_os = "macos") && !opencode_refs.is_empty(),
+        &opencode_refs,
+    )?;
 
     let chat_item = MenuItem::with_id("chat", "Open Chat…", true, None);
-    let connect_item = MenuItem::with_id("connect", "Connect OpenCode…", true, None);
+    let opencode_item = MenuItem::with_id("opencode", "Set Up OpenCode", is_running, None);
     let settings_item = MenuItem::with_id("settings", "Settings…", true, None);
-    let setup_item = MenuItem::with_id("setup", "Setup Guide…", true, None);
+    let setup_item = app
+        .needs_setup()
+        .then(|| MenuItem::with_id("setup", "Continue Setup…", true, None));
     let quit_item = MenuItem::with_id("quit", "Quit Agent Superviser", true, None);
 
     let menu = Menu::new();
+    if let Some(setup) = &setup_item {
+        menu.append_items(&[setup as &dyn IsMenuItem, &PredefinedMenuItem::separator()])?;
+    }
     menu.append_items(&[
         &status_item,
         &guard_item,
@@ -177,9 +254,9 @@ fn build_menu(backend: &Backend) -> Result<Menu> {
         &PredefinedMenuItem::separator(),
         &code_sub,
         &chat_item,
-        &connect_item,
+        &in_opencode_sub,
+        &opencode_item,
         &settings_item,
-        &setup_item,
         &PredefinedMenuItem::separator(),
         &quit_item,
     ])?;

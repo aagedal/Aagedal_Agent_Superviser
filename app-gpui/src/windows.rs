@@ -1,10 +1,11 @@
 //! Window manager, macOS Dock ActivationPolicy toggling, and shared GPUI global state.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui_kit::{
     ActivationPolicy, AnyWindowHandle, App, AppContext, Bounds, Entity, Global, PathPromptOptions,
-    WindowBounds, WindowOptions, px, size,
+    WindowBounds, WindowId, WindowOptions, px, size,
 };
 
 use crate::backend::Backend;
@@ -27,18 +28,40 @@ impl Global for AppGlobals {}
 impl AppGlobals {
     pub fn refresh_tray(&self) {
         if let Some(tray) = &self.tray {
-            tray.refresh(&self.backend);
+            tray.refresh(&self.backend.app);
         }
     }
 }
 
-/// Shows the app in the macOS Dock + Cmd-Tab while any window is open, or hides it back
-/// to the menu bar (`Accessory`) when all windows are closed.
-pub fn sync_dock_policy(cx: &mut App) {
-    let has_windows = !cx.windows().is_empty();
-    if has_windows {
+/// Clears stale handles for `closed_id` and hides the Dock icon when no windows remain.
+pub fn on_window_closed(closed_id: WindowId, cx: &mut App) {
+    if cx.has_global::<AppGlobals>() {
+        let globals = cx.global_mut::<AppGlobals>();
+        if globals
+            .chat
+            .as_ref()
+            .is_some_and(|(h, _)| h.window_id() == closed_id)
+        {
+            globals.chat = None;
+        }
+        if globals
+            .settings
+            .as_ref()
+            .is_some_and(|(h, _)| h.window_id() == closed_id)
+        {
+            globals.settings = None;
+        }
+        if globals
+            .setup
+            .as_ref()
+            .is_some_and(|(h, _)| h.window_id() == closed_id)
+        {
+            globals.setup = None;
+        }
+    }
+    let has_other_windows = cx.windows().iter().any(|w| w.window_id() != closed_id);
+    if has_other_windows {
         cx.set_activation_policy(ActivationPolicy::Regular);
-        cx.activate(true);
     } else {
         cx.set_activation_policy(ActivationPolicy::Accessory);
     }
@@ -76,7 +99,7 @@ pub fn open_chat(project_id: Option<String>, cx: &mut App) {
     }
 
     let backend = cx.global::<AppGlobals>().backend.clone();
-    let options = centered_options("Agent Superviser Chat (GPUI Prototype)", 1040.0, 720.0, cx);
+    let options = centered_options("Agent Superviser Chat", 1040.0, 720.0, cx);
     match gpui_kit::open_window(options, cx, |window, cx| {
         apply_theme(Some(window), cx);
         cx.new(|cx| ChatWindow::new(backend, project_id, window, cx))
@@ -105,7 +128,7 @@ pub fn open_settings(initial_tab: Option<usize>, cx: &mut App) {
     }
 
     let backend = cx.global::<AppGlobals>().backend.clone();
-    let options = centered_options("Agent Superviser Settings (GPUI Prototype)", 900.0, 660.0, cx);
+    let options = centered_options("Agent Superviser", 920.0, 680.0, cx);
     match gpui_kit::open_window(options, cx, |window, cx| {
         apply_theme(Some(window), cx);
         cx.new(|cx| SettingsWindow::new(backend, initial_tab.unwrap_or(0), window, cx))
@@ -130,7 +153,7 @@ pub fn open_setup(cx: &mut App) {
     }
 
     let backend = cx.global::<AppGlobals>().backend.clone();
-    let options = centered_options("Set Up Agent Superviser (GPUI Prototype)", 800.0, 680.0, cx);
+    let options = centered_options("Set Up Agent Superviser", 800.0, 680.0, cx);
     match gpui_kit::open_window(options, cx, |window, cx| {
         apply_theme(Some(window), cx);
         cx.new(|cx| SetupWindow::new(backend, window, cx))
@@ -142,10 +165,10 @@ pub fn open_setup(cx: &mut App) {
     }
 }
 
-/// Prompts for a macOS folder natively via GPUI and adds it to the prototype project list.
-pub fn choose_project_folder(
+/// Prompts for a macOS folder natively via GPUI and invokes `on_pick` with the chosen path.
+pub fn choose_folder(
     prompt_text: &'static str,
-    open_in_chat: bool,
+    on_pick: impl FnOnce(PathBuf, &mut App) + 'static,
     cx: &mut App,
 ) {
     let rx = cx.prompt_for_paths(PathPromptOptions {
@@ -161,16 +184,27 @@ pub fn choose_project_folder(
         let Some(folder) = paths.into_iter().next() else {
             return;
         };
-        cx.update(|cx| {
-            let project = cx
-                .global::<AppGlobals>()
-                .backend
-                .add_prototype_project(&folder);
-            cx.global::<AppGlobals>().refresh_tray();
-            if open_in_chat {
-                open_chat(Some(project.id), cx);
-            }
-        });
+        cx.update(|cx| on_pick(folder, cx));
     })
     .detach();
+}
+
+/// Prompts for a macOS folder natively via GPUI and creates/persists a real project for it.
+pub fn choose_project_folder(prompt_text: &'static str, open_in_chat: bool, cx: &mut App) {
+    choose_folder(
+        prompt_text,
+        move |folder, cx| {
+            let app = cx.global::<AppGlobals>().backend.app.clone();
+            match app.project_for_folder(&folder) {
+                Ok(project) => {
+                    cx.global::<AppGlobals>().refresh_tray();
+                    if open_in_chat {
+                        open_chat(Some(project.id), cx);
+                    }
+                }
+                Err(e) => tracing::warn!("could not create project for {}: {e:#}", folder.display()),
+            }
+        },
+        cx,
+    );
 }
