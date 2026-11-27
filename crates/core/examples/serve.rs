@@ -21,9 +21,11 @@ async fn main() -> anyhow::Result<()> {
     let catalog = Catalog::bundled();
     let entry = model.entry_path().unwrap();
     let (speculative, _) = runtime::detect_speculative(&entry, u64::MAX, DEFAULT_SPEC_DRAFT_N_MAX);
+    let mmproj_path = runtime::find_companion_mmproj(&entry);
     let mut server = LlamaServer::start(ServerConfig {
         binary: runtime::find_llama_server().expect("llama-server"),
         model_path: entry,
+        mmproj_path,
         alias: model.alias.clone(),
         context: 32768,
         port: runtime::free_port()?,

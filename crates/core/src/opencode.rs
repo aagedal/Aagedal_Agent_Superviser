@@ -95,7 +95,18 @@ pub fn provider(setup: &Setup, v2_keys: bool) -> Value {
         .iter()
         .map(|m| {
             let limit = json!({ "context": m.context, "output": MAX_OUTPUT.min(m.context / 4) });
-            (m.alias.clone(), json!({ "name": m.name, "limit": limit }))
+            (
+                m.alias.clone(),
+                json!({
+                    "name": m.name,
+                    "attachment": true,
+                    "modalities": {
+                        "input": ["text", "image"],
+                        "output": ["text"],
+                    },
+                    "limit": limit,
+                }),
+            )
         })
         .collect();
     let key = format!("{{file:{}}}", setup.api_key_file.display());
@@ -293,6 +304,8 @@ mod tests {
         assert_eq!(ours["options"]["baseURL"], "http://127.0.0.1:8787/v1");
         assert_eq!(ours["options"]["apiKey"], "{file:/data/keys/local-api-key}");
         assert_eq!(ours["models"]["qwen3.5-9b"]["limit"]["context"], 65_536);
+        assert_eq!(ours["models"]["qwen3.5-9b"]["attachment"], true);
+        assert_eq!(ours["models"]["qwen3.5-9b"]["modalities"]["input"], json!(["text", "image"]));
         assert_eq!(value["model"], "superviser/qwen3.5-9b");
         assert_eq!(value["small_model"], "superviser/qwen3.5-9b");
     }

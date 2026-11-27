@@ -29,8 +29,80 @@ let status = null; // the model server's
 let pending = []; // events for a chat whose id isn't known yet
 let awaiting = false;
 let usage = null; // {used, size} tokens of the open chat, as OpenCode reports them
-let archived = new Set(); // the project's archived chats
+let archived = new Set(); // "projectId\nchatId" keys of archived chats across projects
 let showArchived = false;
+let filterCurrentProject = false;
+let allSessions = []; // unified cross-project session list
+const workingSinceBySession = new Map(); // sessionId -> epoch ms
+
+const archiveKey = (projectId, chatId) => `${projectId}\n${chatId}`;
+
+function projectMonogram(name) {
+  const words = String(name || "").split(/[^A-Za-z0-9]+/).filter(Boolean);
+  const chars = words.length >= 2 ? words[0][0] + words[1][0] : String(name || "").replace(/[^A-Za-z0-9]/g, "").slice(0, 2);
+  return (chars || "PR").toUpperCase();
+}
+
+function projectBadgeStyle(id) {
+  const dark = window.matchMedia?.("(prefers-color-scheme: dark)").matches;
+  const palette = dark
+    ? [
+        ["#2f3542", "#cbd5e1"],
+        ["#3b2c5e", "#d8b4fe"],
+        ["#164e63", "#67e8f9"],
+        ["#1e4633", "#86efac"],
+        ["#523718", "#fcd34d"],
+        ["#522238", "#fda4af"],
+        ["#1e3a5f", "#93c5fd"],
+        ["#364420", "#bef264"],
+      ]
+    : [
+        ["#e2e8f0", "#334155"],
+        ["#f3e8ff", "#6b21a8"],
+        ["#cffafe", "#155e75"],
+        ["#dcfce7", "#166534"],
+        ["#fef3c7", "#92400e"],
+        ["#ffe4e6", "#9f1239"],
+        ["#dbeafe", "#1e40af"],
+        ["#ecfccb", "#3f6212"],
+      ];
+  let hash = 2166136261;
+  for (let i = 0; i < String(id || "").length; i++) {
+    hash ^= id.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  const [bg, fg] = palette[(hash >>> 0) % palette.length];
+  return `background:${bg};color:${fg}`;
+}
+
+function parseSessionTime(raw) {
+  const candidate = raw.updatedAt ?? raw.updated_at ?? raw.updated ?? raw.createdAt ?? raw.created_at;
+  if (typeof candidate === "number" && Number.isFinite(candidate)) {
+    return candidate > 1e10 ? Math.floor(candidate / 1000) : Math.floor(candidate);
+  }
+  if (typeof candidate === "string") {
+    const ms = Date.parse(candidate);
+    if (Number.isFinite(ms)) return Math.floor(ms / 1000);
+  }
+  return 0;
+}
+
+function formatRelTime(epochSecs) {
+  if (!epochSecs) return "";
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - epochSecs);
+  if (diff < 60) return "now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
+  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}d`;
+  return `${Math.floor(diff / (86400 * 30))}mo`;
+}
+
+function formatWorkingCompact(startMs) {
+  const secs = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+  return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+}
 
 const view = {
   tools: new Map(), // toolCallId -> card
@@ -124,33 +196,62 @@ async function openFile(path, how, editor = null) {
   }
 }
 
+let menuTrigger = null;
+
 async function fileMenu(event, info) {
+  const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   closeMenu();
+  menuTrigger = trigger;
   editors ??= await invoke("editors");
-  const item = (label, action) => el("button", { class: "menu-item", onclick: () => { closeMenu(); action(); } }, label);
+  const item = (label, action) => el("button", { type: "button", role: "menuitem", class: "menu-item", onclick: () => { closeMenu(); action(); } }, label);
   const menu = el(
     "div",
-    { class: "menu", id: "file-menu" },
+    { class: "menu", id: "file-menu", role: "menu" },
     info.runs_code
       ? el("div", { class: "menu-note" }, "This could run as a program, outside the sandbox, so it only opens in an editor or Finder.")
       : item(info.is_dir ? "Open in Finder" : "Open", () => openFile(info.path, "default")),
     ...editors.filter((name) => !(info.is_dir && name === "TextEdit")).map((name) => item(`Open in ${name}`, () => openFile(info.path, "editor", name))),
     item("Show in Finder", () => openFile(info.path, "finder")),
   );
+  menu.addEventListener("keydown", (e) => {
+    const items = [...menu.querySelectorAll(".menu-item")];
+    if (!items.length) return;
+    const idx = items.indexOf(document.activeElement);
+    if (e.key === "ArrowDown" || (e.key === "Tab" && !e.shiftKey)) {
+      e.preventDefault();
+      items[(idx + 1 + items.length) % items.length].focus();
+    } else if (e.key === "ArrowUp" || (e.key === "Tab" && e.shiftKey)) {
+      e.preventDefault();
+      items[(idx - 1 + items.length) % items.length].focus();
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      items[0].focus();
+    } else if (e.key === "End") {
+      e.preventDefault();
+      items[items.length - 1].focus();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      closeMenu(true);
+    }
+  });
   document.body.append(menu);
   const { innerWidth, innerHeight } = window;
   menu.style.left = `${Math.min(event.clientX, innerWidth - menu.offsetWidth - 8)}px`;
   menu.style.top = `${Math.min(event.clientY, innerHeight - menu.offsetHeight - 8)}px`;
+  menu.querySelector(".menu-item")?.focus();
 }
 
-function closeMenu() {
-  $("file-menu")?.remove();
+function closeMenu(restoreFocus = false) {
+  const open = $("file-menu");
+  if (!open) return;
+  open.remove();
+  if (restoreFocus && menuTrigger?.isConnected) menuTrigger.focus();
+  menuTrigger = null;
 }
 document.addEventListener("click", (event) => {
   if (!event.target.closest("#file-menu")) closeMenu();
 });
-document.addEventListener("keydown", (event) => event.key === "Escape" && closeMenu());
-window.addEventListener("blur", closeMenu);
+window.addEventListener("blur", () => closeMenu(false));
 
 function textOf(content) {
   return content?.type === "text" ? content.text || "" : "";
@@ -167,18 +268,158 @@ function clearView() {
   list().replaceChildren();
 }
 
-function appendUser(id, text) {
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_IMAGES_PER_MESSAGE = 8;
+let pendingImages = [];
+let attachNotice = "";
+let nextImageId = 1;
+
+function formatBytes(bytes) {
+  if (!bytes || bytes < 1024) return `${bytes || 0} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function renderPendingImages() {
+  const strip = $("pending-images");
+  if (!strip) return;
+  if (!pendingImages.length && !attachNotice) {
+    strip.hidden = true;
+    strip.replaceChildren();
+    return;
+  }
+  strip.hidden = false;
+  strip.replaceChildren(
+    ...(attachNotice ? [el("div", { class: "pending-img-notice" }, attachNotice)] : []),
+    ...pendingImages.map((img) =>
+      el(
+        "div",
+        { class: "pending-img-card" },
+        el("img", { src: `data:${img.mime_type};base64,${img.data_base64}`, alt: img.name }),
+        el(
+          "div",
+          { class: "pending-img-meta" },
+          el("span", { class: "pending-img-name", title: img.name }, img.name),
+          el("span", { class: "pending-img-size" }, formatBytes(img.size_bytes)),
+        ),
+        el("button", {
+          type: "button",
+          class: "icon",
+          title: `Remove ${img.name}`,
+          "aria-label": `Remove ${img.name}`,
+          onclick: () => {
+            pendingImages = pendingImages.filter((item) => item.id !== img.id);
+            if (pendingImages.length < MAX_IMAGES_PER_MESSAGE) attachNotice = "";
+            renderPendingImages();
+          },
+        }, "×"),
+      ),
+    ),
+    ...(pendingImages.length > 1
+      ? [el("button", {
+          type: "button",
+          class: "small",
+          onclick: () => {
+            pendingImages = [];
+            attachNotice = "";
+            renderPendingImages();
+          },
+        }, "Clear all")]
+      : []),
+  );
+}
+
+function readFileAsImage(file) {
+  return new Promise((resolve, reject) => {
+    const type = (file.type || "").toLowerCase();
+    if (!type.startsWith("image/")) {
+      reject(`${file.name || "File"} is not an image`);
+      return;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      reject(`${file.name || "Image"} is too large (max 20 MB)`);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const idx = result.indexOf(",");
+      if (idx < 0) {
+        reject(`Couldn't read ${file.name || "image"}`);
+        return;
+      }
+      const mime = type === "image/jpg" ? "image/jpeg" : type;
+      const ext = mime.split("/")[1] || "png";
+      resolve({
+        id: nextImageId++,
+        name: file.name || `Screenshot ${nextImageId - 1}.${ext}`,
+        mime_type: mime,
+        data_base64: result.slice(idx + 1),
+        size_bytes: file.size,
+      });
+    };
+    reader.onerror = () => reject(`Couldn't read ${file.name || "image"}`);
+    reader.readAsDataURL(file);
+  });
+}
+
+async function attachImageFiles(files) {
+  const listFiles = [...(files || [])].filter(Boolean);
+  if (!listFiles.length) return false;
+  const errors = [];
+  let added = 0;
+  for (const file of listFiles) {
+    if (pendingImages.length >= MAX_IMAGES_PER_MESSAGE) {
+      errors.push(`Maximum ${MAX_IMAGES_PER_MESSAGE} images per message.`);
+      break;
+    }
+    try {
+      const img = await readFileAsImage(file);
+      pendingImages.push(img);
+      added++;
+    } catch (err) {
+      errors.push(String(err));
+    }
+  }
+  attachNotice = errors.join(" · ");
+  renderPendingImages();
+  if (added > 0) $("input").focus();
+  return added > 0 || errors.length > 0;
+}
+
+function renderUserBubble(entry) {
+  entry.node.replaceChildren(
+    ...(entry.images.length
+      ? [el(
+          "div",
+          { class: "msg-images" },
+          ...entry.images.map((img) =>
+            el(
+              "div",
+              { class: "msg-image-item" },
+              el("img", { src: `data:${img.mime_type};base64,${img.data_base64}`, alt: img.name || "Attached image" }),
+              img.name ? el("span", { class: "msg-image-name" }, img.name) : null,
+            ),
+          ),
+        )]
+      : []),
+    ...(entry.text ? [el("div", {}, entry.text)] : []),
+  );
+}
+
+function appendUser(id, text, images = []) {
   list().querySelector(".empty")?.remove();
   view.texts.delete("current");
   view.thoughts.delete("current");
   let entry = id && view.users.get(id);
   if (!entry) {
-    entry = { node: el("div", { class: "msg user" }), text: "" };
+    entry = { node: el("div", { class: "msg user" }), text: "", images: [] };
     if (id) view.users.set(id, entry);
     list().append(entry.node);
   }
-  entry.text += text;
-  entry.node.textContent = entry.text;
+  if (text) entry.text += text;
+  if (images?.length) entry.images.push(...images);
+  renderUserBubble(entry);
   scrollDown();
   return entry.node;
 }
@@ -351,9 +592,22 @@ function askPermission(request, toolCall, options) {
 
 function applyUpdate(change) {
   switch (change.sessionUpdate) {
-    case "user_message_chunk":
-      appendUser(change.messageId, textOf(change.content));
+    case "user_message_chunk": {
+      const content = change.content;
+      if (content?.type === "image" && content.data) {
+        appendUser(change.messageId, "", [{
+          name: "Image",
+          mime_type: content.mimeType || "image/png",
+          data_base64: content.data,
+        }]);
+      } else {
+        const t = textOf(content);
+        if (!t.trimStart().startsWith("[Attached image file paths]")) {
+          appendUser(change.messageId, t);
+        }
+      }
       break;
+    }
     case "agent_message_chunk":
       agentText(change.messageId || "current", textOf(change.content));
       break;
@@ -392,7 +646,7 @@ const opencode = {
     const opened = await invoke("acp_open", { project: projectId, session: id });
     return opened.busy;
   },
-  async send(text, { projectId = project?.id, sessionId = session, model = chatModel, onSession } = {}) {
+  async send(text, { projectId = project?.id, sessionId = session, model = chatModel, images = [], onSession } = {}) {
     let target = sessionId;
     if (!target) {
       awaiting = true;
@@ -403,7 +657,7 @@ const opencode = {
         awaiting = false;
       }
     }
-    await invoke("acp_prompt", { project: projectId, session: target, text, model });
+    await invoke("acp_prompt", { project: projectId, session: target, text, model, images });
     return target;
   },
   stop: (projectId = project?.id, sessionId = session) => invoke("acp_cancel", { project: projectId, session: sessionId }),
@@ -421,10 +675,10 @@ const builtin = {
     chat.messages.forEach((message, i) => this.message(message, `m${i}`, true));
     return chat.busy;
   },
-  async send(text, { projectId = project?.id, sessionId = session, model = chatModel, onSession } = {}) {
+  async send(text, { projectId = project?.id, sessionId = session, model = chatModel, images = [], onSession } = {}) {
     awaiting = !sessionId;
     try {
-      const id = await invoke("chat_send", { project: projectId, chat: sessionId, text, model });
+      const id = await invoke("chat_send", { project: projectId, chat: sessionId, text, model, images });
       onSession?.(id);
       return id;
     } finally {
@@ -435,7 +689,26 @@ const builtin = {
   remove: (id, projectId = project?.id) => invoke("chat_delete", { project: projectId, id }),
   message(message, id, replay) {
     if (message.role === "user") {
-      if (replay) appendUser(id, message.content || "");
+      if (replay) {
+        if (Array.isArray(message.content)) {
+          const texts = [];
+          const images = [];
+          for (const part of message.content) {
+            if ((part?.type === "text" || part?.type === "input_text") && part.text && !part.superviser_meta) {
+              texts.push(part.text);
+            } else if (part?.type === "image_url") {
+              const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url;
+              const match = typeof url === "string" && url.match(/^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i);
+              if (match) {
+                images.push({ name: `Image ${images.length + 1}`, mime_type: match[1].toLowerCase(), data_base64: match[2] });
+              }
+            }
+          }
+          appendUser(id, texts.join("\n"), images);
+        } else {
+          appendUser(id, message.content || "");
+        }
+      }
     } else if (message.role === "assistant") {
       const key = replay ? id : `live${this.live++}`;
       if (message.reasoning) agentThought(replay ? key : "live-thought", message.reasoning, true);
@@ -524,6 +797,9 @@ async function showChat(id) {
   session = id;
   busy = false;
   usage = null;
+  pendingImages = [];
+  attachNotice = "";
+  renderPendingImages();
   if (!awaiting) pending.length = 0;
   clearView();
   subagents = [];
@@ -561,84 +837,496 @@ async function showChat(id) {
   await renderChatList();
   if (mine !== chatGen) return;
   update();
+  if (!id) $("input").focus();
 }
 
 let chatTitles = new Map();
-async function renderChatList() {
-  const mine = ++listGen;
-  const box = $("chat-list");
-  const proj = project;
-  if (!proj) return box.replaceChildren();
-  let chats = [];
-  // A Linux VM takes a few seconds to start, more the first time.
-  if (box.dataset.project !== proj.id && proj.isolation === "linux-vm") box.replaceChildren(el("p", { class: "small muted" }, "Starting the Linux VM…"));
-  try {
-    chats = await engines[engine].sessions(proj.id);
-  } catch (e) {
-    if (mine !== listGen || proj.id !== project?.id) return;
-    box.replaceChildren(el("p", { class: "small muted" }, String(e)));
+
+function updateHeaderProject() {
+  const badge = $("header-badge");
+  const projName = $("header-project");
+  const settingsBtn = $("project-settings-btn");
+  if (!project) {
+    badge.hidden = true;
+    projName.textContent = "";
+    if (settingsBtn) settingsBtn.hidden = true;
     return;
   }
-  if (mine !== listGen || proj.id !== project?.id) return;
-  box.dataset.project = proj.id;
-  const archivedList = await invoke("archived_chats", { project: proj.id }).catch(() => []);
-  if (mine !== listGen || proj.id !== project?.id) return;
-  archived = new Set(archivedList);
-  chatTitles = new Map(chats.map((c) => [c.id, c.title]));
-  if (session && chatTitles.has(session)) $("title").textContent = chatTitles.get(session);
-  const item = (chat) =>
-    el(
-      "div",
-      { class: `chat-item${chat.id === session ? " active" : ""}` },
+  badge.hidden = false;
+  badge.textContent = projectMonogram(project.name);
+  badge.setAttribute("style", projectBadgeStyle(project.id));
+  projName.textContent = `${project.name} /`;
+  if (settingsBtn) {
+    settingsBtn.hidden = false;
+    settingsBtn.title = `Project settings for ${project.name} (${project.folders[0].path})`;
+  }
+}
+
+let filterProjectId = null;
+let approvalPendingSessions = new Set();
+let doneSessions = new Set();
+let projectsPopoutOpen = false;
+let projectsPopoutSelected = 1;
+let newChatModalOpen = false;
+let newChatSelected = 0;
+
+function orderedProjects(query = "") {
+  const list = [...projects];
+  if (project) {
+    const idx = list.findIndex((p) => p.id === project.id);
+    if (idx > 0) list.unshift(...list.splice(idx, 1));
+  }
+  const q = query.trim().toLowerCase();
+  if (!q) return list;
+  return list.filter(
+    (p) =>
+      p.name.toLowerCase().includes(q) ||
+      (p.folders?.[0]?.path || "").toLowerCase().includes(q),
+  );
+}
+
+function renderFilterChip() {
+  const slot = $("project-filter-slot");
+  if (!slot) return;
+  const filtered = filterProjectId && projects.find((p) => p.id === filterProjectId);
+  if (filtered) {
+    slot.replaceChildren(
       el(
         "button",
         {
           type: "button",
-          class: "chat-item-title",
-          "aria-current": chat.id === session ? "true" : null,
-          onclick: () => showChat(chat.id),
+          class: "filter-dropdown-btn filtered",
+          title: "Filter chats by project (⌘⇧P)",
+          onclick: (event) => {
+            event.stopPropagation();
+            if (projectsPopoutOpen) closeProjectsPopout();
+            else openProjectsPopout();
+          },
         },
-        chat.title,
+        el(
+          "span",
+          { class: "filter-dropdown-left" },
+          el("span", { class: "proj-badge", style: projectBadgeStyle(filtered.id) }, projectMonogram(filtered.name)),
+          el("span", { class: "filter-chip-name", title: filtered.name }, filtered.name),
+        ),
+        el("span", { class: "muted" }, "▾"),
       ),
-      archived.has(chat.id)
-        ? el("button", { type: "button", class: "chat-item-action", title: "Put back in the list", "aria-label": `Put "${chat.title}" back in the list`, onclick: () => archiveChat(chat.id, false) }, "↩")
-        : el("button", { type: "button", class: "chat-item-action", title: "Archive chat", "aria-label": `Archive "${chat.title}"`, onclick: () => archiveChat(chat.id, true) }, "⤓"),
-      el("button", { type: "button", class: "chat-item-action", title: "Delete chat", "aria-label": `Delete "${chat.title}"`, onclick: () => deleteChat(chat) }, "×"),
+      el("button", {
+        type: "button",
+        class: "icon",
+        title: "Show chats from all projects",
+        "aria-label": "Clear project filter",
+        onclick: () => {
+          filterProjectId = null;
+          drawChatList();
+        },
+      }, "×"),
     );
-  const kept = chats.filter((c) => archived.has(c.id));
+  } else {
+    slot.replaceChildren(
+      el(
+        "button",
+        {
+          type: "button",
+          class: "filter-dropdown-btn",
+          title: "Filter chats by project (⌘⇧P)",
+          onclick: (event) => {
+            event.stopPropagation();
+            if (projectsPopoutOpen) closeProjectsPopout();
+            else openProjectsPopout();
+          },
+        },
+        el("span", { class: "filter-chip-name" }, "All projects"),
+        el("span", { class: "muted" }, "▾"),
+      ),
+    );
+  }
+}
+
+function renderProjectsPopout() {
+  const pop = $("projects-popout");
+  const listEl = $("projects-popout-list");
+  if (!pop || !listEl) return;
+  pop.hidden = !projectsPopoutOpen;
+  if (!projectsPopoutOpen) return;
+  const matched = orderedProjects($("projects-popout-search")?.value || "");
+  listEl.replaceChildren(
+    el(
+      "button",
+      {
+        type: "button",
+        class: `popout-row${projectsPopoutSelected === 0 ? " selected" : ""}`,
+        onclick: () => {
+          closeProjectsPopout();
+          newProject();
+        },
+      },
+      el("span", { class: "popout-row-left" }, el("span", { class: "proj-badge" }, "+"), el("span", { class: "popout-row-name" }, "Add project")),
+    ),
+    el(
+      "button",
+      {
+        type: "button",
+        class: `popout-row${projectsPopoutSelected === 1 ? " selected" : ""}`,
+        onclick: () => {
+          filterProjectId = null;
+          closeProjectsPopout();
+          drawChatList();
+        },
+      },
+      el("span", { class: "popout-row-left" }, el("span", { class: "proj-badge" }, "▤"), el("span", { class: "popout-row-name" }, "All projects")),
+      !filterProjectId ? el("span", { class: "popout-check" }, "✓") : null,
+    ),
+    ...matched.map((p, i) =>
+      el(
+        "button",
+        {
+          type: "button",
+          class: `popout-row${projectsPopoutSelected === i + 2 ? " selected" : ""}`,
+          onclick: () => {
+            filterProjectId = p.id;
+            closeProjectsPopout();
+            drawChatList();
+          },
+        },
+        el(
+          "span",
+          { class: "popout-row-left" },
+          el("span", { class: "proj-badge", style: projectBadgeStyle(p.id) }, projectMonogram(p.name)),
+          el("span", { class: "popout-row-name" }, p.name),
+        ),
+        filterProjectId === p.id ? el("span", { class: "popout-check" }, "✓") : null,
+      ),
+    ),
+  );
+}
+
+function openProjectsPopout() {
+  closeNewChatModal();
+  projectsPopoutOpen = true;
+  projectsPopoutSelected = 1;
+  if ($("projects-popout-search")) $("projects-popout-search").value = "";
+  renderProjectsPopout();
+  $("projects-popout-search")?.focus();
+}
+
+function closeProjectsPopout() {
+  projectsPopoutOpen = false;
+  renderProjectsPopout();
+}
+
+function renderNewChatModal() {
+  const modal = $("new-chat-modal");
+  const listEl = $("new-chat-list");
+  if (!modal || !listEl) return;
+  modal.hidden = !newChatModalOpen;
+  if (!newChatModalOpen) return;
+  const matched = orderedProjects($("new-chat-search")?.value || "");
+  listEl.replaceChildren(
+    ...matched.map((p, i) => {
+      const isCurrent = project?.id === p.id;
+      const env = p.isolation === "linux-vm" ? "Linux VM" : "macOS sandbox";
+      const sub = `${isCurrent ? "Current · " : ""}${env} · ${p.folders?.[0]?.path || ""}`;
+      return el(
+        "button",
+        {
+          type: "button",
+          class: `modal-proj-row${newChatSelected === i ? " selected" : ""}`,
+          onclick: () => startNewChatInProject(p.id),
+        },
+        el(
+          "span",
+          { class: "modal-proj-left" },
+          el("span", { class: "proj-badge", style: projectBadgeStyle(p.id) }, projectMonogram(p.name)),
+          el(
+            "span",
+            { class: "modal-proj-text" },
+            el("span", { class: "modal-proj-title" }, p.name),
+            el("span", { class: "modal-proj-sub" }, sub),
+          ),
+        ),
+        i < 9 ? el("span", { class: "modal-proj-key" }, `⌘${i + 1}`) : null,
+      );
+    }),
+    el(
+      "button",
+      {
+        type: "button",
+        class: `modal-proj-row${newChatSelected === matched.length ? " selected" : ""}`,
+        onclick: () => {
+          closeNewChatModal();
+          newProject();
+        },
+      },
+      el(
+        "span",
+        { class: "modal-proj-left" },
+        el("span", { class: "proj-badge" }, "+"),
+        el("span", { class: "modal-proj-title" }, "Add new project…"),
+      ),
+      el("span", { class: "modal-proj-key" }, "⌘⇧O"),
+    ),
+  );
+}
+
+function openNewChatModal() {
+  if (!projects.length) {
+    newProject();
+    return;
+  }
+  closeProjectsPopout();
+  newChatModalOpen = true;
+  newChatSelected = 0;
+  if ($("new-chat-search")) $("new-chat-search").value = "";
+  renderNewChatModal();
+  $("new-chat-search")?.focus();
+}
+
+function closeNewChatModal() {
+  newChatModalOpen = false;
+  renderNewChatModal();
+}
+
+async function startNewChatInProject(projectId) {
+  closeNewChatModal();
+  if (project?.id !== projectId) {
+    await openProject(projectId);
+  } else {
+    await showChat(null);
+  }
+  $("input")?.focus();
+}
+
+async function openSession(projectId, chatId) {
+  doneSessions.delete(chatId);
+  if (project?.id !== projectId) {
+    const targetProj = projects.find((p) => p.id === projectId);
+    if (!targetProj) return;
+    project = targetProj;
+    $("project").value = project.id;
+    updateHeaderProject();
+    gitPanel = null;
+    gitNotice = null;
+    gitState = null;
+    renderGit();
+    refreshGit(true);
+  }
+  await showChat(chatId);
+}
+
+function drawChatList() {
+  const box = $("chat-list");
+  const query = ($("chat-search")?.value || "").trim().toLowerCase();
+  renderFilterChip();
+
+  const filtered = allSessions.filter((chat) => {
+    if (filterProjectId && chat.projectId !== filterProjectId) return false;
+    if (!query) return true;
+    return (
+      chat.title.toLowerCase().includes(query) ||
+      chat.projectName.toLowerCase().includes(query)
+    );
+  });
+
+  const item = (chat) => {
+    const isActive = chat.id === session && chat.projectId === project?.id;
+    const isArch = archived.has(archiveKey(chat.projectId, chat.id));
+    const needsApproval = approvalPendingSessions.has(chat.id);
+    const workingSince = workingSinceBySession.get(chat.id);
+    const isDone = doneSessions.has(chat.id);
+    const rel = formatRelTime(chat.updated);
+    const envLabel = chat.isolation === "linux-vm" ? "Linux VM" : "macOS sandbox";
+    const statusBadge = needsApproval
+      ? el("span", { class: "chat-card-approval" }, "⚠ Approval")
+      : workingSince
+        ? el("span", { class: "chat-card-working" }, el("span", { class: "dot" }), `Working ${formatWorkingCompact(workingSince)}`)
+        : isDone
+          ? el("span", { class: "chat-card-done" }, "✓ Done")
+          : rel
+            ? el("span", { class: "chat-card-time" }, rel)
+            : null;
+    return el(
+      "div",
+      { class: `chat-card${isActive ? " active" : ""}` },
+      el(
+        "button",
+        {
+          type: "button",
+          class: "chat-card-open chat-item-title",
+          "aria-current": isActive ? "true" : null,
+          onclick: () => openSession(chat.projectId, chat.id),
+        },
+        el(
+          "div",
+          { class: "chat-card-meta" },
+          el(
+            "span",
+            { class: "chat-card-proj" },
+            el("span", { class: "proj-badge", style: projectBadgeStyle(chat.projectId) }, projectMonogram(chat.projectName)),
+            el("span", { class: "chat-card-proj-name" }, chat.projectName),
+          ),
+          statusBadge,
+        ),
+        el("div", { class: "chat-card-title" }, chat.title),
+      ),
+      el(
+        "div",
+        { class: "chat-card-foot" },
+        el("span", { class: "chat-card-env" }, envLabel),
+        el(
+          "span",
+          { class: "chat-card-actions" },
+          isArch
+            ? el("button", { type: "button", class: "chat-item-action", title: "Restore chat to active list", "aria-label": `Restore "${chat.title}"`, onclick: () => archiveChat(chat.id, false, chat.projectId) }, "↩")
+            : el("button", { type: "button", class: "chat-item-action", title: "Archive chat", "aria-label": `Archive "${chat.title}"`, onclick: () => archiveChat(chat.id, true, chat.projectId) }, "⤓"),
+          el("button", { type: "button", class: "chat-item-action", title: "Delete chat", "aria-label": `Delete "${chat.title}"`, onclick: () => deleteChat(chat) }, "×"),
+        ),
+      ),
+    );
+  };
+
+  const activeItems = filtered.filter((c) => !archived.has(archiveKey(c.projectId, c.id)));
+  const kept = filtered.filter((c) => archived.has(archiveKey(c.projectId, c.id)));
+
+  const draftCard =
+    !session && !query && project
+      ? el(
+          "div",
+          { class: "chat-card draft" },
+          el(
+            "div",
+            { class: "chat-card-meta" },
+            el(
+              "span",
+              { class: "chat-card-proj" },
+              el("span", { class: "proj-badge", style: projectBadgeStyle(project.id) }, projectMonogram(project.name)),
+              el("span", { class: "chat-card-proj-name" }, project.name),
+            ),
+            el("span", { class: "chat-card-working" }, "Draft"),
+          ),
+          el("div", { class: "chat-card-title" }, "New chat"),
+          el("div", { class: "chat-card-foot" }, el("span", { class: "chat-card-env" }, project.isolation === "linux-vm" ? "Linux VM" : "macOS sandbox")),
+        )
+      : null;
+
   const more = el("details", { class: "archived-chats" }, el("summary", { class: "small muted" }, `Archived (${kept.length})`), ...kept.map(item));
   more.open = showArchived || kept.some((c) => c.id === session);
   more.addEventListener("toggle", () => (showArchived = more.open));
-  box.replaceChildren(...chats.filter((c) => !archived.has(c.id)).map(item), ...(kept.length ? [more] : []));
+  box.replaceChildren(
+    ...(draftCard ? [draftCard] : []),
+    ...activeItems.map(item),
+    ...(activeItems.length === 0 && query ? [el("p", { class: "small muted" }, "No matching chats.")] : []),
+    ...(kept.length ? [more] : []),
+  );
+}
+
+async function renderChatList() {
+  const mine = ++listGen;
+  const box = $("chat-list");
+  if (!projects.length) {
+    allSessions = [];
+    box.replaceChildren();
+    return;
+  }
+  if (project && box.dataset.project !== project.id && project.isolation === "linux-vm" && allSessions.length === 0) {
+    box.replaceChildren(el("p", { class: "small muted" }, "Starting the Linux VM…"));
+  }
+  let collected = [];
+  let firstError = null;
+  try {
+    if (engine === "opencode") {
+      const perProj = await invoke("acp_all_sessions", { activeProject: project?.id || null });
+      if (mine !== listGen) return;
+      for (const entry of perProj || []) {
+        const projMeta = projects.find((p) => p.id === entry.project);
+        if (!projMeta) continue;
+        if (entry.error && (entry.project === project?.id || !firstError)) firstError = entry.error;
+        for (const s of entry.sessions || []) {
+          if (!s.sessionId) continue;
+          collected.push({
+            id: s.sessionId,
+            projectId: projMeta.id,
+            projectName: projMeta.name,
+            isolation: projMeta.isolation,
+            title: s.title?.startsWith("New session - ") ? "New chat" : s.title || "Chat",
+            updated: parseSessionTime(s),
+          });
+        }
+      }
+    } else {
+      const lists = await Promise.all(
+        projects.map(async (projMeta) => {
+          const rows = await invoke("chat_list", { project: projMeta.id }).catch(() => []);
+          return rows.map((c) => ({
+            id: c.id,
+            projectId: projMeta.id,
+            projectName: projMeta.name,
+            isolation: projMeta.isolation,
+            title: c.title,
+            updated: c.updated || 0,
+          }));
+        }),
+      );
+      if (mine !== listGen) return;
+      collected = lists.flat();
+    }
+  } catch (e) {
+    if (mine !== listGen) return;
+    box.replaceChildren(el("p", { class: "small muted" }, String(e)));
+    return;
+  }
+
+  const archivedEntries = await Promise.all(
+    projects.map(async (p) => {
+      const ids = await invoke("archived_chats", { project: p.id }).catch(() => []);
+      return ids.map((id) => archiveKey(p.id, id));
+    }),
+  );
+  if (mine !== listGen) return;
+  archived = new Set(archivedEntries.flat());
+  collected.sort((a, b) => {
+    const ab = workingSinceBySession.has(a.id) ? 1 : 0;
+    const bb = workingSinceBySession.has(b.id) ? 1 : 0;
+    if (ab !== bb) return bb - ab;
+    return (b.updated || 0) - (a.updated || 0);
+  });
+  allSessions = collected;
+  box.dataset.project = project?.id || "";
+  chatTitles = new Map(allSessions.map((c) => [c.id, c.title]));
+  if (session && chatTitles.has(session)) $("title").textContent = chatTitles.get(session);
+  if (allSessions.length === 0 && firstError) {
+    box.replaceChildren(el("p", { class: "small muted" }, firstError));
+  } else {
+    drawChatList();
+  }
   update();
 }
 
 // Archived chats are kept, out of the list; sending in one puts it back.
-async function archiveChat(id, archive) {
-  const proj = project;
-  if (!proj) return;
+async function archiveChat(id, archive, projectId = project?.id) {
+  if (!projectId) return;
   try {
-    await invoke("set_chat_archived", { project: proj.id, chat: id, archived: archive });
+    await invoke("set_chat_archived", { project: projectId, chat: id, archived: archive });
   } catch (e) {
     alert(e);
     return;
   }
-  if (proj.id !== project?.id) return;
-  if (archive && id === session) showChat(null);
-  else renderChatList();
+  if (archive) archived.add(archiveKey(projectId, id));
+  else archived.delete(archiveKey(projectId, id));
+  if (archive && id === session && projectId === project?.id) showChat(null);
+  else drawChatList();
 }
 
 async function deleteChat(chat) {
-  const proj = project;
-  if (!proj) return;
+  const projId = chat.projectId || project?.id;
+  if (!projId) return;
   if (!confirm(`Delete “${chat.title}”?`)) return;
   try {
-    await engines[engine].remove(chat.id, proj.id);
+    await engines[engine].remove(chat.id, projId);
   } catch (e) {
     alert(e);
   }
-  if (proj.id !== project?.id) return;
-  if (chat.id === session) showChat(null);
+  if (chat.id === session && projId === project?.id) showChat(null);
   else renderChatList();
 }
 
@@ -658,7 +1346,7 @@ async function openProject(id) {
   if (mine !== projectGen) return;
   project = projects.find((p) => p.id === id) || projects.find((p) => p.id === project?.id) || projects[0] || null;
   $("project").value = project?.id || "";
-  $("where").textContent = project ? `· ${project.folders[0].path}` : "";
+  updateHeaderProject();
   gitPanel = null;
   gitNotice = null;
   gitState = null;
@@ -812,7 +1500,7 @@ function update() {
   const long = session && !busy && share >= LONG_CHAT ? [`This chat is ${Math.round(share * 100)}% full. Long chats get slower and less reliable, and a full one is shortened to a summary. If this task is done, start a new chat.`] : [];
   notice.hidden = reasons.length + notes.length + long.length === 0;
   notice.append(...long.map((text) => el("div", { class: "row info" }, el("span", { class: "spacer" }, text), el("button", { onclick: () => archiveChat(session, true) }, "Archive and start a new chat"))));
-  $("archive").hidden = !session || archived.has(session);
+  $("archive").hidden = !session || !project || archived.has(archiveKey(project.id, session));
   renderModelPicker();
   $("send").disabled = busy || reasons.length > 0 || !chatModel;
   $("send").hidden = busy;
@@ -852,8 +1540,23 @@ function onOpencode(event) {
     if (event.project === project?.id) $("chat-list").replaceChildren(el("p", { class: "small muted" }, event.text));
     return;
   }
+  if (event.type === "permission") {
+    approvalPendingSessions.add(event.session);
+    drawChatList();
+  }
+  if (event.type === "state") {
+    if (event.busy) {
+      doneSessions.delete(event.session);
+      if (!workingSinceBySession.has(event.session)) workingSinceBySession.set(event.session, Date.now());
+      drawChatList();
+    } else {
+      workingSinceBySession.delete(event.session);
+      approvalPendingSessions.delete(event.session);
+      if (!event.error && event.stop_reason !== "cancelled") doneSessions.add(event.session);
+      if (event.project !== project?.id || event.session !== session) renderChatList();
+    }
+  }
   if (event.project !== project?.id || event.session !== session) {
-    if (event.type === "state" && !event.busy && event.project === project?.id) renderChatList();
     return;
   }
   if (event.type === "update") applyUpdate(event.update);
@@ -867,8 +1570,23 @@ function onOpencode(event) {
 }
 
 function onBuiltin(event) {
+  if (event.type === "approval") {
+    approvalPendingSessions.add(event.chat);
+    drawChatList();
+  }
+  if (event.type === "state") {
+    if (event.busy) {
+      doneSessions.delete(event.chat);
+      if (!workingSinceBySession.has(event.chat)) workingSinceBySession.set(event.chat, Date.now());
+      drawChatList();
+    } else {
+      workingSinceBySession.delete(event.chat);
+      approvalPendingSessions.delete(event.chat);
+      if (!event.error) doneSessions.add(event.chat);
+      if (event.chat !== session) renderChatList();
+    }
+  }
   if (event.chat !== session) {
-    if (event.type === "state") renderChatList();
     return;
   }
   if (event.type === "message") builtin.message(event.message, null, false);
@@ -906,18 +1624,19 @@ listen("projects", async () => {
   if (found) {
     project = found;
     $("project").value = project.id;
-    $("where").textContent = `· ${project.folders[0].path}`;
+    updateHeaderProject();
+    renderChatList();
     update();
   } else if (project || projects.length) {
     await openProject(projects[0]?.id || "");
   } else {
     $("project").value = "";
-    $("where").textContent = "";
+    updateHeaderProject();
     update();
   }
 });
 
-async function send(text) {
+async function send(text, images = []) {
   const proj = project;
   const startSession = session;
   const modelId = chatModel;
@@ -925,7 +1644,7 @@ async function send(text) {
   if (!proj || !modelId) return;
 
   list().querySelector(".empty")?.remove();
-  const userNode = appendUser(null, text);
+  const userNode = appendUser(null, text, images);
   busy = true;
   let resolveAbort;
   const aborted = new Promise((resolve) => (resolveAbort = resolve));
@@ -994,20 +1713,27 @@ async function send(text) {
       if (afterStatus === "switched") return;
       if (afterStatus === "cancelled") throw SEND_CANCELLED;
     }
-    if (startSession && archived.has(startSession)) {
+    if (startSession && archived.has(archiveKey(proj.id, startSession))) {
       await invoke("set_chat_archived", { project: proj.id, chat: startSession, archived: false })
         .then(() => {
-          if (startGen === chatGen) archived.delete(startSession);
+          if (startGen === chatGen) archived.delete(archiveKey(proj.id, startSession));
         })
         .catch(() => {});
       const afterUnarchive = checkActive();
       if (afterUnarchive === "switched") return;
       if (afterUnarchive === "cancelled") throw SEND_CANCELLED;
     }
+    const wireImages = images.map(({ name, mime_type, data_base64, size_bytes }) => ({
+      name,
+      mime_type,
+      data_base64,
+      size_bytes: size_bytes || 0,
+    }));
     const targetSession = await engines[engine].send(text, {
       projectId: proj.id,
       sessionId: startSession,
       model: modelId,
+      images: wireImages,
       onSession: (id) => {
         if (startGen === chatGen) session = id;
       },
@@ -1020,7 +1746,11 @@ async function send(text) {
     if (startGen !== chatGen) return;
     // Not sent: remove the unsent bubble and give the message back, so it isn't lost or duplicated.
     userNode?.remove();
-    if (!$("input").value) $("input").value = text;
+    if (!$("input").value && text) $("input").value = text;
+    if (!pendingImages.length && images.length) {
+      pendingImages = images;
+      renderPendingImages();
+    }
     if (e === SEND_CANCELLED) {
       if (!list().querySelector(".msg") && !session) list().append(emptyState());
       finished(null, "cancelled");
@@ -1036,10 +1766,63 @@ async function send(text) {
 $("composer").addEventListener("submit", (event) => {
   event.preventDefault();
   const text = $("input").value.trim();
-  if (!text || $("send").disabled) return;
+  if ((!text && !pendingImages.length) || $("send").disabled) return;
+  const images = pendingImages.slice();
   $("input").value = "";
-  send(text);
+  pendingImages = [];
+  attachNotice = "";
+  renderPendingImages();
+  send(text, images);
 });
+$("attach-image")?.addEventListener("click", () => $("image-input")?.click());
+$("image-input")?.addEventListener("change", async (event) => {
+  const input = event.target;
+  if (input.files?.length) await attachImageFiles(input.files);
+  input.value = "";
+});
+document.addEventListener("paste", (event) => {
+  const items = [...(event.clipboardData?.items || [])];
+  const imageFiles = items
+    .filter((item) => item.kind === "file" && item.type?.startsWith("image/"))
+    .map((item) => item.getAsFile())
+    .filter(Boolean);
+  if (imageFiles.length) {
+    event.preventDefault();
+    attachImageFiles(imageFiles);
+  }
+});
+{
+  const chatPane = document.querySelector(".chat");
+  const overlay = $("drop-overlay");
+  let dragDepth = 0;
+  const hasFiles = (dt) => [...(dt?.types || [])].includes("Files");
+  chatPane?.addEventListener("dragenter", (event) => {
+    if (!hasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepth++;
+    chatPane.classList.add("drag-over");
+    if (overlay) overlay.hidden = false;
+  });
+  chatPane?.addEventListener("dragover", (event) => {
+    if (!hasFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  });
+  chatPane?.addEventListener("dragleave", () => {
+    if (dragDepth > 0) dragDepth--;
+    if (dragDepth === 0) {
+      chatPane.classList.remove("drag-over");
+      if (overlay) overlay.hidden = true;
+    }
+  });
+  chatPane?.addEventListener("drop", (event) => {
+    event.preventDefault();
+    dragDepth = 0;
+    chatPane.classList.remove("drag-over");
+    if (overlay) overlay.hidden = true;
+    if (event.dataTransfer?.files?.length) attachImageFiles(event.dataTransfer.files);
+  });
+}
 $("input").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
@@ -1050,10 +1833,56 @@ $("stop").addEventListener("click", () => {
   if (sending) sending.cancel();
   if (session) engines[engine].stop(project?.id, session).catch(() => {});
 });
-$("new-chat").addEventListener("click", () => showChat(null));
-$("archive").addEventListener("click", () => session && archiveChat(session, true));
+$("new-chat").addEventListener("click", () => openNewChatModal());
+$("projects-popout-btn")?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  if (projectsPopoutOpen) closeProjectsPopout();
+  else openProjectsPopout();
+});
+$("projects-popout-search")?.addEventListener("input", () => {
+  projectsPopoutSelected = 0;
+  renderProjectsPopout();
+});
+$("new-chat-search")?.addEventListener("input", () => {
+  newChatSelected = 0;
+  renderNewChatModal();
+});
+$("new-chat-modal")?.addEventListener("click", (event) => {
+  if (event.target === $("new-chat-modal")) closeNewChatModal();
+});
+document.addEventListener("click", (event) => {
+  if (projectsPopoutOpen && !event.target.closest("#projects-popout") && !event.target.closest("#project-filter-slot")) {
+    closeProjectsPopout();
+  }
+});
+$("add-project").addEventListener("click", newProject);
+$("chat-search").addEventListener("input", () => drawChatList());
+$("chat-search").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    const first = $("chat-list").querySelector(".chat-card-open");
+    if (first) first.click();
+  } else if (event.key === "ArrowDown") {
+    event.preventDefault();
+    $("chat-list").querySelector(".chat-card-open")?.focus();
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    $("chat-search").value = "";
+    drawChatList();
+    $("input").focus();
+  }
+});
+$("project-scope").addEventListener("click", () => {
+  filterCurrentProject = !filterCurrentProject;
+  drawChatList();
+});
+$("archive").addEventListener("click", () => session && project && archiveChat(session, true, project.id));
 $("project").addEventListener("change", () => openProject($("project").value));
 $("manage").addEventListener("click", () => invoke("open_window", { name: "settings" }));
+$("project-settings-btn")?.addEventListener("click", () => invoke("open_window", { name: "settings" }));
+setInterval(() => {
+  if (workingSinceBySession.size > 0) drawChatList();
+}, 15000);
 
 // --- Host-side Git & GitHub PR bar ---
 
@@ -1209,7 +2038,13 @@ function openCommitPanel() {
       await refreshGit(alsoPush);
     }
   };
-  input.addEventListener("keydown", (e) => e.key === "Enter" && runCommit(false));
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const canPush = Boolean(st?.has_remote && !st.detached);
+      runCommit((e.metaKey || e.ctrlKey) && canPush);
+    }
+  });
   const shown = (st?.dirty_files || []).slice(0, 8);
   const extra = (st?.dirty_files || []).length - shown.length;
   panel.replaceChildren(
@@ -1247,32 +2082,49 @@ async function openPrPanel() {
   const titleInput = el("input", { type: "text", placeholder: "Pull request title" });
   const bodyInput = el("textarea", { placeholder: "Short summary of what changed (optional)" });
   const draftCheck = el("input", { type: "checkbox" });
+  const submitPr = async () => {
+    if (submitBtn.disabled) return;
+    const title = titleInput.value.trim();
+    if (!title) {
+      gitNotice = { text: "Enter a pull request title first.", error: true };
+      renderGit();
+      return;
+    }
+    gitBusy = "Creating PR…";
+    gitNotice = null;
+    renderGit();
+    try {
+      const pr = await invoke("git_create_pr", { project: project.id, title, body: bodyInput.value.trim(), draft: draftCheck.checked });
+      gitPanel = null;
+      gitNotice = { text: pr.number ? `Created PR #${pr.number}: ${pr.title}` : `Created PR: ${pr.title}`, url: pr.url || null };
+    } catch (e) {
+      gitNotice = { text: String(e), error: true };
+    } finally {
+      gitBusy = null;
+      await refreshGit(true);
+    }
+  };
   const submitBtn = el("button", {
     type: "button",
     class: "small primary",
     disabled: !gitState?.gh_available,
-    onclick: async () => {
-      const title = titleInput.value.trim();
-      if (!title) {
-        gitNotice = { text: "Enter a pull request title first.", error: true };
-        renderGit();
-        return;
-      }
-      gitBusy = "Creating PR…";
-      gitNotice = null;
-      renderGit();
-      try {
-        const pr = await invoke("git_create_pr", { project: project.id, title, body: bodyInput.value.trim(), draft: draftCheck.checked });
-        gitPanel = null;
-        gitNotice = { text: pr.number ? `Created PR #${pr.number}: ${pr.title}` : `Created PR: ${pr.title}`, url: pr.url || null };
-      } catch (e) {
-        gitNotice = { text: String(e), error: true };
-      } finally {
-        gitBusy = null;
-        await refreshGit(true);
-      }
-    },
+    onclick: submitPr,
   }, "Create PR");
+  titleInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      submitPr();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      bodyInput.focus();
+    }
+  });
+  bodyInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      submitPr();
+    }
+  });
   panel.replaceChildren(
     !gitState?.gh_available ? el("div", { class: "small warn-text" }, "GitHub CLI (gh) not found on PATH. Install it with `brew install gh` and run `gh auth login`.") : null,
     el("div", { class: "row" }, titleInput),
@@ -1415,7 +2267,7 @@ function renderSubagents() {
         selected.state === "running" && selected.cancellable
           ? el("button", { type: "button", class: "small danger", onclick: () => invoke("subagent_cancel", { id: selected.id }) }, "Stop")
           : null,
-        el("button", { type: "button", class: "small", onclick: () => { inspectedSubagent = null; renderSubagents(); } }, "Close"),
+        el("button", { type: "button", class: "small", onclick: () => { inspectedSubagent = null; renderSubagents(); $("input").focus(); } }, "Close"),
       ),
     ),
     el(
@@ -1435,6 +2287,151 @@ function renderSubagents() {
     ),
   );
 }
+
+// --- Keyboard navigation & shortcuts ---
+
+$("chat-list").addEventListener("keydown", (event) => {
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  const target = event.target.closest(".chat-item-title");
+  if (!target) return;
+  const items = [...$("chat-list").querySelectorAll(".chat-item-title")].filter((btn) => btn.offsetParent !== null);
+  const idx = items.indexOf(target);
+  if (idx < 0) return;
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    items[(idx + 1) % items.length].focus();
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    items[(idx - 1 + items.length) % items.length].focus();
+  } else if (event.key === "Home") {
+    event.preventDefault();
+    items[0].focus();
+  } else if (event.key === "End") {
+    event.preventDefault();
+    items[items.length - 1].focus();
+  }
+});
+
+function switchAdjacentChat(delta) {
+  const buttons = [...$("chat-list").querySelectorAll(".chat-item-title")].filter((btn) => btn.offsetParent !== null);
+  if (!buttons.length) return;
+  const activeIdx = buttons.findIndex((btn) => btn.getAttribute("aria-current") === "true");
+  const nextIdx = activeIdx >= 0 ? (activeIdx + delta + buttons.length) % buttons.length : delta >= 0 ? 0 : buttons.length - 1;
+  buttons[nextIdx].click();
+}
+
+document.addEventListener("keydown", (event) => {
+  const mod = event.metaKey || event.ctrlKey;
+  const key = event.key.toLowerCase();
+
+  if (event.key === "Escape") {
+    if (newChatModalOpen) {
+      event.preventDefault();
+      closeNewChatModal();
+      return;
+    }
+    if (projectsPopoutOpen) {
+      event.preventDefault();
+      closeProjectsPopout();
+      return;
+    }
+    if ($("file-menu")) {
+      event.preventDefault();
+      closeMenu(true);
+    } else if (document.activeElement === $("chat-search") || $("chat-search").value) {
+      event.preventDefault();
+      $("chat-search").value = "";
+      drawChatList();
+      $("input").focus();
+    } else if (gitPanel) {
+      event.preventDefault();
+      gitPanel = null;
+      renderGit();
+      $("input").focus();
+    } else if (inspectedSubagent) {
+      event.preventDefault();
+      inspectedSubagent = null;
+      renderSubagents();
+      $("input").focus();
+    } else if (busy && (!$("input").value.trim() || document.activeElement !== $("input"))) {
+      event.preventDefault();
+      $("stop").click();
+    }
+    return;
+  }
+
+  if (mod && !event.shiftKey && !event.altKey) {
+    if (newChatModalOpen && /^[1-9]$/.test(key)) {
+      const matched = orderedProjects($("new-chat-search")?.value || "");
+      const target = matched[Number(key) - 1];
+      if (target) {
+        event.preventDefault();
+        startNewChatInProject(target.id);
+      }
+      return;
+    }
+    if (key === "n") {
+      event.preventDefault();
+      openNewChatModal();
+    } else if (key === "f") {
+      event.preventDefault();
+      $("chat-search").focus();
+    } else if (key === "l" || key === "k") {
+      event.preventDefault();
+      $("input").focus();
+    } else if (key === ",") {
+      event.preventDefault();
+      invoke("open_window", { name: "settings" });
+    } else if (key === ".") {
+      if (busy) {
+        event.preventDefault();
+        $("stop").click();
+      }
+    } else if (key === "[") {
+      event.preventDefault();
+      switchAdjacentChat(-1);
+    } else if (key === "]") {
+      event.preventDefault();
+      switchAdjacentChat(1);
+    }
+    return;
+  }
+
+  if (mod && event.shiftKey && !event.altKey) {
+    if (key === "o") {
+      event.preventDefault();
+      newProject();
+    } else if (key === "i") {
+      event.preventDefault();
+      $("image-input")?.click();
+    } else if (key === "p") {
+      event.preventDefault();
+      if (projectsPopoutOpen) closeProjectsPopout();
+      else openProjectsPopout();
+    } else if (key === "m") {
+      event.preventDefault();
+      $("chat-model").focus();
+    } else if (key === "a") {
+      if (session && project && !archived.has(archiveKey(project.id, session))) {
+        event.preventDefault();
+        archiveChat(session, true, project.id);
+      }
+    } else if (key === "g") {
+      if (gitState?.is_repo && (gitState.dirty_files.length > 0 || gitPanel === "commit")) {
+        event.preventDefault();
+        openCommitPanel();
+      } else {
+        refreshGit(true);
+      }
+    }
+    return;
+  }
+
+  if (event.altKey && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+    event.preventDefault();
+    switchAdjacentChat(event.key === "ArrowDown" ? 1 : -1);
+  }
+});
 
 (async () => {
   engine = await invoke("chat_engine");

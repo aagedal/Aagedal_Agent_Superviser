@@ -57,12 +57,29 @@ function renderGuideSteps() {
         el(
           "li",
           {},
-          el(
-            "button",
-            { type: "button", class: "step-btn", onclick: () => goToStep(i) },
-            el("span", { class: "num" }),
-            el("span", { class: "step-text" }, el("span", {}, name), el("span", { class: "step-note" })),
-          ),
+            el(
+              "button",
+              {
+                type: "button",
+                class: "step-btn",
+                onclick: () => goToStep(i),
+                onkeydown: (event) => {
+                  if (event.metaKey || event.ctrlKey || event.altKey) return;
+                  let next = -1;
+                  if (event.key === "ArrowRight") next = (i + 1) % GUIDE_STEPS.length;
+                  else if (event.key === "ArrowLeft") next = (i - 1 + GUIDE_STEPS.length) % GUIDE_STEPS.length;
+                  else if (event.key === "Home") next = 0;
+                  else if (event.key === "End") next = GUIDE_STEPS.length - 1;
+                  if (next >= 0) {
+                    event.preventDefault();
+                    goToStep(next);
+                    list.children[next]?.querySelector("button.step-btn")?.focus();
+                  }
+                },
+              },
+              el("span", { class: "num" }),
+              el("span", { class: "step-text" }, el("span", {}, name), el("span", { class: "step-note" })),
+            ),
         ),
       ),
     );
@@ -248,6 +265,42 @@ const skipSetup = () => invoke("leave_setup", { to: "settings", project: null, m
 $("guide-back").addEventListener("click", () => goToStep(guideStep - 1));
 $("guide-next").addEventListener("click", () => goToStep(guideStep + 1));
 $("guide-skip").addEventListener("click", skipSetup);
+
+document.addEventListener("keydown", (event) => {
+  const mod = event.metaKey || event.ctrlKey;
+  if (mod && !event.shiftKey && !event.altKey) {
+    const num = Number(event.key);
+    if (num >= 1 && num <= GUIDE_STEPS.length) {
+      event.preventDefault();
+      goToStep(num - 1);
+      return;
+    }
+    if (event.key === "[") {
+      event.preventDefault();
+      goToStep(guideStep - 1);
+      return;
+    }
+    if (event.key === "]") {
+      event.preventDefault();
+      goToStep(guideStep + 1);
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (guideStep < GUIDE_STEPS.length - 1) {
+        goToStep(guideStep + 1);
+      } else {
+        const startBtn = $("guide-body").querySelector("button.big");
+        if (startBtn && !startBtn.disabled) startBtn.click();
+      }
+      return;
+    }
+  }
+  if (event.altKey && !mod && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+    event.preventDefault();
+    goToStep(guideStep + (event.key === "ArrowRight" ? 1 : -1));
+  }
+});
 
 // Keep the steps current: downloads, models loading, folders chosen elsewhere.
 hooks.started.push(() => renderGuide());

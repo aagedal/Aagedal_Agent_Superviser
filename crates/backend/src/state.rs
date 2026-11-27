@@ -103,6 +103,10 @@ impl ReasoningLevel {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -126,6 +130,10 @@ pub struct Settings {
     /// Save each model's last conversation to disk when it's unloaded, and load it back when
     /// the model starts again.
     pub save_conversations: bool,
+    /// Include local file paths alongside dragged & dropped images so the agent can inspect
+    /// metadata or run local image tools on them inside the sandbox.
+    #[serde(default = "default_true")]
+    pub include_image_paths: bool,
     /// Remembered reasoning level per installed model id.
     #[serde(default)]
     pub model_reasoning: HashMap<String, ReasoningLevel>,
@@ -152,6 +160,7 @@ impl Default for Settings {
             projects: Vec::new(),
             setup_done: false,
             save_conversations: true,
+            include_image_paths: true,
             model_reasoning: HashMap::new(),
             sandbox_network: Network::default(),
             recent_projects: Vec::new(),
@@ -483,6 +492,7 @@ impl App {
         let config = ServerConfig {
             binary,
             model_path: model.entry_path().context("judge model has no entry file")?,
+            mmproj_path: None,
             alias: model.alias.clone(),
             context: catalog::JUDGE_CONTEXT,
             port: runtime::free_port()?,
@@ -1031,9 +1041,14 @@ impl App {
             None => None,
         };
         let started = async {
+            let mmproj_path = runtime::find_companion_mmproj(&entry);
+            if let Some(mmproj) = &mmproj_path {
+                tracing::info!("{}: using companion vision projector {}", model.alias, mmproj.display());
+            }
             let mut config = ServerConfig {
                 binary,
                 model_path: entry.clone(),
+                mmproj_path,
                 alias: model.alias.clone(),
                 context: fit.context,
                 port: runtime::free_port()?,
@@ -1117,6 +1132,14 @@ impl App {
                             }
                         }
                         config.speculative = next_spec;
+                        config.port = runtime::free_port()?;
+                    }
+                    // If a companion vision projector prevented loading, retry without `--mmproj`.
+                    Err(e) if !server.is_running() && config.mmproj_path.is_some() => {
+                        self.loading_pids.lock().unwrap().remove(&load_id);
+                        self.remember_pid(&file_key, None);
+                        tracing::warn!("{}: {e:#}; retrying without companion vision projector", model.alias);
+                        config.mmproj_path = None;
                         config.port = runtime::free_port()?;
                     }
                     // Nor one whose attention can't use an 8-bit cache: with a 16-bit one, if it fits.
@@ -1308,6 +1331,12 @@ impl App {
         Ok(())
     }
 
+    /// Toggles sharing local file paths alongside dragged & dropped images.
+    pub fn set_include_image_paths(&self, enabled: bool) -> anyhow::Result<()> {
+        self.settings.lock().unwrap().include_image_paths = enabled;
+        self.save_settings()
+    }
+
     /// Records (or with `None` forgets) a model server's pid in `run/`, for [`runtime::stop_leftovers`].
     fn remember_pid(&self, name: &str, pid: Option<u32>) {
         let file = self.paths.run().join(format!("{name}.pid"));
@@ -1472,8 +1501,8 @@ impl App {
     /// Adds `project`, or replaces the one with its id, and gives the guard its rules.
     pub fn save_project(&self, project: Project) -> anyhow::Result<Project> {
         let project = project.normalized()?;
-        let choice = sandbox::choices(project.main()).into_iter().find(|c| c.isolation == project.isolation);
-        if let Some(why) = choice.and_then(|c| c.unavailable) {
+        let backend = sandbox::backend(project.isolation);
+        if let Err(why) = backend.available().and_then(|()| backend.suits(project.main())) {
             bail!("{why}");
         }
         {

@@ -101,9 +101,56 @@ impl Chats {
     }
 }
 
-/// Adds the user's message to a chat (a new one without `chat`) and starts the agent on it.
-/// Returns the chat's id at once; the rest arrives as [`AppEvent::Chat`] events on `app.bus`.
-pub fn send(app: Arc<App>, project: &str, chat: Option<&str>, text: &str, model: &str) -> anyhow::Result<String> {
+/// Builds an OpenAI-format user message: plain string when text-only, or multimodal content array
+/// with `image_url` data URIs (and an optional local-paths metadata part) when images are attached.
+pub fn user_message(
+    text: &str,
+    images: &[crate::attachments::ImageAttachment],
+    image_paths_note: Option<&str>,
+) -> Value {
+    if images.is_empty() {
+        return json!({ "role": "user", "content": text });
+    }
+    let mut parts: Vec<Value> = Vec::with_capacity(images.len() + 2);
+    if !text.is_empty() {
+        parts.push(json!({ "type": "text", "text": text }));
+    }
+    if let Some(note) = image_paths_note.filter(|s| !s.is_empty()) {
+        parts.push(json!({
+            "type": "text",
+            "text": note,
+            "superviser_meta": true,
+        }));
+    }
+    for img in images {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": { "url": img.data_url() },
+        }));
+    }
+    json!({ "role": "user", "content": parts })
+}
+
+/// Adds the user's message (with optional image attachments) to a chat (a new one without `chat`)
+/// and starts the agent on it. Returns the chat's id at once; the rest arrives as
+/// [`AppEvent::Chat`] events on `app.bus`.
+pub fn send(
+    app: Arc<App>,
+    project: &str,
+    chat: Option<&str>,
+    text: &str,
+    images: &[crate::attachments::ImageAttachment],
+    model: &str,
+) -> anyhow::Result<String> {
+    if images.len() > crate::attachments::MAX_IMAGES_PER_MESSAGE {
+        bail!("Too many images (max {}).", crate::attachments::MAX_IMAGES_PER_MESSAGE);
+    }
+    for img in images {
+        img.validate()?;
+    }
+    if text.trim().is_empty() && images.is_empty() {
+        bail!("Enter a message or attach an image.");
+    }
     let project = app.project(project).context("that project no longer exists")?;
     if project.isolation != Isolation::MacosSandbox {
         bail!(
@@ -132,7 +179,11 @@ pub fn send(app: Arc<App>, project: &str, chat: Option<&str>, text: &str, model:
         );
     }
     app.chats.deleted.lock().unwrap().remove(&chat.id);
-    let message = json!({ "role": "user", "content": text });
+    let include_paths = app.settings.lock().unwrap().include_image_paths;
+    let path_note = include_paths
+        .then(|| crate::attachments::format_image_paths_note(images, Some(&project)))
+        .flatten();
+    let message = user_message(text, images, path_note.as_deref());
     chat.messages.push(message.clone());
     if let Err(e) = chat.save(&app.paths) {
         app.chats.running.lock().unwrap().remove(&chat.id);
@@ -550,6 +601,13 @@ fn for_model(message: &Value) -> Value {
     let mut message = message.clone();
     if let Some(object) = message.as_object_mut() {
         object.remove("reasoning");
+        if let Some(parts) = object.get_mut("content").and_then(Value::as_array_mut) {
+            for part in parts {
+                if let Some(part_obj) = part.as_object_mut() {
+                    part_obj.remove("superviser_meta");
+                }
+            }
+        }
     }
     message
 }
@@ -775,5 +833,33 @@ mod tests {
             consume_sse_event(&buffer, &mut reply, &mut calls).unwrap();
         }
         assert_eq!(reply.content, "café — done!");
+    }
+
+    #[test]
+    fn user_message_supports_plain_and_multimodal_images() {
+        assert_eq!(user_message("hello", &[], None), json!({ "role": "user", "content": "hello" }));
+        let img = crate::attachments::ImageAttachment::from_bytes(
+            "shot.png".into(),
+            "image/png",
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+        )
+        .unwrap();
+        let msg = user_message(
+            "describe this",
+            std::slice::from_ref(&img),
+            Some("[Attached image file paths]\n- shot.png: /tmp/shot.png"),
+        );
+        let parts = msg["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], json!({ "type": "text", "text": "describe this" }));
+        assert_eq!(parts[1]["superviser_meta"], true);
+        assert_eq!(parts[2]["type"], "image_url");
+        assert_eq!(parts[2]["image_url"]["url"], img.data_url());
+
+        let clean = for_model(&msg);
+        assert!(clean["content"][1].get("superviser_meta").is_none());
+
+        let img_only = user_message("", std::slice::from_ref(&img), None);
+        assert_eq!(img_only["content"].as_array().unwrap().len(), 1);
     }
 }

@@ -188,10 +188,75 @@ pub fn detect_speculative(entry_path: &Path, spare_memory: u64, n_max: u32) -> (
     (Speculative::Ngram, 0)
 }
 
+/// Searches the main model's directory (and its immediate parent if the model lives in a
+/// subfolder like `Q4_K_M/` or `Mainline_Support/`) for a companion multimodal vision projector
+/// GGUF (`mmproj*.gguf`) so `llama-server` can read pasted/dropped images.
+pub fn find_companion_mmproj(entry_path: &Path) -> Option<PathBuf> {
+    let entry_canon = std::fs::canonicalize(entry_path).unwrap_or_else(|_| entry_path.to_path_buf());
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = entry_path.parent() {
+        dirs.push(dir.to_path_buf());
+        if let Some(parent) = dir.parent() {
+            let folder_name = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let is_model_subdir = folder_name == "mainline_support"
+                || quant::allowed(&folder_name)
+                || folder_name.starts_with("ud-");
+            if is_model_subdir {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+    }
+
+    let mut found: Vec<(u8, u64, PathBuf)> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
+                continue;
+            }
+            let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if canon == entry_canon {
+                continue;
+            }
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !filename.starts_with("mmproj") {
+                continue;
+            }
+            let rank = if filename.contains("bf16") {
+                0
+            } else if filename.contains("f16") {
+                1
+            } else if filename.contains("q8") {
+                2
+            } else {
+                3
+            };
+            let size = std::fs::metadata(&path).map_or(0, |m| m.len());
+            found.push((rank, size, path));
+        }
+    }
+    found.sort_by_key(|(rank, size, _)| (*rank, *size));
+    found.into_iter().next().map(|(_, _, path)| path)
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub binary: PathBuf,
     pub model_path: PathBuf,
+    /// Optional multimodal projector GGUF (`--mmproj`) for vision-capable models.
+    pub mmproj_path: Option<PathBuf>,
     /// The model name the API answers to.
     pub alias: String,
     pub context: u64,
@@ -374,6 +439,9 @@ pub fn args(config: &ServerConfig) -> Vec<String> {
     }
     if let Some(dir) = &config.slot_dir {
         args.extend(["--slot-save-path".into(), dir.display().to_string()]);
+    }
+    if let Some(mmproj) = &config.mmproj_path {
+        args.extend(["--mmproj".into(), mmproj.display().to_string()]);
     }
     if config.decision {
         for flag in ["--batch-size", "--ubatch-size"] {
@@ -595,6 +663,7 @@ mod tests {
         let config = ServerConfig {
             binary: "llama-server".into(),
             model_path: "/m/a.gguf".into(),
+            mmproj_path: None,
             alias: "a".into(),
             context: 32768,
             port: 1234,
@@ -609,7 +678,9 @@ mod tests {
             slot_dir: None,
         };
         assert!(!args(&config).iter().any(|a| a == "--ubatch-size"));
-        assert!(!args(&config).iter().any(|a| a == "--cache-type-k" || a == "--slot-save-path" || a == "--flash-attn"));
+        assert!(!args(&config).iter().any(|a| a == "--cache-type-k" || a == "--slot-save-path" || a == "--flash-attn" || a == "--mmproj"));
+        let with_mmproj = args(&ServerConfig { mmproj_path: Some("/m/mmproj-BF16.gguf".into()), ..config.clone() });
+        assert!(with_mmproj.windows(2).any(|w| w == ["--mmproj", "/m/mmproj-BF16.gguf"]));
         let q8 = args(&ServerConfig { kv: KvType::Q8, slot_dir: Some("/c/slots".into()), ..config.clone() });
         for pair in [["--flash-attn", "on"], ["--cache-type-k", "q8_0"], ["--cache-type-v", "q8_0"], ["--slot-save-path", "/c/slots"]] {
             assert!(q8.windows(2).any(|w| w == pair), "{pair:?} in {q8:?}");
@@ -630,6 +701,7 @@ mod tests {
         let config = ServerConfig {
             binary: "llama-server".into(),
             model_path: "/m/a.gguf".into(),
+            mmproj_path: None,
             alias: "a".into(),
             context: 32768,
             port: 1234,
@@ -660,6 +732,7 @@ mod tests {
         let config = ServerConfig {
             binary: "llama-server".into(),
             model_path: "/m/Qwen3.8-27B-UD-Q4_K_M.gguf".into(),
+            mmproj_path: None,
             alias: "qwen3.8-27b".into(),
             context: 65536,
             port: 1234,
@@ -772,5 +845,24 @@ mod tests {
         let log_listen = format!("{log_ctx}warmup: warming up\nmain: server is listening on http://127.0.0.1:8080\n");
         let p4 = parse_load_progress(&log_listen);
         assert!(p4.fraction >= 0.95);
+    }
+
+    #[test]
+    fn finds_companion_mmproj_in_same_or_parent_quant_dir() {
+        let dir = std::env::temp_dir().join(format!("superviser-mmproj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let quant_dir = dir.join("Q4_K_M");
+        std::fs::create_dir_all(&quant_dir).unwrap();
+        let main_path = quant_dir.join("Gemma-4-26B-Q4_K_M-00001-of-00002.gguf");
+        std::fs::write(&main_path, b"gguf").unwrap();
+        assert_eq!(find_companion_mmproj(&main_path), None);
+
+        let f16 = dir.join("mmproj-F16.gguf");
+        let bf16 = dir.join("mmproj-BF16.gguf");
+        std::fs::write(&f16, b"mmproj-f16").unwrap();
+        std::fs::write(&bf16, b"mmproj-bf16").unwrap();
+        assert_eq!(find_companion_mmproj(&main_path), Some(bf16));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -6,6 +6,7 @@
 
 pub mod acp;
 pub mod agent;
+pub mod attachments;
 pub mod events;
 pub mod explain;
 pub mod files;
@@ -14,6 +15,7 @@ pub mod skills;
 pub mod state;
 pub mod subagents;
 
+pub use attachments::ImageAttachment;
 pub use events::{AcpEvent, AppEvent, ChatEvent, DownloadEvent, EventBus};
 pub use state::{
     App, DEFAULT_GUARD_PORT, JUDGE_DOWNLOAD, JUDGE_NAME, JudgeStatus, LoadState, LoadedModel,
