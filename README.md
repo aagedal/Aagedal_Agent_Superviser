@@ -29,7 +29,7 @@ Early. Working today:
 - **Entropy (Built-in Harness & Chat)** (`crates/entropy`, `crates/backend/src/agent.rs`, `app/ui/chat.html`, `app-gpui/src/chat.rs`): **Entropy**, Agent Superviser's own standalone Rust coding harness, is the default chat engine—keeping system prompt + tool schema overhead under ~1,000 tokens so local models retain nearly the full 32k/64k context window. It combines a lean toolset (`read`, `glob`, `grep`, `write`, `edit`, `bash`, plus isolated read-only `subagent` routing to lighter secondary models when loaded) with forgiving multi-strategy edit matching (exact, indentation-normalized, whitespace-trimmed, block-anchor, atomic multi-hunk edits, closest-snippet hints, and concise unified diffs), automatic stale tool-output pruning and conversation compaction checkpoints, Pi-style mid-turn steering and chat branching (`fork`), `.entropy/SYSTEM.md` / `AGENTS.md` / `CLAUDE.md` support, and pluggable sandboxing across both macOS Seatbelt and Apple `container` Linux VMs.
 - **External Harnesses (Connect tab)** (`crates/core/src/connect.rs`): Settings → Connect provides live local API credentials and copyable setup instructions for **Pi** (`~/.pi/agent/models.json`), **OpenCode** (`opencode.json`), **Codex CLI** (`~/.codex/config.toml`), and any OpenAI-compatible client—all routed through the guard.
 - **Menu bar app** (native GPUI in `app-gpui`, with the earlier Tauri 2 app in `app`): load and unload models, an HF token stored in the keychain, the local API key, a live list of tool calls, the chat window and the setup guide. While a model downloads, a chat's agent works, or for 5 minutes after any model call through the guard, the Mac doesn't go to sleep when left alone (`crates/core/src/awake.rs`; the display still may).
-- **Releases**: pushing a version tag (e.g. `v0.1.0-alpha.1`) builds, signs, and notarizes the native GPUI app with bundled `llama.cpp` for Apple silicon (Intel and other platforms wait for a stable release) and drafts a GitHub release (`.github/workflows/release.yml`, automatically marked as a prerelease for `-alpha`/`-beta`/`-rc` tags); publishing the draft ships it.
+- **Releases**: `scripts/release-gpui-macos.sh` builds, signs, and notarizes the native GPUI app with bundled `llama.cpp` for Apple silicon (Intel and other platforms wait for a stable release), packages a signed & notarized DMG + `SHA256SUMS.txt`, and drafts a GitHub release (automatically marked as a prerelease for `-alpha`/`-beta`/`-rc` tags). An optional manual `.github/workflows/release.yml` workflow is also available if CI secrets are configured.
 
 Not yet: MLX, auto-updates for the GPUI app, Windows and Linux testing, and discrete-GPU VRAM detection.
 
@@ -48,12 +48,23 @@ cargo run -p superviser-core --example smoke -- unsloth/Qwen3.5-0.8B-GGUF /tmp/s
 
 ### Releases
 
-One-time setup, in the repository's Settings → Secrets and variables → Actions:
+Local signing & notarization (recommended — keeps your Developer ID certificate in your macOS Keychain):
 
-1. Export the Developer ID Application certificate with its private key from Keychain Access as a `.p12` file. Add it base64-encoded (`base64 -i cert.p12 | pbcopy`) as `APPLE_CERTIFICATE`, its export password as `APPLE_CERTIFICATE_PASSWORD`, and its name (`Developer ID Application: Name (TEAMID)`) as `APPLE_SIGNING_IDENTITY`.
-2. For notarizing: `APPLE_ID`, an app-specific password from account.apple.com as `APPLE_PASSWORD`, and `APPLE_TEAM_ID`.
+1. Store your Apple notarization credentials once in Keychain:
+   ```sh
+   xcrun notarytool store-credentials "agent-superviser-notary" \
+     --apple-id "you@example.com" \
+     --team-id "TEAMID" \
+     --password "xxxx-xxxx-xxxx-xxxx"
+   ```
+2. Set the version in `Cargo.toml`, `app-gpui/Info.plist` (`CFBundleShortVersionString`), and `app/tauri.conf.json`, commit, merge to `main`, and push the tag (`git tag v0.1.0-alpha.1 && git push origin v0.1.0-alpha.1`).
+3. Build, sign, notarize, package the DMG + `SHA256SUMS.txt`, and create the draft GitHub release (automatically marked as a prerelease for tags containing `-`):
+   ```sh
+   ./scripts/release-gpui-macos.sh --notary-profile agent-superviser-notary --draft-release
+   ```
+4. Review the draft release on GitHub and click **Publish release**.
 
-Each release: set the version in `Cargo.toml`, `app-gpui/Info.plist` (`CFBundleShortVersionString`), and `app/tauri.conf.json`, commit, then `git tag v0.1.0-alpha.1 && git push origin v0.1.0-alpha.1`. The workflow checks that the tag matches all three manifests, signs `llama.cpp` and `Agent Superviser.app` inside-out, notarizes and staples both the `.app` and the `.dmg`, generates `SHA256SUMS.txt`, and drafts a GitHub release (marked as a prerelease for tags containing `-`). Review the draft release, then publish it.
+Optional CI release: `.github/workflows/release.yml` can also be triggered manually (`workflow_dispatch`) for an existing tag once `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, and `APPLE_TEAM_ID` are set in repository Actions secrets.
 
 App data lives in `~/Library/Application Support/me.aagedal.AgentSuperviser` on macOS: models, `keys/`, `guard/calls.jsonl` and `logs/`.
 

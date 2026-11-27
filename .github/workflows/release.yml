@@ -1,27 +1,32 @@
-# Builds, signs, and notarizes the native GPUI macOS app (Apple silicon, for now) for a version
-# tag (e.g. `v0.1.0-alpha.1` or `v0.2.0`), packages it into a signed & notarized DMG with bundled
-# `llama.cpp`, and drafts a GitHub release. Prerelease tags containing `-` (such as `-alpha.1`)
-# are automatically marked as GitHub prereleases. Publishing the draft ships it.
+# Optional GitHub Actions release workflow (manual dispatch) for building, signing, and
+# notarizing the native GPUI macOS app in CI when Apple Developer ID secrets are configured.
+# For local macOS signing/notarization (recommended when keeping your Developer ID cert in
+# your local Keychain), run `./scripts/release-gpui-macos.sh` instead.
 #
-# Secrets (see README → Releases): APPLE_CERTIFICATE (base64 .p12 of a Developer ID Application
-# certificate), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY, APPLE_ID, APPLE_PASSWORD
-# (an app-specific password), and APPLE_TEAM_ID.
+# Secrets (only needed for CI dispatch): APPLE_CERTIFICATE (base64 .p12 of a Developer ID
+# Application certificate), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY, APPLE_ID,
+# APPLE_PASSWORD (an app-specific password), and APPLE_TEAM_ID.
 
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to build and release (e.g. v0.1.0-alpha.1)"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 env:
   TARGET: aarch64-apple-darwin
+  RELEASE_TAG: ${{ inputs.tag }}
 
 jobs:
   build:
@@ -30,11 +35,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ inputs.tag }}
           persist-credentials: false
 
       - name: Check tag, versions, and signing secrets
         run: |
-          python3 - "$GITHUB_REF_NAME" <<'EOF'
+          python3 - "$RELEASE_TAG" <<'EOF'
           import json, plistlib, sys, tomllib
 
           tag = sys.argv[1]
@@ -97,83 +103,13 @@ jobs:
           cargo clippy -p superviser-core -p entropy -p superviser-guard -p superviser-scan -p superviser-backend -p agent-superviser-gpui --all-targets -- -D warnings
           cargo test -p superviser-core -p entropy -p superviser-guard -p superviser-scan -p superviser-backend -p agent-superviser-gpui
 
-      - name: Build and bundle Agent Superviser.app (GPUI + llama.cpp)
-        run: ./scripts/bundle-gpui-macos.sh --release --target "$TARGET"
-
-      - name: Sign, notarize, and package DMG
+      - name: Build, sign, notarize, and package DMG
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-
-          notarize() {
-            local path="$1"
-            local out status id
-            out=$(xcrun notarytool submit "$path" \
-              --apple-id "$APPLE_ID" \
-              --password "$APPLE_PASSWORD" \
-              --team-id "$APPLE_TEAM_ID" \
-              --wait --timeout 1h --output-format json)
-            echo "$out"
-            status=$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("status", ""))' "$out")
-            id=$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("id", ""))' "$out")
-            if [ "$status" != "Accepted" ]; then
-              echo "::error::Notarization of $path failed with status: $status"
-              if [ -n "$id" ]; then
-                xcrun notarytool log "$id" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
-              fi
-              exit 1
-            fi
-          }
-
-          version="${GITHUB_REF_NAME#v}"
-          app="target/$TARGET/release/Agent Superviser.app"
-          llama_dir="$app/Contents/Resources/llama.cpp"
-
-          # Sign inside-out: dylibs first, then llama-server, then the app bundle.
-          for file in "$llama_dir"/*.dylib; do
-            codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$file"
-          done
-          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$llama_dir/llama-server"
-          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$app"
-          codesign --verify --deep --strict --verbose=2 "$app"
-
-          # Notarize and staple the .app bundle before placing it in the DMG.
-          app_zip="$RUNNER_TEMP/Agent-Superviser.zip"
-          ditto -c -k --keepParent "$app" "$app_zip"
-          notarize "$app_zip"
-          rm -f "$app_zip"
-          xcrun stapler staple "$app"
-          xcrun stapler validate "$app"
-          spctl --assess --type execute --verbose=2 "$app"
-
-          # Package the stapled .app into a drag-to-Applications DMG, then sign and notarize the DMG.
-          stage="$RUNNER_TEMP/dmg-stage"
-          rm -rf "$stage"
-          mkdir -p "$stage" dist
-          ditto "$app" "$stage/Agent Superviser.app"
-          ln -s /Applications "$stage/Applications"
-
-          dmg="dist/Agent-Superviser_${version}_aarch64.dmg"
-          hdiutil create \
-            -volname "Agent Superviser" \
-            -srcfolder "$stage" \
-            -ov \
-            -format UDZO \
-            -imagekey zlib-level=9 \
-            "$dmg"
-          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
-          notarize "$dmg"
-          xcrun stapler staple "$dmg"
-          xcrun stapler validate "$dmg"
-          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
-
-          (cd dist && shasum -a 256 "Agent-Superviser_${version}_aarch64.dmg" > SHA256SUMS.txt)
-          cat dist/SHA256SUMS.txt
+        run: ./scripts/release-gpui-macos.sh --target "$TARGET"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -198,15 +134,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           args=(
-            "$GITHUB_REF_NAME"
+            "$RELEASE_TAG"
             dist/*
             --repo "$GITHUB_REPOSITORY"
             --draft
             --verify-tag
-            --title "Agent Superviser ${GITHUB_REF_NAME#v}"
+            --title "Agent Superviser ${RELEASE_TAG#v}"
             --generate-notes
           )
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+          if [[ "$RELEASE_TAG" == *-* ]]; then
             args+=(--prerelease)
           fi
           gh release create "${args[@]}"
