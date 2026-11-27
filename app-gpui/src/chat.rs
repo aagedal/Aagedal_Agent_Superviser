@@ -36,10 +36,9 @@ use superviser_backend::git::{self, GitStatus};
 use superviser_backend::skills::{self, Skill, SkillScope};
 use superviser_backend::subagents::{self, SubagentRecord, SubagentState};
 use superviser_backend::{AcpEvent, AppEvent, ChatEvent, JudgeStatus, LoadState, ReasoningLevel};
-use superviser_core::agent::Chat;
-use superviser_core::opencode;
 use superviser_core::project::Approvals;
 use superviser_core::sandbox::Isolation;
+use entropy::Chat;
 
 use crate::backend::Backend;
 use crate::theme::palette;
@@ -399,11 +398,7 @@ impl ChatWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        let engine = if opencode::binary().is_some() {
-            ChatEngine::OpenCode
-        } else {
-            ChatEngine::Builtin
-        };
+        let engine = ChatEngine::Builtin;
 
         let projects = backend.app.settings.lock().unwrap().projects.clone();
         let selected_project = initial_project
@@ -1675,7 +1670,7 @@ impl ChatWindow {
                 }
                 ChatEngine::Builtin => {
                     for proj in &projects {
-                        for c in Chat::list(&app.paths, &proj.id) {
+                        for c in Chat::list_in(&app.paths.data, &proj.id) {
                             let model_name = app
                                 .chat_model(&proj.id, &c.id)
                                 .and_then(|mid| installed_names.get(&mid).cloned());
@@ -1823,7 +1818,7 @@ impl ChatWindow {
                     Ok((eng.busy_since(&sid), None))
                 }
                 .await,
-                ChatEngine::Builtin => match Chat::load(&app.paths, &pid, &sid) {
+                ChatEngine::Builtin => match Chat::load_in(&app.paths.data, &pid, &sid) {
                     Ok(chat) => Ok((app.chats.busy_since(&chat.id), Some(chat.messages))),
                     Err(e) => Err(format!("{e:#}")),
                 },
@@ -1951,7 +1946,7 @@ impl ChatWindow {
                 .await,
                 ChatEngine::Builtin => {
                     app.chats.stop_and_delete(&chat_id);
-                    Chat::delete(&app.paths, &pid, &chat_id)
+                    Chat::delete_in(&app.paths.data, &pid, &chat_id)
                         .and_then(|_| app.forget_chat(&pid, &chat_id))
                         .map_err(|e| format!("{e:#}"))
                 }
@@ -2796,6 +2791,22 @@ impl ChatWindow {
                 }
                 self.scroll_if_following();
                 cx.notify();
+            }
+            ChatEvent::Usage { chat, used, size } => {
+                if self.active_session.as_deref() == Some(chat.as_str()) && size > 0 {
+                    self.usage = Some((used, size));
+                    cx.notify();
+                }
+            }
+            ChatEvent::Notice { chat, text } => {
+                if self.active_session.as_deref() == Some(chat.as_str()) {
+                    self.blocks.push(ChatBlock::StatusNote {
+                        text,
+                        is_error: false,
+                    });
+                    self.scroll_if_following();
+                    cx.notify();
+                }
             }
             ChatEvent::State { chat, busy, error } => {
                 if busy {
@@ -7115,10 +7126,8 @@ impl Render for ChatWindow {
         });
         let has_loading_models = !loading_models.is_empty();
         let has_model = self.selected_model.is_some();
-        let vm_blocked_builtin = proj
-            .as_ref()
-            .is_some_and(|pr| pr.isolation == Isolation::LinuxVm && self.engine == ChatEngine::Builtin);
-        let can_send = !self.busy && proj.is_some() && has_model && !vm_blocked_builtin;
+        let vm_blocked_builtin = false;
+        let can_send = !self.busy && proj.is_some() && has_model;
 
         let judge_loading = matches!(
             *self.backend.app.judge_status.lock().unwrap(),
@@ -7147,7 +7156,7 @@ impl Render for ChatWindow {
             format!("Starting safety judge… {elapsed}")
         } else {
             match self.working_phase {
-                WorkingPhase::StartingAgent => format!("Starting OpenCode… {elapsed}"),
+                WorkingPhase::StartingAgent => format!("Starting agent… {elapsed}"),
                 WorkingPhase::ReadingPrompt => {
                     if is_first_turn {
                         format!(

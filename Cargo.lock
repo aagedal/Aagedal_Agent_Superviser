@@ -114,6 +114,7 @@ name = "agent-superviser"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "entropy",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -135,6 +136,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "entropy",
  "gpui-kit",
  "image",
  "muda",
@@ -2012,6 +2014,24 @@ name = "endi"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
+
+[[package]]
+name = "entropy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "directories",
+ "futures-util",
+ "getrandom 0.3.4",
+ "hex",
+ "ignore",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "enum-iterator"
@@ -8659,6 +8679,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "entropy",
  "futures-util",
  "reqwest 0.12.28",
  "serde",
@@ -8678,7 +8699,6 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "hex",
- "ignore",
  "jsonc-parser",
  "keyring",
  "objc2-foundation 0.3.2",

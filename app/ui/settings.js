@@ -352,13 +352,32 @@ listen("status", () => {
 // --- Connect tab ---
 async function renderConnect() {
   await refreshOverview();
-  const info = await invoke("api_info");
+  const [info, guides] = await Promise.all([invoke("api_info"), invoke("connect_guides")]);
   $("base-url").value = info.base_url || "";
   $("api-key").value = info.api_key;
   $("model-name").value = info.model || "(load a model first)";
-  $("opencode-version").textContent = overview.opencode_version ? `OpenCode ${overview.opencode_version} found.` : "OpenCode was not found on your PATH. Install it from opencode.ai, then come back.";
-  $("setup-opencode").disabled = overview.status.state !== "running";
   $("hf-status").textContent = overview.hf_token_set ? "A token is saved." : "No token saved.";
+  const box = $("harness-guides");
+  if (box) {
+    box.replaceChildren(
+      ...guides.map((g) => {
+        const copyBtn = el("button", {}, "Copy config");
+        copyBtn.addEventListener("click", async () => {
+          await navigator.clipboard.writeText(g.snippet);
+          copyBtn.textContent = "Copied";
+          setTimeout(() => (copyBtn.textContent = "Copy config"), 1200);
+        });
+        return el(
+          "details",
+          { open: g.id === "pi", class: "guide" },
+          el("summary", {}, el("strong", {}, g.name), " — ", el("span", { class: "muted small" }, g.subtitle)),
+          el("div", { class: "row" }, el("code", { class: "small muted selectable" }, g.file_path), copyBtn),
+          el("pre", { class: "selectable" }, g.snippet),
+          el("p", { class: "muted small" }, g.notes),
+        );
+      }),
+    );
+  }
 }
 
 for (const button of document.querySelectorAll("[data-copy]")) {
@@ -374,18 +393,9 @@ $("reveal-key").addEventListener("click", () => {
   $("reveal-key").textContent = input.type === "password" ? "Show" : "Hide";
 });
 $("regenerate-key").addEventListener("click", async () => {
-  if (!confirm("Make a new API key? Tools set up with the old key will need to be set up again.")) return;
+  if (!confirm("Make a new API key? External tools using the old key will need to be updated.")) return;
   await invoke("regenerate_api_key");
   renderConnect();
-});
-$("setup-opencode").addEventListener("click", async () => {
-  const result = $("opencode-result");
-  try {
-    const done = await invoke("setup_opencode");
-    result.textContent = `Updated ${done.path}${done.restarted_service ? " and restarted the OpenCode service" : ""}.`;
-  } catch (e) {
-    result.textContent = String(e);
-  }
 });
 $("hf-form").addEventListener("submit", async (event) => {
   event.preventDefault();

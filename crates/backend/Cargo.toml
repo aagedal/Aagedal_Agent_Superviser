@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 superviser-core.workspace = true
+entropy.workspace = true
 superviser-guard.workspace = true
 anyhow.workspace = true
 serde.workspace = true

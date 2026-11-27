@@ -82,9 +82,8 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
 
-      # Tauri signs the app and ripgrep (an externalBin) but not resources. OpenCode keeps its
-      # authors' Developer ID signature; llama.cpp's release is only ad-hoc signed, so it's
-      # signed here (build.rs keeps the fetched files, since their checksum marker still matches).
+      # Tauri signs the app bundle but not resources; llama.cpp's release is only ad-hoc signed,
+      # so it's signed here (build.rs keeps the fetched files, since their checksum marker still matches).
       - name: Fetch the bundled programs and sign llama.cpp
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -93,12 +92,10 @@ jobs:
           for file in app/binaries/llama.cpp/llama-server app/binaries/llama.cpp/*.dylib; do
             codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$file"
           done
-          codesign --verify --strict --verbose=2 app/binaries/opencode/opencode
-          codesign -dv app/binaries/opencode/opencode 2>&1 | grep -q 'flags=.*runtime' || { echo "::error::OpenCode isn't signed with the hardened runtime"; exit 1; }
 
       - name: Run workspace tests
         run: |
-          cargo clippy -p superviser-core -p superviser-guard -p superviser-scan --all-targets -- -D warnings
+          cargo clippy -p superviser-core -p entropy -p superviser-guard -p superviser-scan -p superviser-backend --all-targets -- -D warnings
           cargo test --workspace
 
       - name: Build, sign and notarize the app

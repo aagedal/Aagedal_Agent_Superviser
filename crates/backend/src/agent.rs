@@ -1,103 +1,77 @@
-//! The built-in agent's loop. It sends a chat to the model through the guard, on the
-//! project's path so the project's rules apply, runs the tool calls that come back (asking
-//! the user first when the project says to), and emits updates on [`EventBus`] as it goes.
+//! Bridges the standalone [`entropy`] coding harness crate into Agent Superviser's runtime (`App`),
+//! macOS Seatbelt sandbox, Apple `container` Linux VM, guard proxy, and live sub-agent tracker.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use superviser_core::agent::tools::{self, Kind, Workspace};
-use superviser_core::agent::{Chat, system_prompt};
 use superviser_core::awake::Awake;
 use superviser_core::project::{Approvals, Folder, Project};
-use superviser_core::sandbox::{Isolation, seatbelt};
+use superviser_core::sandbox::container::{self, ShellVm};
+use superviser_core::sandbox::{Isolation, Network, seatbelt};
 use superviser_core::secrets;
-use tokio::sync::{oneshot, watch};
+use entropy::{
+    ApprovalPolicy, Chat, ChatStore, CommandOutput, CommandRunner, EventSink, HarnessEvent,
+    MAX_STEPS, ModelEndpoint, PathMapper, PromptConfig, SessionManager, StreamReply,
+    SubagentHandler, ToolCall, TurnConfig, Workspace, WorkspaceFolder, compact_chat, run_process,
+    run_turn,
+};
+use tokio::sync::watch;
 
 use crate::events::{AppEvent, ChatEvent, EventBus};
 use crate::state::App;
 use crate::subagents::{SubagentRecord, SubagentState, SubagentStep, now_ms, title_case_role};
 
-/// Model replies in one turn before the agent stops and hands back to the user.
-const MAX_STEPS: usize = 60;
 /// Maximum steps an isolated read-only sub-agent may take before summarizing.
 const MAX_SUBAGENT_STEPS: usize = 12;
-/// How often the reply being written is sent to the window.
-const DELTA_EVERY: Duration = Duration::from_millis(50);
-const DECLINED: &str = "The user declined this call. Ask what they'd like instead, or find another way they'd accept.";
 const NOT_RUN: &str = "Not run: the user stopped the agent.";
 
-struct RunningTurn {
-    project: String,
-    started_at: Instant,
-    stop: watch::Sender<bool>,
-}
-
-/// Turns in progress and calls waiting for the user.
+/// Active harness turns and tool-approval channels.
 #[derive(Default)]
 pub struct Chats {
-    /// By chat id: running turn metadata and stop signal.
-    running: Mutex<HashMap<String, RunningTurn>>,
-    /// Chats deleted while a turn was stopping, so the exiting turn never recreates their file.
-    deleted: Mutex<HashSet<String>>,
-    /// By `chat:call`.
-    approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    sessions: SessionManager,
 }
 
 impl Chats {
     pub fn busy(&self, chat: &str) -> bool {
-        self.running.lock().unwrap().contains_key(chat)
+        self.sessions.busy(chat)
     }
 
     pub fn busy_since(&self, chat: &str) -> Option<Instant> {
-        self.running.lock().unwrap().get(chat).map(|turn| turn.started_at)
+        self.sessions.busy_since(chat)
     }
 
     pub fn stop(&self, chat: &str) {
-        if let Some(turn) = self.running.lock().unwrap().get(chat) {
-            let _ = turn.stop.send(true);
-        }
+        self.sessions.stop(chat);
+    }
+
+    /// Sends a Pi-style mid-turn steering message to a running chat.
+    pub fn steer(&self, chat: &str, message: Value) -> bool {
+        self.sessions.steer(chat, message)
     }
 
     /// Stops `chat` and marks it deleted so an active turn won't save its file back to disk.
     pub fn stop_and_delete(&self, chat: &str) {
-        let running = self.running.lock().unwrap();
-        if let Some(turn) = running.get(chat) {
-            self.deleted.lock().unwrap().insert(chat.to_string());
-            let _ = turn.stop.send(true);
-        }
+        self.sessions.stop_and_delete(chat);
     }
 
     /// Stops every active turn for `project` and marks them deleted.
     pub fn stop_project(&self, project: &str) {
-        let running = self.running.lock().unwrap();
-        let mut deleted = self.deleted.lock().unwrap();
-        for (chat, turn) in running.iter() {
-            if turn.project == project {
-                deleted.insert(chat.clone());
-                let _ = turn.stop.send(true);
-            }
-        }
+        self.sessions.stop_project(project);
     }
 
     /// Stops every active turn (when the app quits).
     pub fn stop_all(&self) {
-        for turn in self.running.lock().unwrap().values() {
-            let _ = turn.stop.send(true);
-        }
-    }
-
-    fn is_deleted(&self, chat: &str) -> bool {
-        self.deleted.lock().unwrap().contains(chat)
+        self.sessions.stop_all();
     }
 
     pub fn answer(&self, chat: &str, call: &str, allow: bool) {
-        if let Some(answer) = self.approvals.lock().unwrap().remove(&format!("{chat}:{call}")) {
-            let _ = answer.send(allow);
-        }
+        self.sessions.answer(chat, call, allow);
     }
 }
 
@@ -132,8 +106,8 @@ pub fn user_message(
 }
 
 /// Adds the user's message (with optional image attachments) to a chat (a new one without `chat`)
-/// and starts the agent on it. Returns the chat's id at once; the rest arrives as
-/// [`AppEvent::Chat`] events on `app.bus`.
+/// and starts the harness on it. If `chat` is already running, queues the message as a Pi-style
+/// mid-turn steer so the model adapts without aborting.
 pub fn send(
     app: Arc<App>,
     project: &str,
@@ -152,55 +126,64 @@ pub fn send(
         bail!("Enter a message or attach an image.");
     }
     let project = app.project(project).context("that project no longer exists")?;
-    if project.isolation != Isolation::MacosSandbox {
-        bail!(
-            "The built-in agent runs projects in the macOS sandbox only; the chat runs Linux VM projects with OpenCode, which this build doesn't include. Open this one in OpenCode, or switch it to the macOS sandbox in Projects."
-        );
-    }
-    let (model, _) = app.loaded(model).context("Load the chat's model first.")?;
-    app.touch(&model.id);
-    let mut chat = match chat {
-        Some(id) => Chat::load(&app.paths, &project.id, id)?,
-        None => Chat::new(&project.id),
-    };
-    let (stop, stopped) = watch::channel(false);
-    {
-        let mut running = app.chats.running.lock().unwrap();
-        if running.contains_key(&chat.id) {
-            bail!("The agent is still working on this chat.");
-        }
-        running.insert(
-            chat.id.clone(),
-            RunningTurn {
-                project: project.id.clone(),
-                started_at: Instant::now(),
-                stop,
-            },
-        );
-    }
-    app.chats.deleted.lock().unwrap().remove(&chat.id);
     let include_paths = app.settings.lock().unwrap().include_image_paths;
     let path_note = include_paths
         .then(|| crate::attachments::format_image_paths_note(images, Some(&project)))
         .flatten();
     let message = user_message(text, images, path_note.as_deref());
+
+    // Pi-style mid-turn steering: if this chat is already busy, inject the guidance mid-loop!
+    if let Some(id) = chat
+        && app.chats.busy(id)
+        && app.chats.steer(id, message.clone())
+    {
+        return Ok(id.to_string());
+    }
+
+    let (loaded_model, context_window) = app.loaded(model).context("Load the chat's model first.")?;
+    app.touch(&loaded_model.id);
+
+    let store = ChatStore::in_data_dir(&app.paths.data);
+    let mut chat = match chat {
+        Some(id) => store.load(&project.id, id)?,
+        None => Chat::new(&project.id),
+    };
+    let (stopped, steer_rx) = app.chats.sessions.begin_turn(&chat.id, &project.id)?;
+
     chat.messages.push(message.clone());
-    if let Err(e) = chat.save(&app.paths) {
-        app.chats.running.lock().unwrap().remove(&chat.id);
+    if let Err(e) = store.save(&mut chat) {
+        app.chats.sessions.end_turn(&chat.id);
         return Err(e);
     }
     let id = chat.id.clone();
-    app.bus.emit(AppEvent::Chat(ChatEvent::State { chat: id.clone(), busy: true, error: None }));
-    app.bus.emit(AppEvent::Chat(ChatEvent::Message { chat: id.clone(), message }));
+    app.bus.emit(AppEvent::Chat(ChatEvent::State {
+        chat: id.clone(),
+        busy: true,
+        error: None,
+    }));
+    app.bus.emit(AppEvent::Chat(ChatEvent::Message {
+        chat: id.clone(),
+        message,
+    }));
+
     let sync_app = app.clone();
     tokio::spawn(async move {
         sync_app.sync_upstreams().await;
     });
+
     tokio::spawn(async move {
         let _awake = Awake::hold();
-        let result = turn(&app, &project, &model.alias, &mut chat, stopped).await;
-        app.chats.running.lock().unwrap().remove(&chat.id);
-        app.chats.deleted.lock().unwrap().remove(&chat.id);
+        let result = run_project_turn(
+            &app,
+            &project,
+            (&loaded_model.alias, context_window),
+            store,
+            &mut chat,
+            stopped,
+            steer_rx,
+        )
+        .await;
+        app.chats.sessions.end_turn(&chat.id);
         app.bus.emit(AppEvent::Chat(ChatEvent::State {
             chat: chat.id.clone(),
             busy: false,
@@ -210,113 +193,288 @@ pub fn send(
     Ok(id)
 }
 
-/// The model's replies and the calls they make, until it answers without calls, the user
-/// stops it, or it has taken [`MAX_STEPS`].
-async fn turn(
-    app: &App,
+/// Explicitly compacts older turns of an idle chat (`/compact`).
+pub async fn compact(app: &App, project_id: &str, chat_id: &str, model: &str) -> anyhow::Result<Option<String>> {
+    if app.chats.busy(chat_id) {
+        bail!("Wait for the current turn to finish before compacting.");
+    }
+    let project = app.project(project_id).context("that project no longer exists")?;
+    let (loaded_model, context_window) = app.loaded(model).context("Load a model first to compact this chat.")?;
+    let guard = app.guard_url().context("the guard is not running")?;
+    let endpoint = ModelEndpoint {
+        completions_url: format!("{}{}/v1/chat/completions", guard.trim_end_matches("/v1"), project.guard_path()),
+        api_key: secrets::local_api_key(&app.paths)?,
+        model: loaded_model.alias,
+        context_window,
+    };
+    let store = ChatStore::in_data_dir(&app.paths.data);
+    let mut chat = store.load(&project.id, chat_id)?;
+    let summary = compact_chat(&store, &endpoint, &mut chat, 4).await?;
+    if summary.is_some() {
+        app.bus.emit(AppEvent::Chat(ChatEvent::Notice {
+            chat: chat.id.clone(),
+            text: "Compacted earlier turns into a summary checkpoint.".into(),
+        }));
+    }
+    Ok(summary)
+}
+
+/// Creates a branched copy of `chat_id` keeping the first `keep_messages` messages.
+pub fn fork(app: &App, project_id: &str, chat_id: &str, keep_messages: usize) -> anyhow::Result<Chat> {
+    let store = ChatStore::in_data_dir(&app.paths.data);
+    store.fork(project_id, chat_id, keep_messages)
+}
+
+struct IsolationRuntime {
+    runner: Option<Arc<dyn CommandRunner>>,
+    path_mapper: Option<Arc<dyn PathMapper>>,
+    prompt_cfg: PromptConfig,
+}
+
+async fn run_project_turn(
+    app: &Arc<App>,
     project: &Project,
-    model: &str,
+    model_info: (&str, u64),
+    store: ChatStore,
     chat: &mut Chat,
-    mut stopped: watch::Receiver<bool>,
+    stopped: watch::Receiver<bool>,
+    steer_rx: tokio::sync::mpsc::UnboundedReceiver<Value>,
 ) -> anyhow::Result<()> {
+    let (model_alias, context_window) = model_info;
     let main = std::fs::canonicalize(project.main())
         .with_context(|| format!("{} is gone", project.main().display()))?;
     let related: Vec<Folder> = project
         .related()
         .iter()
-        .filter_map(|f| Some(Folder { path: std::fs::canonicalize(&f.path).ok()?, writable: f.writable }))
+        .filter_map(|f| {
+            Some(Folder {
+                path: std::fs::canonicalize(&f.path).ok()?,
+                writable: f.writable,
+            })
+        })
         .collect();
-    let (commands, edits) = (project.allows("commands"), project.allows("edits"));
-    let profile = if commands {
-        Some(seatbelt::write_project_profile(
-            &app.paths,
-            &main,
-            &related,
-            project.network,
-            &project.blocked_programs,
-            &format!("chat-{}", project.id),
-        )?)
-    } else {
-        None
-    };
-    let folders: Vec<Folder> = std::iter::once(Folder { path: main.clone(), writable: true })
-        .chain(related.iter().cloned())
-        .collect();
-    let workspace = Workspace::new(&folders, profile, edits)?;
-    let mut tools = workspace.definitions();
-    if project.allows("subagents") {
-        tools.push(subagent_tool_definition());
-    }
-    let system = json!({ "role": "system", "content": system_prompt(project, &main, &related, commands, edits) });
-    let guard = app.guard_url().context("the guard is not running")?;
-    let url = format!("{}{}/v1/chat/completions", guard.trim_end_matches("/v1"), project.guard_path());
-    let key = secrets::local_api_key(&app.paths)?;
-    let client = reqwest::Client::new();
+    let (commands, edits, allow_subagents) = (
+        project.allows("commands"),
+        project.allows("edits"),
+        project.allows("subagents"),
+    );
 
-    for _ in 0..MAX_STEPS {
-        if *stopped.borrow() {
-            return Ok(());
-        }
-        let messages: Vec<Value> = std::iter::once(system.clone())
-            .chain(chat.messages.iter().map(for_model))
-            .collect();
-        let body = json!({ "model": model, "messages": messages, "tools": tools, "stream": true });
-        let reply = tokio::select! {
-            reply = stream_reply(&app.bus, &client, &url, &key, &body, &chat.id) => reply?,
-            _ = stopped.wait_for(|s| *s) => return Ok(()),
-        };
-        let mut message = json!({ "role": "assistant", "content": reply.content });
-        if !reply.reasoning.is_empty() {
-            message["reasoning"] = json!(reply.reasoning);
-        }
-        if !reply.calls.is_empty() {
-            message["tool_calls"] = json!(
-                reply
-                    .calls
-                    .iter()
-                    .map(|c| json!({ "id": c.id, "type": "function", "function": { "name": c.name, "arguments": c.arguments } }))
-                    .collect::<Vec<_>>()
-            );
-        }
-        add(app, chat, message)?;
-        if reply.calls.is_empty() {
-            return Ok(());
-        }
-        for call in &reply.calls {
-            let result = if *stopped.borrow() {
-                NOT_RUN.to_string()
-            } else if call.name == "subagent" && project.allows("subagents") {
-                run_subagent(app, project, &chat.id, model, &folders, call, stopped.clone()).await
-            } else if !asks(project.approvals, &call.name) || approved(app, &chat.id, call, &mut stopped).await {
-                workspace.run(&call.name, &call.arguments, stopped.clone()).await
-            } else if *stopped.borrow() {
-                NOT_RUN.to_string()
+    let ws_folders: Vec<WorkspaceFolder> = std::iter::once(WorkspaceFolder {
+        path: main.clone(),
+        writable: true,
+    })
+    .chain(related.iter().map(|f| WorkspaceFolder {
+        path: f.path.clone(),
+        writable: f.writable,
+    }))
+    .collect();
+
+    let IsolationRuntime { runner, path_mapper, mut prompt_cfg } = match project.isolation {
+        Isolation::MacosSandbox => {
+            let runner: Option<Arc<dyn CommandRunner>> = if commands {
+                let profile = seatbelt::write_project_profile(
+                    &app.paths,
+                    &main,
+                    &related,
+                    project.network,
+                    &project.blocked_programs,
+                    &format!("chat-{}", project.id),
+                )?;
+                Some(Arc::new(SeatbeltRunner { profile, main: main.clone() }))
             } else {
-                DECLINED.to_string()
+                None
             };
-            add(app, chat, json!({ "role": "tool", "tool_call_id": call.id, "content": result }))?;
+            let mut cfg = PromptConfig::new(&project.name, main.clone());
+            cfg.related = ws_folders[1..].to_vec();
+            cfg.environment = "a macOS Seatbelt sandbox".into();
+            cfg.shell_label = "zsh on macOS".into();
+            IsolationRuntime { runner, path_mapper: None, prompt_cfg: cfg }
         }
+        Isolation::LinuxVm => {
+            let runner: Option<Arc<dyn CommandRunner>> = if commands {
+                let paths = app.paths.clone();
+                let main_c = main.clone();
+                let rel_c = related.clone();
+                let net = project.network;
+                let bus = app.bus.clone();
+                let cid = chat.id.clone();
+                let vm = tokio::task::spawn_blocking(move || -> anyhow::Result<ShellVm> {
+                    let vm = ShellVm::new(&paths, &main_c, &rel_c, net)?;
+                    if !vm.has_image() {
+                        bus.emit(AppEvent::Chat(ChatEvent::Notice {
+                            chat: cid,
+                            text: "Building the Linux sandbox image once (this takes a couple of minutes)…".into(),
+                        }));
+                        vm.ensure_image()?;
+                    }
+                    Ok(vm)
+                })
+                .await
+                .context("Linux VM setup task failed")??;
+                Some(Arc::new(LinuxVmRunner { vm: Arc::new(vm) }))
+            } else {
+                None
+            };
+            let (vm_main, vm_rel_paths) = container::vm_paths(&related);
+            let mut cfg = PromptConfig::new(&project.name, main.clone());
+            cfg.display_main = vm_main;
+            cfg.display_related = related
+                .iter()
+                .zip(vm_rel_paths)
+                .map(|(f, vm_p)| (vm_p, f.writable))
+                .collect();
+            cfg.environment = "an isolated Linux VM".into();
+            cfg.shell_label = "bash in Linux VM".into();
+            let mapper: Arc<dyn PathMapper> = Arc::new(VmPathMapper {
+                main: main.clone(),
+                related: related.clone(),
+            });
+            IsolationRuntime { runner, path_mapper: Some(mapper), prompt_cfg: cfg }
+        }
+    };
+
+    prompt_cfg.commands = commands;
+    prompt_cfg.edits = edits;
+    prompt_cfg.subagents = allow_subagents;
+    prompt_cfg.internet = project.network == Network::Internet;
+
+    let mut workspace = Workspace::new(&ws_folders, runner, edits)?;
+    if let Some(mapper) = path_mapper {
+        workspace = workspace.with_path_mapper(mapper);
     }
-    bail!("The agent took {MAX_STEPS} steps without finishing; send a message to let it continue.")
+
+    let guard = app.guard_url().context("the guard is not running")?;
+    let endpoint = ModelEndpoint {
+        completions_url: format!("{}{}/v1/chat/completions", guard.trim_end_matches("/v1"), project.guard_path()),
+        api_key: secrets::local_api_key(&app.paths)?,
+        model: model_alias.to_string(),
+        context_window,
+    };
+
+    let subagents: Option<Arc<dyn SubagentHandler>> = allow_subagents.then(|| {
+        Arc::new(BackendSubagentHandler {
+            app: app.clone(),
+            project: project.clone(),
+            parent_model_alias: model_alias.to_string(),
+            folders: ws_folders.clone(),
+        }) as Arc<dyn SubagentHandler>
+    });
+
+    let approvals = match project.approvals {
+        Approvals::Commands => ApprovalPolicy::Commands,
+        Approvals::Everything => ApprovalPolicy::Everything,
+        Approvals::Never => ApprovalPolicy::Never,
+    };
+
+    let sink = BusEventSink { bus: app.bus.clone() };
+    let cfg = TurnConfig {
+        store,
+        endpoint,
+        system_prompt: entropy::prompt::build(&prompt_cfg),
+        workspace,
+        approvals,
+        subagents,
+        max_steps: MAX_STEPS,
+    };
+    run_turn(&app.chats.sessions, &sink, cfg, chat, stopped, steer_rx).await
 }
 
-fn subagent_tool_definition() -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": "subagent",
-            "description": "Delegate a focused read-only investigation or analysis task (e.g. searching files, tracing how a feature works, reviewing code) to an isolated sub-agent with its own fresh context window. Returns a concise summary so your main context stays compact.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "role": { "type": "string", "description": "Short role name such as Explore, Research, or Review" },
-                    "description": { "type": "string", "description": "Short 3-8 word label for the subtask" },
-                    "prompt": { "type": "string", "description": "Clear, self-contained instructions for what the sub-agent should inspect and report back" }
-                },
-                "required": ["description", "prompt"]
+struct BusEventSink {
+    bus: EventBus,
+}
+
+impl EventSink for BusEventSink {
+    fn emit(&self, event: HarnessEvent) {
+        let mapped = match event {
+            HarnessEvent::Message { chat, message } => ChatEvent::Message { chat, message },
+            HarnessEvent::Delta { chat, content, reasoning } => ChatEvent::Delta { chat, content, reasoning },
+            HarnessEvent::Approval { chat, call, name, arguments } => {
+                ChatEvent::Approval { chat, call, name, arguments }
             }
-        }
-    })
+            HarnessEvent::Usage { chat, used, size } => ChatEvent::Usage { chat, used, size },
+            HarnessEvent::Notice { chat, text } => ChatEvent::Notice { chat, text },
+            HarnessEvent::State { chat, busy, error } => ChatEvent::State { chat, busy, error },
+        };
+        self.bus.emit(AppEvent::Chat(mapped));
+    }
+}
+
+struct SeatbeltRunner {
+    profile: PathBuf,
+    main: PathBuf,
+}
+
+impl CommandRunner for SeatbeltRunner {
+    fn shell_description(&self) -> &str {
+        "zsh"
+    }
+
+    fn run(
+        &self,
+        command: &str,
+        timeout: Duration,
+        cancel: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = Result<CommandOutput, String>> + Send + '_>> {
+        let cmd = seatbelt::shell(&self.profile, &self.main, command);
+        Box::pin(run_process(cmd, timeout, cancel))
+    }
+}
+
+struct LinuxVmRunner {
+    vm: Arc<ShellVm>,
+}
+
+impl CommandRunner for LinuxVmRunner {
+    fn shell_description(&self) -> &str {
+        "bash in Linux VM"
+    }
+
+    fn run(
+        &self,
+        command: &str,
+        timeout: Duration,
+        cancel: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = Result<CommandOutput, String>> + Send + '_>> {
+        let cmd = self.vm.shell_command(command);
+        Box::pin(run_process(cmd, timeout, cancel))
+    }
+}
+
+struct VmPathMapper {
+    main: PathBuf,
+    related: Vec<Folder>,
+}
+
+impl PathMapper for VmPathMapper {
+    fn to_host(&self, path: &Path) -> Option<PathBuf> {
+        container::host_path(&self.main, &self.related, path)
+    }
+}
+
+struct BackendSubagentHandler {
+    app: Arc<App>,
+    project: Project,
+    parent_model_alias: String,
+    folders: Vec<WorkspaceFolder>,
+}
+
+impl SubagentHandler for BackendSubagentHandler {
+    fn run(
+        &self,
+        chat_id: String,
+        call: ToolCall,
+        cancel: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = String> + Send + '_>> {
+        Box::pin(run_subagent(
+            &self.app,
+            &self.project,
+            chat_id,
+            &self.parent_model_alias,
+            &self.folders,
+            call,
+            cancel,
+        ))
+    }
 }
 
 /// Picks the best currently-loaded model for a sub-agent: if the machine has another lighter
@@ -339,15 +497,13 @@ fn pick_subagent_model(app: &App, parent_alias: &str) -> (String, String) {
     (parent_alias.to_string(), name)
 }
 
-/// Runs an isolated read-only sub-agent turn, streaming its live status, tool steps, and
-/// final summary through `app.subagents`.
 async fn run_subagent(
     app: &App,
     project: &Project,
-    parent_chat_id: &str,
+    parent_chat_id: String,
     parent_model_alias: &str,
-    folders: &[Folder],
-    call: &Call,
+    folders: &[WorkspaceFolder],
+    call: ToolCall,
     mut parent_stopped: watch::Receiver<bool>,
 ) -> String {
     let args: Value = serde_json::from_str(if call.arguments.trim().is_empty() {
@@ -382,10 +538,10 @@ async fn run_subagent(
         SubagentRecord {
             id: sub_id.clone(),
             project: project.id.clone(),
-            parent_session: parent_chat_id.to_string(),
+            parent_session: parent_chat_id,
             child_session: None,
             role: role.clone(),
-            title: title.clone(),
+            title,
             prompt: prompt.clone(),
             model: Some(model_name),
             state: SubagentState::Running,
@@ -401,7 +557,6 @@ async fn run_subagent(
     );
 
     let outcome: anyhow::Result<(SubagentState, String)> = async {
-        // Read-only workspace (no edits, no shell) keeps sub-agents safe and conflict-free.
         let workspace = Workspace::new(folders, None, false)?;
         let tools = workspace.definitions();
         let guard = app.guard_url().context("the guard is not running")?;
@@ -530,7 +685,7 @@ async fn run_subagent(
     }
 }
 
-fn summarize_builtin_call(call: &Call) -> (String, String) {
+fn summarize_builtin_call(call: &ToolCall) -> (String, String) {
     let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
     let verb = match call.name.as_str() {
         "read" => "Read",
@@ -553,7 +708,7 @@ async fn stream_subagent_reply(
     url: &str,
     key: &str,
     body: &Value,
-) -> anyhow::Result<Reply> {
+) -> anyhow::Result<StreamReply> {
     let response = client
         .post(url)
         .bearer_auth(key)
@@ -566,16 +721,16 @@ async fn stream_subagent_reply(
         let text = response.text().await.unwrap_or_default();
         bail!("the model server said {status}: {text}");
     }
-    let mut reply = Reply::default();
-    let mut calls: Vec<Call> = Vec::new();
+    let mut reply = StreamReply::default();
+    let mut calls: Vec<ToolCall> = Vec::new();
     let mut buffer: Vec<u8> = Vec::new();
     let mut last = Instant::now();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         buffer.extend_from_slice(&chunk.context("the sub-agent reply was cut off")?);
-        while let Some((start, end)) = find_sse_event_end(&buffer) {
+        while let Some((start, end)) = entropy::engine::find_sse_event_end(&buffer) {
             let event: Vec<u8> = buffer.drain(..end).collect();
-            consume_sse_event(&event[..start], &mut reply, &mut calls)?;
+            entropy::engine::consume_sse_event(&event[..start], &mut reply, &mut calls)?;
         }
         if last.elapsed() >= Duration::from_millis(120) && !reply.content.is_empty() {
             app.subagents.update_with(sub_id, &app.bus, |rec| {
@@ -585,7 +740,7 @@ async fn stream_subagent_reply(
         }
     }
     if !buffer.is_empty() {
-        consume_sse_event(&buffer, &mut reply, &mut calls)?;
+        entropy::engine::consume_sse_event(&buffer, &mut reply, &mut calls)?;
     }
     for (i, call) in calls.iter_mut().enumerate() {
         if call.id.is_empty() {
@@ -596,244 +751,9 @@ async fn stream_subagent_reply(
     Ok(reply)
 }
 
-/// A saved message as the model gets it: without our own fields.
-fn for_model(message: &Value) -> Value {
-    let mut message = message.clone();
-    if let Some(object) = message.as_object_mut() {
-        object.remove("reasoning");
-        if let Some(parts) = object.get_mut("content").and_then(Value::as_array_mut) {
-            for part in parts {
-                if let Some(part_obj) = part.as_object_mut() {
-                    part_obj.remove("superviser_meta");
-                }
-            }
-        }
-    }
-    message
-}
-
-fn add(app: &App, chat: &mut Chat, message: Value) -> anyhow::Result<()> {
-    if app.chats.is_deleted(&chat.id) {
-        return Ok(());
-    }
-    app.bus.emit(AppEvent::Chat(ChatEvent::Message {
-        chat: chat.id.clone(),
-        message: message.clone(),
-    }));
-    chat.messages.push(message);
-    chat.save(&app.paths)
-}
-
-/// Whether the project wants the user asked before `tool` runs.
-fn asks(approvals: Approvals, tool: &str) -> bool {
-    match approvals {
-        Approvals::Never => false,
-        Approvals::Commands => tools::kind(tool) == Kind::Runs,
-        Approvals::Everything => tools::kind(tool) != Kind::Reads,
-    }
-}
-
-/// Asks the user about `call`; false if they decline or stop the agent.
-async fn approved(app: &App, chat: &str, call: &Call, stopped: &mut watch::Receiver<bool>) -> bool {
-    let (answer, answered) = oneshot::channel();
-    let key = format!("{chat}:{}", call.id);
-    app.chats.approvals.lock().unwrap().insert(key.clone(), answer);
-    app.bus.emit(AppEvent::Chat(ChatEvent::Approval {
-        chat: chat.to_string(),
-        call: call.id.clone(),
-        name: call.name.clone(),
-        arguments: call.arguments.clone(),
-    }));
-    let allowed = tokio::select! {
-        answer = answered => answer.unwrap_or(false),
-        _ = stopped.wait_for(|s| *s) => false,
-    };
-    app.chats.approvals.lock().unwrap().remove(&key);
-    allowed
-}
-
-#[derive(Debug, Default, Clone)]
-struct Call {
-    id: String,
-    name: String,
-    arguments: String,
-}
-
-#[derive(Debug, Default)]
-struct Reply {
-    content: String,
-    reasoning: String,
-    calls: Vec<Call>,
-}
-
-/// Sends one request and reads the streamed reply, passing it on to the window as it comes.
-async fn stream_reply(
-    bus: &EventBus,
-    client: &reqwest::Client,
-    url: &str,
-    key: &str,
-    body: &Value,
-    chat: &str,
-) -> anyhow::Result<Reply> {
-    let response = client
-        .post(url)
-        .bearer_auth(key)
-        .json(body)
-        .send()
-        .await
-        .context("couldn't reach the guard")?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        let message = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
-            .unwrap_or(text);
-        bail!("the model server said {status}: {message}");
-    }
-    let mut reply = Reply::default();
-    let mut calls: Vec<Call> = Vec::new();
-    let mut buffer: Vec<u8> = Vec::new();
-    let mut last = Instant::now();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        buffer.extend_from_slice(&chunk.context("the reply was cut off")?);
-        while let Some((start, end)) = find_sse_event_end(&buffer) {
-            let event: Vec<u8> = buffer.drain(..end).collect();
-            consume_sse_event(&event[..start], &mut reply, &mut calls)?;
-        }
-        if last.elapsed() >= DELTA_EVERY {
-            bus.emit(AppEvent::Chat(ChatEvent::Delta {
-                chat: chat.to_string(),
-                content: reply.content.clone(),
-                reasoning: reply.reasoning.clone(),
-            }));
-            last = Instant::now();
-        }
-    }
-    if !buffer.is_empty() {
-        consume_sse_event(&buffer, &mut reply, &mut calls)?;
-    }
-    // Calls the model named but never gave an id still need one to be answered.
-    for (i, call) in calls.iter_mut().enumerate() {
-        if call.id.is_empty() {
-            call.id = format!("call_{i}");
-        }
-    }
-    reply.calls = calls.into_iter().filter(|c| !c.name.is_empty()).collect();
-    Ok(reply)
-}
-
-/// Finds the first `\n\n` or `\r\n\r\n` boundary in a raw byte buffer so multi-byte UTF-8
-/// characters split across HTTP chunks are never decoded mid-sequence.
-fn find_sse_event_end(buf: &[u8]) -> Option<(usize, usize)> {
-    let mut i = 0;
-    while i + 1 < buf.len() {
-        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
-            return Some((i, i + 2));
-        }
-        if i + 3 < buf.len() && &buf[i..i + 4] == b"\r\n\r\n" {
-            return Some((i, i + 4));
-        }
-        i += 1;
-    }
-    None
-}
-
-fn consume_sse_event(raw: &[u8], reply: &mut Reply, calls: &mut Vec<Call>) -> anyhow::Result<()> {
-    let event = String::from_utf8_lossy(raw);
-    for data in event.lines().filter_map(|l| l.strip_prefix("data:")).map(str::trim) {
-        if data == "[DONE]" {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(data) else { continue };
-        if let Some(error) = value.get("error") {
-            bail!("the model server said: {}", error["message"].as_str().unwrap_or("an error"));
-        }
-        read_delta(&value["choices"][0]["delta"], reply, calls);
-    }
-    Ok(())
-}
-
-/// Adds one streamed delta to the reply: text, reasoning, and pieces of tool calls by index.
-fn read_delta(delta: &Value, reply: &mut Reply, calls: &mut Vec<Call>) {
-    if let Some(text) = delta["content"].as_str() {
-        reply.content.push_str(text);
-    }
-    if let Some(text) = delta["reasoning_content"].as_str() {
-        reply.reasoning.push_str(text);
-    }
-    for part in delta["tool_calls"].as_array().into_iter().flatten() {
-        let index = part["index"].as_u64().unwrap_or(calls.len() as u64) as usize;
-        if calls.len() <= index {
-            calls.resize(index + 1, Call::default());
-        }
-        let call = &mut calls[index];
-        if let Some(id) = part["id"].as_str() {
-            call.id = id.to_string();
-        }
-        if let Some(name) = part["function"]["name"].as_str() {
-            call.name.push_str(name);
-        }
-        if let Some(arguments) = part["function"]["arguments"].as_str() {
-            call.arguments.push_str(arguments);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn assembles_streamed_tool_calls() {
-        let mut reply = Reply::default();
-        let mut calls = Vec::new();
-        for delta in [
-            json!({"reasoning_content": "Look first."}),
-            json!({"tool_calls": [{"index": 0, "id": "a", "function": {"name": "read", "arguments": "{\"pa"}}]}),
-            json!({"tool_calls": [{"index": 0, "function": {"arguments": "th\": \"x\"}"}}]}),
-            json!({"tool_calls": [{"index": 1, "id": "b", "function": {"name": "bash", "arguments": "{}"}}]}),
-            json!({"content": "Done."}),
-        ] {
-            read_delta(&delta, &mut reply, &mut calls);
-        }
-        assert_eq!((reply.content.as_str(), reply.reasoning.as_str()), ("Done.", "Look first."));
-        assert_eq!((calls[0].name.as_str(), calls[0].arguments.as_str()), ("read", "{\"path\": \"x\"}"));
-        assert_eq!(calls[1].id, "b");
-    }
-
-    #[test]
-    fn asks_as_the_project_says() {
-        assert!(asks(Approvals::Commands, "bash") && !asks(Approvals::Commands, "edit"));
-        assert!(asks(Approvals::Everything, "write") && !asks(Approvals::Everything, "grep"));
-        assert!(!asks(Approvals::Never, "bash"));
-    }
-
-    #[test]
-    fn reasoning_stays_out_of_requests() {
-        let saved = json!({"role": "assistant", "content": "x", "reasoning": "y"});
-        assert_eq!(for_model(&saved), json!({"role": "assistant", "content": "x"}));
-    }
-
-    #[test]
-    fn sse_byte_buffer_preserves_split_utf8_and_trailing_event() {
-        let mut reply = Reply::default();
-        let mut calls = Vec::new();
-        let stream = "data: {\"choices\":[{\"delta\":{\"content\":\"café — done\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}";
-        let mut buffer = Vec::new();
-        for chunk in stream.as_bytes().chunks(3) {
-            buffer.extend_from_slice(chunk);
-            while let Some((start, end)) = find_sse_event_end(&buffer) {
-                let event: Vec<u8> = buffer.drain(..end).collect();
-                consume_sse_event(&event[..start], &mut reply, &mut calls).unwrap();
-            }
-        }
-        if !buffer.is_empty() {
-            consume_sse_event(&buffer, &mut reply, &mut calls).unwrap();
-        }
-        assert_eq!(reply.content, "café — done!");
-    }
 
     #[test]
     fn user_message_supports_plain_and_multimodal_images() {
@@ -856,10 +776,44 @@ mod tests {
         assert_eq!(parts[2]["type"], "image_url");
         assert_eq!(parts[2]["image_url"]["url"], img.data_url());
 
-        let clean = for_model(&msg);
+        let clean = entropy::context::for_model(&msg);
         assert!(clean["content"][1].get("superviser_meta").is_none());
 
         let img_only = user_message("", std::slice::from_ref(&img), None);
         assert_eq!(img_only["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_runner_enforces_sandbox() {
+        let root = std::env::temp_dir().join(format!("superviser-seatbelt-runner-{}", std::process::id()));
+        let main = root.join("app");
+        std::fs::create_dir_all(&main).unwrap();
+        let paths = superviser_core::paths::Paths::at(root.join("data"));
+        let main = std::fs::canonicalize(&main).unwrap();
+        let profile = seatbelt::write_project_profile(
+            &paths,
+            &main,
+            &[],
+            Network::LocalOnly,
+            &["uname".into()],
+            "test",
+        )
+        .unwrap();
+        let runner: Arc<dyn CommandRunner> = Arc::new(SeatbeltRunner { profile, main: main.clone() });
+        let ws = Workspace::new(
+            &[WorkspaceFolder { path: main, writable: true }],
+            Some(runner),
+            true,
+        )
+        .unwrap();
+        let (_tx, cancel) = watch::channel(false);
+        assert_eq!(
+            ws.run("bash", r#"{"command": "echo hi > made.txt && cat made.txt"}"#, cancel.clone()).await,
+            "hi\n(exit code 0)"
+        );
+        let blocked = ws.run("bash", r#"{"command": "uname"}"#, cancel).await;
+        assert!(!blocked.contains("Darwin") && !blocked.contains("exit code 0"), "{blocked}");
+        std::fs::remove_dir_all(root).ok();
     }
 }

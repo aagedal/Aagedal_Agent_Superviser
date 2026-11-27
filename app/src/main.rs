@@ -9,7 +9,6 @@ mod update;
 use std::sync::Arc;
 
 use superviser_backend::{App, AppEvent, LoadState, ServerStatus};
-use superviser_core::sandbox::Isolation;
 use superviser_guard::Verdict;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
@@ -163,6 +162,7 @@ fn main() {
             commands::regenerate_api_key,
             commands::set_hf_token,
             commands::setup_opencode,
+            commands::connect_guides,
             commands::recent_calls,
             commands::judge_settings,
             commands::set_judge,
@@ -192,6 +192,8 @@ fn main() {
             commands::chat_list,
             commands::chat_load,
             commands::chat_send,
+            commands::chat_compact,
+            commands::chat_fork,
             commands::chat_stop,
             commands::chat_answer,
             commands::chat_delete,
@@ -264,23 +266,12 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
     let models = Submenu::with_id_and_items(handle, "models", "Load Model", true, &model_refs)?;
     let stop = MenuItem::with_id(handle, "stop", if running > 1 { "Unload All Models" } else { "Unload Model" }, running > 0, None::<&str>)?;
     let chat = MenuItem::with_id(handle, "chat", "Open Chat…", true, None::<&str>)?;
-    let opencode = MenuItem::with_id(handle, "opencode", "Set Up OpenCode", matches!(status, ServerStatus::Running { .. }), None::<&str>)?;
-    let running = matches!(status, ServerStatus::Running { .. });
+    let connect = MenuItem::with_id(handle, "connect", "Connect External Harness…", true, None::<&str>)?;
     let projects = app.settings.lock().unwrap().projects.clone();
-    // The chat; it runs Linux VM projects with OpenCode, so without it they open in Terminal.
-    let chat_in_vm = superviser_core::opencode::binary().is_some();
     let chat_items: Vec<MenuItem<tauri::Wry>> = projects
         .iter()
         .take(MAX_TRAY_PROJECTS)
-        .map(|p| match p.isolation {
-            Isolation::LinuxVm if !chat_in_vm => MenuItem::with_id(handle, format!("project:{}", p.id), format!("{} (OpenCode, Linux VM)", p.name), running, None::<&str>),
-            _ => MenuItem::with_id(handle, format!("chat:{}", p.id), &p.name, true, None::<&str>),
-        })
-        .collect::<tauri::Result<_>>()?;
-    let opencode_items: Vec<MenuItem<tauri::Wry>> = projects
-        .iter()
-        .take(MAX_TRAY_PROJECTS)
-        .map(|p| MenuItem::with_id(handle, format!("project:{}", p.id), &p.name, running, None::<&str>))
+        .map(|p| MenuItem::with_id(handle, format!("chat:{}", p.id), &p.name, true, None::<&str>))
         .collect::<tauri::Result<_>>()?;
     let choose = MenuItem::with_id(handle, "choose-project", "New Project from Folder…", true, Some("CmdOrCtrl+O"))?;
     let separator = PredefinedMenuItem::separator(handle)?;
@@ -290,8 +281,6 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
     }
     chat_refs.push(&choose);
     let code = Submenu::with_id_and_items(handle, "code", "Code in a Project", cfg!(target_os = "macos"), &chat_refs)?;
-    let opencode_refs: Vec<&dyn IsMenuItem<tauri::Wry>> = opencode_items.iter().map(|i| i as &dyn IsMenuItem<tauri::Wry>).collect();
-    let in_opencode = Submenu::with_id_and_items(handle, "in-opencode", "Open in OpenCode", cfg!(target_os = "macos") && !opencode_refs.is_empty(), &opencode_refs)?;
     let settings = MenuItem::with_id(handle, "settings", "Settings…", true, Some("CmdOrCtrl+,"))?;
     // Until setup is finished or skipped, a way back to it.
     let setup = app.needs_setup().then(|| MenuItem::with_id(handle, "setup", "Continue Setup…", true, None::<&str>)).transpose()?;
@@ -323,8 +312,7 @@ fn tray_menu(handle: &AppHandle, app: &App) -> tauri::Result<Menu<tauri::Wry>> {
                 &PredefinedMenuItem::separator(handle)?,
                 &code,
                 &chat,
-                &in_opencode,
-                &opencode,
+                &connect,
                 &settings,
                 &PredefinedMenuItem::separator(handle)?,
                 &quit,
@@ -374,8 +362,8 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
                 app.unload_model(None).await;
             });
         }
-        // The Connect tab runs the setup and shows what happened.
-        "opencode" => {
+        // The Connect tab shows local API credentials and setup instructions for external harnesses.
+        "connect" | "opencode" => {
             if let Err(e) = open_window_at(&handle, "settings", "connect") {
                 tracing::warn!("opening settings: {e}");
             }
@@ -406,7 +394,7 @@ fn on_menu_event(handle: &AppHandle, event: tauri::menu::MenuEvent) {
 /// Asks for a folder, then opens its project (made if needed) in the chat window.
 pub fn choose_project(handle: &AppHandle) {
     let handle_for_pick = handle.clone();
-    let mut dialog = handle.dialog().file().set_title("Choose a project folder for OpenCode");
+    let mut dialog = handle.dialog().file().set_title("Choose a project folder");
     if let Some(home) = std::env::var_os("HOME") {
         dialog = dialog.set_directory(home);
     }

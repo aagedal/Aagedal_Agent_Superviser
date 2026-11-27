@@ -27,7 +27,7 @@ pub enum AcpEvent {
     Starting { project: String, text: String },
 }
 
-/// What a chat window hears from the built-in agent.
+/// What a chat window hears from the built-in harness.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatEvent {
@@ -37,6 +37,10 @@ pub enum ChatEvent {
     Delta { chat: String, content: String, reasoning: String },
     /// A call waits for the user's yes or no.
     Approval { chat: String, call: String, name: String, arguments: String },
+    /// Live context window usage (tokens used out of model context size).
+    Usage { chat: String, used: u64, size: u64 },
+    /// Informational status notice (e.g. automatic context compaction).
+    Notice { chat: String, text: String },
     /// The turn started or ended (with what went wrong, if something did).
     State { chat: String, busy: bool, error: Option<String> },
 }

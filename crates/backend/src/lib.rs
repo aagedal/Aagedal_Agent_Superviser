@@ -22,3 +22,4 @@ pub use state::{
     ReasoningLevel, Room, ServerStatus, Settings,
 };
 pub use subagents::{SubagentRecord, SubagentState, SubagentStep};
+pub use entropy::{Chat, ChatStore, ChatSummary, Compaction};

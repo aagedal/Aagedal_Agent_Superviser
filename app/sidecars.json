@@ -1,32 +1,5 @@
 {
-  "_comment": "Programs bundled with the app, pinned by SHA-256. build.rs downloads the ones for the build target into binaries/ when missing: a single program becomes a Tauri externalBin, which a signed build signs as the app; one with a `folder` is copied there with the libraries it links (a Tauri resource), which keeps its own signature (OpenCode's is its authors' Developer ID, with the JIT entitlements Bun needs). OpenCode is MIT, ripgrep MIT or Unlicense, llama.cpp MIT; see NOTICE.md.",
-  "opencode": {
-    "version": "2.3.2",
-    "folder": "opencode",
-    "aarch64-apple-darwin": {
-      "url": "https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-darwin-arm64.zip",
-      "sha256": "31ab5a06a29edc7e49b895f35c2b64ebfe7c7f0437b0f2581b006efcd79fee1a",
-      "member": "opencode"
-    },
-    "x86_64-apple-darwin": {
-      "url": "https://github.com/anomalyco/opencode/releases/download/v2.3.2/opencode-darwin-x64.zip",
-      "sha256": "1875a6d1106702f04c9468831563c061bd00337f891a1b4a6cd151155e6aaf5c",
-      "member": "opencode"
-    }
-  },
-  "rg": {
-    "version": "15.1.0",
-    "aarch64-apple-darwin": {
-      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-aarch64-apple-darwin.tar.gz",
-      "sha256": "378e973289176ca0c6054054ee7f631a065874a352bf43f0fa60ef079b6ba715",
-      "member": "ripgrep-15.1.0-aarch64-apple-darwin/rg"
-    },
-    "x86_64-apple-darwin": {
-      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-apple-darwin.tar.gz",
-      "sha256": "64811cb24e77cac3057d6c40b63ac9becf9082eedd54ca411b475b755d334882",
-      "member": "ripgrep-15.1.0-x86_64-apple-darwin/rg"
-    }
-  },
+  "_comment": "Programs bundled with the app, pinned by SHA-256. build.rs downloads the ones for the build target into binaries/ when missing: a folder is copied with the libraries it links (a Tauri resource). llama.cpp is MIT; see NOTICE.md.",
   "llama-server": {
     "version": "b12631",
     "folder": "llama.cpp",
