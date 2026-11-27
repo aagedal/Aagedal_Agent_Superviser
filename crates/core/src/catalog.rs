@@ -11,8 +11,9 @@ use crate::hardware::Hardware;
 use crate::hub::{Hub, QuantGroup};
 use crate::quant;
 
-/// Contexts we try, largest first. Coding agents need at least the smallest: OpenCode's
-/// system prompt and tool definitions alone take well over 10k tokens.
+/// Contexts we try, largest first. Our built-in harness uses under 1k tokens for its system
+/// prompt and tools, leaving nearly the entire window for code and conversation history, while
+/// external harnesses connected over the local API (like OpenCode) also need at least 32k.
 pub const CONTEXTS: &[u64] = &[65_536, 32_768];
 pub const MIN_CONTEXT: u64 = 32_768;
 

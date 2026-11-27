@@ -154,7 +154,7 @@ impl Default for Settings {
             block: true,
             judge: false,
             judge_fail_closed: false,
-            configure_opencode: true,
+            configure_opencode: false,
             use_other_apps: true,
             last_model: None,
             projects: Vec::new(),
@@ -1518,11 +1518,29 @@ impl App {
         Ok(project)
     }
 
+    /// Setup guides & copyable config snippets for external harnesses (Pi, OpenCode, Codex, etc.).
+    pub fn connect_guides(&self) -> Vec<superviser_core::connect::HarnessGuide> {
+        let base_url = self.guard_url().unwrap_or_default();
+        let api_key = secrets::local_api_key(&self.paths).unwrap_or_default();
+        let latest = self.latest_model();
+        let (alias, name, ctx) = match latest {
+            Some((m, ctx)) => (m.alias, m.model.name, ctx),
+            None => (String::new(), String::new(), superviser_core::catalog::MIN_CONTEXT),
+        };
+        superviser_core::connect::guides(&superviser_core::connect::ConnectParams {
+            base_url: &base_url,
+            api_key: &api_key,
+            model_alias: &alias,
+            model_name: &name,
+            context_window: ctx,
+        })
+    }
+
     pub fn delete_project(&self, id: &str) -> anyhow::Result<()> {
         self.engines.stop(id);
         self.chats.stop_project(id);
         self.settings.lock().unwrap().projects.retain(|p| p.id != id);
-        superviser_core::agent::Chat::delete_all(&self.paths, id);
+        entropy::Chat::delete_all_in(&self.paths.data, id);
         {
             let mut chat_models = self.chat_models.lock().unwrap();
             let before = chat_models.len();

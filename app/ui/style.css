@@ -118,6 +118,23 @@ input[type="text"], input[type="password"], input[type="search"] {
 .card .body { flex: 1; min-width: 0; }
 .card .title { font-weight: 600; }
 .card .actions { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+details.guide {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 14px;
+  margin: 8px 0;
+}
+details.guide > summary { cursor: pointer; }
+details.guide pre {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  overflow: auto;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
 .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .chip { font-size: 11px; background: var(--chip); color: var(--muted); padding: 1px 7px; border-radius: 10px; }
 .chip.good { color: var(--good); }

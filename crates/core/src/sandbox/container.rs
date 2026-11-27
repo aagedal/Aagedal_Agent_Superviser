@@ -30,9 +30,12 @@ use super::{Backend, Isolation, Network, Prepared, Request, Setup, shell_quote};
 use crate::project::Folder;
 
 const CONTAINERFILE: &str = include_str!("Containerfile");
+const SANDBOX_CONTAINERFILE: &str = include_str!("SandboxContainerfile");
 /// Bumped whenever `Containerfile` changes, so images are rebuilt.
 const RECIPE: u32 = 4;
+const SANDBOX_RECIPE: u32 = 1;
 const IMAGE: &str = "agent-superviser/opencode";
+const SANDBOX_IMAGE: &str = "agent-superviser/sandbox";
 /// The OpenCode version used when the host's can't be read.
 const DEFAULT_OPENCODE: &str = "2.3.2";
 /// The host-only network used when internet is off.
@@ -328,6 +331,97 @@ impl Vm {
         stop(&self.container, &name);
         let mut command = Command::new(&self.container);
         command.args(["run", "-i", "--name", &name]).args(&self.options).arg(&self.image).args(args).env("SSH_AUTH_SOCK", &self.socket);
+        command
+    }
+}
+
+/// Lightweight Linux VM sandbox for the built-in harness's shell commands (no OpenCode inside).
+pub struct ShellVm {
+    container: PathBuf,
+    image: String,
+    context: PathBuf,
+    options: Vec<String>,
+}
+
+impl ShellVm {
+    /// Prepares the Linux VM image recipe and mount flags for `project` and `related`.
+    pub fn new(
+        paths: &crate::paths::Paths,
+        project: &Path,
+        related: &[Folder],
+        network: Network,
+    ) -> anyhow::Result<Self> {
+        for folder in std::iter::once(project).chain(related.iter().map(|f| f.path.as_path())) {
+            let path = folder.display().to_string();
+            anyhow::ensure!(
+                !path.contains(':') && !path.contains(','),
+                "the Linux VM can't share {path}: its path has ':' or ','"
+            );
+        }
+        let container = which::which("container").context("Apple's container tool isn't installed")?;
+        run(&container, &["system", "start", "--enable-kernel-install"])?;
+        let net = network_name(&container, network)?;
+
+        let context = paths.data.join("sandbox").join("harness-image");
+        write_private(&context.join("Containerfile"), SANDBOX_CONTAINERFILE.as_bytes())?;
+        let image = format!("{SANDBOX_IMAGE}:{SANDBOX_RECIPE}");
+
+        let hardware = Hardware::detect();
+        let cpus = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).max(2));
+        let memory_gib = (hardware.total_memory >> 30).div_ceil(4).clamp(2, 16);
+        let mut options: Vec<String> = [
+            "--rm",
+            "--network",
+            &net,
+            "--cpus",
+            &cpus.to_string(),
+            "--memory",
+            &format!("{memory_gib}G"),
+        ]
+        .map(String::from)
+        .into();
+        options.extend(["--volume".into(), format!("{}:{WORKSPACE}", project.display())]);
+        for (folder, target) in vm_folders(related) {
+            let readonly = if folder.writable { "" } else { ",readonly" };
+            options.extend([
+                "--mount".into(),
+                format!("type=bind,source={},target={target}{readonly}", folder.path.display()),
+            ]);
+        }
+        options.extend(["--workdir".into(), WORKSPACE.into()]);
+
+        Ok(Self { container, image, context, options })
+    }
+
+    pub fn has_image(&self) -> bool {
+        Command::new(&self.container)
+            .args(["image", "inspect", &self.image])
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    /// Builds the lightweight Linux sandbox image if it hasn't been built yet.
+    pub fn ensure_image(&self) -> anyhow::Result<()> {
+        if self.has_image() {
+            return Ok(());
+        }
+        let containerfile = self.context.join("Containerfile").display().to_string();
+        let ctx = self.context.display().to_string();
+        run(
+            &self.container,
+            &["build", "--progress", "plain", "-t", &self.image, "-f", &containerfile, &ctx],
+        )?;
+        Ok(())
+    }
+
+    /// Builds a `Command` executing `shell_cmd` via `/bin/bash -lc` inside a fresh ephemeral VM.
+    pub fn shell_command(&self, shell_cmd: &str) -> Command {
+        let mut command = Command::new(&self.container);
+        command
+            .arg("run")
+            .args(&self.options)
+            .arg(&self.image)
+            .args(["/bin/bash", "-lc", shell_cmd]);
         command
     }
 }

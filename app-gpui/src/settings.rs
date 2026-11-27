@@ -68,10 +68,9 @@ struct ProjectEditor {
 }
 
 /// Cached Connect-tab environment & keychain state so `render()` never spawns
-/// subprocesses (`opencode --version`) or hits macOS Keychain on every frame.
+/// subprocesses or hits macOS Keychain on every frame.
 #[derive(Clone)]
 struct ConnectInfo {
-    opencode_ver: String,
     llama_ver: String,
     api_key: String,
     hf_token_set: bool,
@@ -80,7 +79,6 @@ struct ConnectInfo {
 impl Default for ConnectInfo {
     fn default() -> Self {
         Self {
-            opencode_ver: "Checking OpenCode…".into(),
             llama_ver: "Checking llama-server…".into(),
             api_key: "(loading…)".into(),
             hf_token_set: false,
@@ -242,11 +240,6 @@ impl SettingsWindow {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.backend.tokio.spawn(async move {
             let info = tokio::task::spawn_blocking(move || ConnectInfo {
-                opencode_ver: opencode::version()
-                    .map(|v| format!("OpenCode {v} found."))
-                    .unwrap_or_else(|| {
-                        "OpenCode not found (built-in agent will be used for chat).".into()
-                    }),
                 llama_ver: runtime::find_llama_server()
                     .map(|path| format!("llama-server found at {}", path.display()))
                     .unwrap_or_else(|| "llama-server not found on PATH.".into()),
@@ -2564,31 +2557,26 @@ impl SettingsWindow {
         } else {
             "•".repeat(api_key.len().clamp(12, 32))
         };
-        let opencode_ver = self.connect_info.opencode_ver.clone();
         let llama_ver = self.connect_info.llama_ver.clone();
-        let configure_opencode = self
+        let hf_token_set = self.connect_info.hf_token_set;
+        let guides = self.backend.app.connect_guides();
+        let model_alias = self
             .backend
             .app
-            .settings
-            .lock()
-            .unwrap()
-            .configure_opencode;
-        let has_running = self.has_running_model();
-        let hf_token_set = self.connect_info.hf_token_set;
+            .latest_model()
+            .map(|(m, _)| m.alias)
+            .unwrap_or_else(|| "(load a model first)".into());
 
         let base_url_copy = base_url.clone();
         let api_key_copy = api_key.clone();
+        let model_alias_copy = model_alias.clone();
 
-        v_flex()
-            .gap_3()
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .child("Connect a coding tool"),
-            )
-            // OpenCode card
-            .child(
+        let guide_cards: Vec<_> = guides
+            .into_iter()
+            .map(|g| {
+                let id = g.id;
+                let snippet = g.snippet.clone();
+                let copied = self.copied_field == Some(id);
                 v_flex()
                     .p_3()
                     .gap_2()
@@ -2596,62 +2584,65 @@ impl SettingsWindow {
                     .bg(p.panel)
                     .border_1()
                     .border_color(p.line)
-                    .child(div().text_sm().child(opencode_ver))
-                    .child(div().text_xs().text_color(p.muted).child(llama_ver))
                     .child(
-                        Checkbox::new("auto-opencode")
-                            .checked(configure_opencode)
-                            .label("Update OpenCode's global config automatically whenever a model starts")
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.backend
-                                    .app
-                                    .settings
-                                    .lock()
-                                    .unwrap()
-                                    .configure_opencode = *checked;
-                                if let Err(e) = this.backend.app.save_settings() {
-                                    this.set_notice(format!("{e:#}"), true, cx);
-                                } else {
-                                    cx.notify();
-                                }
-                            })),
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                            .child(g.name),
+                                    )
+                                    .child(div().text_xs().text_color(p.muted).child(g.subtitle)),
+                            )
+                            .child(
+                                Button::new(gpui_kit::SharedString::from(format!("copy-guide-{id}")))
+                                    .small()
+                                    .label(if copied { "Copied" } else { "Copy config" })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.copy_text(id, snippet.clone(), cx);
+                                    })),
+                            ),
                     )
                     .child(
-                        h_flex().gap_2().items_center().child(
-                            Button::new("setup-opencode-now")
-                                .primary()
-                                .small()
-                                .disabled(!has_running)
-                                .label("Set up OpenCode now")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    match this.backend.app.setup_opencode() {
-                                        Ok(res) => {
-                                            let msg = format!(
-                                                "Updated {}{}",
-                                                res.path.display(),
-                                                if res.restarted_service {
-                                                    " and restarted OpenCode."
-                                                } else {
-                                                    "."
-                                                }
-                                            );
-                                            this.set_notice(msg, false, cx);
-                                        }
-                                        Err(e) => {
-                                            this.set_notice(format!("{e:#}"), true, cx);
-                                        }
-                                    }
-                                })),
-                        )
-                        .when(!has_running, |row| {
-                            row.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(p.muted)
-                                    .child("Load a model first to configure OpenCode."),
-                            )
-                        }),
-                    ),
+                        div()
+                            .text_xs()
+                            .text_color(p.muted)
+                            .child(format!("File: {}", g.file_path)),
+                    )
+                    .child(
+                        div()
+                            .p_2()
+                            .rounded(px(6.0))
+                            .bg(p.bg)
+                            .border_1()
+                            .border_color(p.line)
+                            .text_xs()
+                            .font_family("Menlo")
+                            .child(g.snippet),
+                    )
+                    .child(div().text_xs().text_color(p.muted).child(g.notes))
+            })
+            .collect();
+
+        v_flex()
+            .gap_3()
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .child("Connect an external harness"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(p.muted)
+                    .child("Agent Superviser's built-in harness (Entropy) works out of the box with under 1k tokens of prompt overhead. External harnesses (Pi, OpenCode, Codex CLI, or any OpenAI-compatible client) can connect through the guarded local API below."),
             )
             // OpenAI-compatible endpoint card
             .child(
@@ -2666,8 +2657,9 @@ impl SettingsWindow {
                         div()
                             .text_sm()
                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .child("OpenAI-compatible endpoint"),
+                            .child("Local guarded API"),
                     )
+                    .child(div().text_xs().text_color(p.muted).child(llama_ver))
                     .child(
                         h_flex()
                             .gap_2()
@@ -2695,6 +2687,36 @@ impl SettingsWindow {
                                     })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.copy_text("url", base_url_copy.clone(), cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().w(px(72.0)).text_xs().text_color(p.muted).child("Model"))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(px(6.0))
+                                    .bg(p.bg)
+                                    .border_1()
+                                    .border_color(p.line)
+                                    .text_xs()
+                                    .child(model_alias),
+                            )
+                            .child(
+                                Button::new("copy-model")
+                                    .small()
+                                    .label(if self.copied_field == Some("model") {
+                                        "Copied"
+                                    } else {
+                                        "Copy"
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.copy_text("model", model_alias_copy.clone(), cx);
                                     })),
                             ),
                     )
@@ -2745,7 +2767,7 @@ impl SettingsWindow {
                                             Ok(new_key) => {
                                                 this.connect_info.api_key = new_key;
                                                 this.set_notice(
-                                                    "Generated a new local API key. Re-run OpenCode setup if needed.",
+                                                    "Generated a new local API key. Update external harnesses with the new key.",
                                                     false,
                                                     cx,
                                                 );
@@ -2756,6 +2778,8 @@ impl SettingsWindow {
                             ),
                     ),
             )
+            // External harness setup guides (Pi, OpenCode, Codex CLI, OpenAI-compatible)
+            .children(guide_cards)
             // Hugging Face token card
             .child(
                 v_flex()

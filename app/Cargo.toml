@@ -13,6 +13,7 @@ sha2 = "0.10"
 
 [dependencies]
 superviser-core.workspace = true
+entropy.workspace = true
 superviser-guard.workspace = true
 superviser-backend.workspace = true
 anyhow.workspace = true

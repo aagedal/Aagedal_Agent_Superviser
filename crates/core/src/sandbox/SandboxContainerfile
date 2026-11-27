@@ -1,0 +1,18 @@
+# Lightweight Linux VM sandbox for Agent Superviser's built-in harness (`bash` tool).
+# Built once and cached by Apple `container`; only the project folders are shared in.
+FROM docker.io/library/debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl git openssh-client less procps unzip xz-utils \
+      build-essential pkg-config python3 python3-pip python3-venv nodejs npm ripgrep fd-find jq \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --uid 1000 --shell /bin/bash agent \
+ && install -d -o agent -g agent /workspace /home/agent/.cache /home/agent/.local
+
+USER agent
+ENV HOME=/home/agent
+WORKDIR /workspace
+CMD ["/bin/bash"]

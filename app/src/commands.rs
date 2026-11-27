@@ -6,7 +6,8 @@ use serde::Serialize;
 use superviser_backend::files::{self, FileInfo};
 use superviser_backend::git::{self, CommitResult, GitStatus, PrDraft, PullRequestInfo, PushResult};
 use superviser_backend::{App, JUDGE_DOWNLOAD, JudgeStatus, LoadedModel, Room, ServerStatus, SubagentRecord};
-use superviser_core::agent::{Chat, ChatSummary};
+use superviser_core::connect::HarnessGuide;
+use entropy::{Chat, ChatSummary};
 use superviser_core::catalog::{Catalog, CatalogModel, Fit, Offer, Pick};
 use superviser_core::discover::{Locations, MlxModel, Skipped};
 use superviser_core::hardware::Hardware;
@@ -262,6 +263,11 @@ pub fn setup_opencode(app: State<'_, Arc<App>>) -> Result<opencode::Installed> {
     app.setup_opencode().map_err(|e| format!("{e:#}"))
 }
 
+#[tauri::command]
+pub fn connect_guides(app: State<'_, Arc<App>>) -> Vec<HarnessGuide> {
+    app.connect_guides()
+}
+
 #[derive(Serialize)]
 pub struct JudgeSettings {
     enabled: bool,
@@ -407,10 +413,10 @@ pub fn open_project(handle: AppHandle, id: Option<String>) {
 
 // --- The chat window's engine: OpenCode over ACP, else the built-in agent ---
 
-/// `opencode` when OpenCode is bundled or installed, else `builtin`.
+/// Entropy (`crates/entropy`) is Agent Superviser's default lean Rust coding harness.
 #[tauri::command]
 pub fn chat_engine() -> &'static str {
-    if opencode::binary().is_some() { "opencode" } else { "builtin" }
+    "builtin"
 }
 
 fn project(app: &App, id: &str) -> Result<Project> {
@@ -574,11 +580,11 @@ pub fn open_file(app: State<'_, Arc<App>>, project: String, path: String, how: S
     files::open_file(&app, &project, &path, &how, editor.as_deref()).map_err(err)
 }
 
-// --- The built-in agent ---
+// --- Entropy (the built-in coding harness) ---
 
 #[tauri::command]
 pub fn chat_list(app: State<'_, Arc<App>>, project: String) -> Vec<ChatSummary> {
-    Chat::list(&app.paths, &project)
+    Chat::list_in(&app.paths.data, &project)
 }
 
 #[derive(Serialize)]
@@ -591,11 +597,12 @@ pub struct ChatView {
 
 #[tauri::command]
 pub fn chat_load(app: State<'_, Arc<App>>, project: String, id: String) -> Result<ChatView> {
-    let chat = Chat::load(&app.paths, &project, &id).map_err(err)?;
+    let chat = Chat::load_in(&app.paths.data, &project, &id).map_err(err)?;
     Ok(ChatView { busy: app.chats.busy(&chat.id), chat })
 }
 
 /// Sends a message (in a new chat without `chat`) and returns the chat's id.
+/// If `chat` is currently running, steers it mid-turn.
 #[tauri::command]
 pub async fn chat_send(
     app: State<'_, Arc<App>>,
@@ -617,6 +624,19 @@ pub async fn chat_send(
 }
 
 #[tauri::command]
+pub async fn chat_compact(app: State<'_, Arc<App>>, project: String, chat: String, model: String) -> Result<Option<String>> {
+    superviser_backend::agent::compact(&app, &project, &chat, &model)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub fn chat_fork(app: State<'_, Arc<App>>, project: String, chat: String, keep_messages: usize) -> Result<Chat> {
+    superviser_backend::agent::fork(&app, &project, &chat, keep_messages)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
 pub fn chat_stop(app: State<'_, Arc<App>>, chat: String) {
     app.chats.stop(&chat);
 }
@@ -629,7 +649,7 @@ pub fn chat_answer(app: State<'_, Arc<App>>, chat: String, call: String, allow: 
 #[tauri::command]
 pub fn chat_delete(app: State<'_, Arc<App>>, project: String, id: String) -> Result<()> {
     app.chats.stop_and_delete(&id);
-    Chat::delete(&app.paths, &project, &id).map_err(err)?;
+    Chat::delete_in(&app.paths.data, &project, &id).map_err(err)?;
     app.forget_chat(&project, &id).map_err(err)
 }
 

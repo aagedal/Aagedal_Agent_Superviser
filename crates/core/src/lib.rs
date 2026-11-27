@@ -2,9 +2,9 @@
 //! downloading them from the Hugging Face Hub, running the inference server, and pointing
 //! coding harnesses at the guard.
 
-pub mod agent;
 pub mod awake;
 pub mod catalog;
+pub mod connect;
 pub mod conversations;
 pub mod discover;
 pub mod gguf;

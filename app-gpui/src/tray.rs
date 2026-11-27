@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use muda::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use superviser_backend::{App, LoadState, ServerStatus};
 use superviser_core::installed::Source;
-use superviser_core::sandbox::Isolation;
 use superviser_guard::Verdict;
 use tokio::sync::mpsc;
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -183,22 +182,12 @@ fn build_menu(app: &App) -> Result<Menu> {
     };
     let stop_item = MenuItem::with_id("stop", stop_label, any_active, None);
 
-    let is_running = matches!(status, ServerStatus::Running { .. });
     let projects = app.settings.lock().unwrap().projects.clone();
-    let chat_in_vm = superviser_core::opencode::binary().is_some();
 
     let chat_items: Vec<MenuItem> = projects
         .iter()
         .take(MAX_TRAY_PROJECTS)
-        .map(|p| match p.isolation {
-            Isolation::LinuxVm if !chat_in_vm => MenuItem::with_id(
-                format!("project:{}", p.id),
-                format!("{} (OpenCode, Linux VM)", p.name),
-                is_running,
-                None,
-            ),
-            _ => MenuItem::with_id(format!("chat:{}", p.id), &p.name, true, None),
-        })
+        .map(|p| MenuItem::with_id(format!("chat:{}", p.id), &p.name, true, None))
         .collect();
     let sep_proj = PredefinedMenuItem::separator();
     let choose_item = MenuItem::with_id("choose-project", "New Project from Folder…", true, None);
@@ -217,24 +206,8 @@ fn build_menu(app: &App) -> Result<Menu> {
         &proj_refs,
     )?;
 
-    let opencode_items: Vec<MenuItem> = projects
-        .iter()
-        .take(MAX_TRAY_PROJECTS)
-        .map(|p| MenuItem::with_id(format!("project:{}", p.id), &p.name, is_running, None))
-        .collect();
-    let opencode_refs: Vec<&dyn IsMenuItem> = opencode_items
-        .iter()
-        .map(|i| i as &dyn IsMenuItem)
-        .collect();
-    let in_opencode_sub = Submenu::with_id_and_items(
-        "in-opencode",
-        "Open in OpenCode",
-        cfg!(target_os = "macos") && !opencode_refs.is_empty(),
-        &opencode_refs,
-    )?;
-
     let chat_item = MenuItem::with_id("chat", "Open Chat…", true, None);
-    let opencode_item = MenuItem::with_id("opencode", "Set Up OpenCode", is_running, None);
+    let connect_item = MenuItem::with_id("opencode", "Connect External Harness…", true, None);
     let settings_item = MenuItem::with_id("settings", "Settings…", true, None);
     let setup_item = app
         .needs_setup()
@@ -254,8 +227,7 @@ fn build_menu(app: &App) -> Result<Menu> {
         &PredefinedMenuItem::separator(),
         &code_sub,
         &chat_item,
-        &in_opencode_sub,
-        &opencode_item,
+        &connect_item,
         &settings_item,
         &PredefinedMenuItem::separator(),
         &quit_item,

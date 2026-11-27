@@ -20,7 +20,7 @@ function el(tag, attrs = {}, ...children) {
 // The window shows one chat at a time. Both engines are drawn from the Agent Client
 // Protocol's updates: OpenCode sends them as they are, and the built-in agent's messages
 // are turned into them (see `builtin` below).
-let engine = "opencode"; // or "builtin"
+let engine = "builtin"; // Entropy (Agent Superviser's lean built-in coding harness)
 let projects = [];
 let project = null;
 let session = null; // null: a new chat, made when the first message is sent
@@ -1482,7 +1482,6 @@ function update() {
   const notice = $("notice");
   const reasons = [];
   if (!project) reasons.push(["Make a project first: a folder for the agent to work in.", "New project…", newProject]);
-  else if (project.isolation !== "macos-sandbox" && engine !== "opencode") reasons.push(["The chat runs Linux VM projects with OpenCode, which this build doesn't include.", "Open in OpenCode", () => invoke("open_project", { id: project.id })]);
   if (!models.length) reasons.push(["Download a model to chat.", "Models…", () => invoke("open_window", { name: "settings" })]);
   // Not in the way: sending starts the chat's model.
   const notes = [];
@@ -1598,6 +1597,15 @@ function onBuiltin(event) {
       { optionId: "allow", kind: "allow_once", name: "Allow" },
       { optionId: "deny", kind: "reject_once", name: "Deny" },
     ]);
+  } else if (event.type === "usage") {
+    if (event.size > 0) {
+      usage = { used: event.used, size: event.size };
+      $("usage").textContent = `Chat ${Math.round((event.used / event.size) * 100)}% full`;
+      $("usage").title = `${Math.round(event.used / 1000)}k of ${Math.round(event.size / 1000)}k tokens of the model's context`;
+    }
+  } else if (event.type === "notice") {
+    list().append(el("p", { class: "small muted" }, event.text));
+    scrollDown();
   } else if (event.type === "state") {
     if (event.busy) {
       busy = true;
