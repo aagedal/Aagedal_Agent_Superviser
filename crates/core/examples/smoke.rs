@@ -41,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let mut server = LlamaServer::start(ServerConfig {
         binary: runtime::find_llama_server().expect("llama-server on PATH"),
         model_path: installed.entry_path().unwrap(),
+        mmproj_path: None,
         alias: installed.alias.clone(),
         context: 8192,
         port: runtime::free_port()?,

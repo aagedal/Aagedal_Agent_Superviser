@@ -219,28 +219,39 @@ function renderActivity() {
 function infoButton(...content) {
   const wrap = el("span", { class: "info-wrap" });
   const button = el("button", {
+    type: "button",
     class: "info",
     title: "Details",
     "aria-label": "Details",
+    "aria-expanded": "false",
     onclick: (event) => {
       event.stopPropagation();
       const open = !wrap.classList.contains("open");
       closePopovers();
       wrap.classList.toggle("open", open);
+      button.setAttribute("aria-expanded", String(open));
     },
   }, "i");
   wrap.append(button, el("div", { class: "popover" }, ...content));
   return wrap;
 }
 
-function closePopovers() {
-  for (const open of document.querySelectorAll(".info-wrap.open")) open.classList.remove("open");
+function closePopovers(restoreFocus = false) {
+  for (const open of document.querySelectorAll(".info-wrap.open")) {
+    const hadFocus = open.contains(document.activeElement);
+    open.classList.remove("open");
+    const btn = open.querySelector("button.info");
+    if (btn) {
+      btn.setAttribute("aria-expanded", "false");
+      if (restoreFocus && hadFocus) btn.focus();
+    }
+  }
 }
 document.addEventListener("click", (event) => {
   if (!event.target.closest(".popover")) closePopovers();
 });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closePopovers();
+  if (event.key === "Escape") closePopovers(true);
 });
 
 function modelDetails(model, fit) {

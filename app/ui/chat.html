@@ -8,17 +8,29 @@
 </head>
 <body>
   <div class="chat-app">
-    <aside class="sidebar">
-      <select id="project" title="Project"></select>
-      <button class="primary" id="new-chat">New chat</button>
-      <div class="chat-list" id="chat-list"></div>
+    <aside class="sidebar" aria-label="Chats">
+      <div class="sidebar-top">
+        <input type="search" id="chat-search" placeholder="Search chats…" aria-label="Search chats" autocomplete="off">
+        <button type="button" class="primary small" id="new-chat" title="New chat — choose a project (⌘N)" aria-label="New chat">✎</button>
+      </div>
+      <div class="sidebar-project-row">
+        <div class="filter-chip-slot" id="project-filter-slot"></div>
+        <button type="button" class="small" id="add-project" title="Add a new project folder (⌘⇧O)" aria-label="Add project">+ Project</button>
+        <select id="project" title="Project for new chats" aria-label="Project" hidden></select>
+        <button type="button" class="small scope-btn" id="project-scope" hidden>All</button>
+      </div>
+      <div class="projects-popout" id="projects-popout" hidden>
+        <input type="search" id="projects-popout-search" placeholder="Search projects…" aria-label="Search projects" autocomplete="off">
+        <div class="projects-popout-list" id="projects-popout-list"></div>
+      </div>
+      <div class="chat-list" id="chat-list" role="navigation" aria-label="Chat history"></div>
       <div class="sidebar-foot">
-        <button class="link" id="manage">Projects and settings…</button>
+        <button type="button" class="icon" id="manage" title="Projects &amp; settings (⌘,)" aria-label="Projects and settings">⚙</button>
       </div>
     </aside>
     <div class="chat">
       <header>
-        <div class="chat-title"><strong id="title">New chat</strong> <span class="muted small" id="where"></span></div>
+        <div class="chat-title"><span class="proj-badge" id="header-badge" hidden></span><span class="muted small" id="header-project"></span><strong id="title">New chat</strong> <button type="button" class="icon" id="project-settings-btn" title="Project settings" aria-label="Project settings" hidden>⚙</button></div>
         <span class="muted small"><span id="usage"></span> <span class="chip" id="spec-badge" hidden></span> <select id="chat-model" title="The model this chat uses"></select> <button class="icon" id="unload" title="Unload the model, freeing its memory" hidden>Unload</button> <button class="icon" id="archive" title="Archive this chat: keep it, out of the list" hidden>Archive</button></span>
       </header>
       <div class="git-bar" id="git-bar" hidden>
@@ -39,14 +51,37 @@
       <div class="subagent-inspector" id="subagent-inspector" hidden></div>
       <div class="messages" id="messages"></div>
       <div class="working" id="working" hidden><span class="pulse"></span><span id="working-text">Working…</span></div>
+      <div class="drop-overlay" id="drop-overlay" hidden>
+        <div class="drop-overlay-card">Drop images to attach to this message</div>
+      </div>
+      <div class="pending-images" id="pending-images" hidden></div>
       <div class="banner notice" id="notice" hidden></div>
       <form class="composer" id="composer">
-        <textarea id="input" placeholder="Ask the agent to do something… (Enter to send, Shift+Enter for a new line)"></textarea>
-        <div class="composer-actions">
-          <button class="primary" id="send" type="submit">Send</button>
-          <button class="danger" id="stop" type="button" hidden>Stop</button>
+        <input type="file" id="image-input" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff" multiple hidden>
+        <div class="composer-box">
+          <textarea id="input" placeholder="Ask the agent… Drop/paste images or type / for skills"></textarea>
+          <div class="composer-bar">
+            <button type="button" class="icon attach-btn" id="attach-image" title="Attach image (⌘⇧I, or drag &amp; drop / ⌘V)" aria-label="Attach image">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+            </button>
+            <div class="composer-actions">
+              <button class="primary small" id="send" type="submit">Send</button>
+              <button class="danger small" id="stop" type="button" hidden>Stop</button>
+            </div>
+          </div>
         </div>
       </form>
+    </div>
+  </div>
+  <div class="modal-backdrop" id="new-chat-modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-label="New chat — choose a project">
+      <div class="modal-head">
+        <span class="small muted">New chat</span>
+        <input type="search" id="new-chat-search" placeholder="Search projects…" aria-label="Search projects" autocomplete="off">
+      </div>
+      <div class="modal-section small muted">Choose a project for this new chat</div>
+      <div class="modal-list" id="new-chat-list"></div>
+      <div class="modal-foot small muted">↑ ↓ Navigate &nbsp; Enter Select &nbsp; ⌘1–9 Quick pick &nbsp; Esc Close</div>
     </div>
   </div>
   <script src="chat.js"></script>

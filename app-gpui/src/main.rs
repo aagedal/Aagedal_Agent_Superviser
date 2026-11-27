@@ -26,6 +26,7 @@ use crate::theme::apply_theme;
 use crate::tray::{TrayAction, TrayController};
 use crate::windows::{
     AppGlobals, choose_project_folder, on_window_closed, open_chat, open_settings, open_setup,
+    set_app_icon,
 };
 
 gpui_kit::actions!(
@@ -36,7 +37,34 @@ gpui_kit::actions!(
         MinimizeWindow,
         HideApp,
         OpenSettingsAction,
-        OpenChatAction
+        OpenChatAction,
+        NewChat,
+        AddProject,
+        AttachImage,
+        FocusChatSearch,
+        FocusComposer,
+        PrevChat,
+        NextChat,
+        FocusProjectPicker,
+        FocusModelPicker,
+        FocusReasoningPicker,
+        ArchiveActiveChat,
+        ToggleGitCommit,
+        StopGeneration,
+        ToggleShortcutsHelp,
+        Dismiss,
+        SelectTab1,
+        SelectTab2,
+        SelectTab3,
+        SelectTab4,
+        PrevTab,
+        NextTab,
+        FocusSearch,
+        SelectStep1,
+        SelectStep2,
+        SelectStep3,
+        PrevStep,
+        NextStep,
     ]
 );
 
@@ -72,13 +100,14 @@ fn main() {
     }
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(gpui_kit::assets::AllAssets)
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             gpui_kit::init(cx);
+            set_app_icon();
             apply_theme(None, cx);
 
-            // Standard macOS keyboard shortcuts and native menu bar (Cmd+Q, Cmd+W, Cmd+,, Cmd+H, Cmd+M).
+            // Standard macOS keyboard shortcuts and window-scoped navigation bindings.
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("cmd-w", CloseWindow, None),
@@ -86,6 +115,46 @@ fn main() {
                 KeyBinding::new("cmd-h", HideApp, None),
                 KeyBinding::new("cmd-,", OpenSettingsAction, None),
                 KeyBinding::new("cmd-n", OpenChatAction, None),
+                // Chat window shortcuts
+                KeyBinding::new("cmd-n", NewChat, Some("ChatWindow")),
+                KeyBinding::new("cmd-shift-o", AddProject, Some("ChatWindow")),
+                KeyBinding::new("cmd-shift-i", AttachImage, Some("ChatWindow")),
+                KeyBinding::new("cmd-f", FocusChatSearch, Some("ChatWindow")),
+                KeyBinding::new("cmd-l", FocusComposer, Some("ChatWindow")),
+                KeyBinding::new("cmd-k", FocusComposer, Some("ChatWindow")),
+                KeyBinding::new("cmd-alt-up", PrevChat, Some("ChatWindow")),
+                KeyBinding::new("cmd-[", PrevChat, Some("ChatWindow")),
+                KeyBinding::new("cmd-alt-down", NextChat, Some("ChatWindow")),
+                KeyBinding::new("cmd-]", NextChat, Some("ChatWindow")),
+                KeyBinding::new("cmd-shift-p", FocusProjectPicker, Some("ChatWindow")),
+                KeyBinding::new("cmd-shift-m", FocusModelPicker, Some("ChatWindow")),
+                KeyBinding::new("cmd-shift-r", FocusReasoningPicker, Some("ChatWindow")),
+                KeyBinding::new("cmd-shift-a", ArchiveActiveChat, Some("ChatWindow")),
+                KeyBinding::new("cmd-shift-g", ToggleGitCommit, Some("ChatWindow")),
+                KeyBinding::new("cmd-.", StopGeneration, Some("ChatWindow")),
+                KeyBinding::new("cmd-/", ToggleShortcutsHelp, Some("ChatWindow")),
+                KeyBinding::new("escape", Dismiss, Some("ChatWindow")),
+                // Settings window shortcuts
+                KeyBinding::new("cmd-1", SelectTab1, Some("SettingsWindow")),
+                KeyBinding::new("cmd-2", SelectTab2, Some("SettingsWindow")),
+                KeyBinding::new("cmd-3", SelectTab3, Some("SettingsWindow")),
+                KeyBinding::new("cmd-4", SelectTab4, Some("SettingsWindow")),
+                KeyBinding::new("cmd-shift-[", PrevTab, Some("SettingsWindow")),
+                KeyBinding::new("ctrl-shift-tab", PrevTab, Some("SettingsWindow")),
+                KeyBinding::new("cmd-shift-]", NextTab, Some("SettingsWindow")),
+                KeyBinding::new("ctrl-tab", NextTab, Some("SettingsWindow")),
+                KeyBinding::new("cmd-f", FocusSearch, Some("SettingsWindow")),
+                KeyBinding::new("cmd-/", ToggleShortcutsHelp, Some("SettingsWindow")),
+                KeyBinding::new("escape", Dismiss, Some("SettingsWindow")),
+                // Setup window shortcuts
+                KeyBinding::new("cmd-1", SelectStep1, Some("SetupWindow")),
+                KeyBinding::new("cmd-2", SelectStep2, Some("SetupWindow")),
+                KeyBinding::new("cmd-3", SelectStep3, Some("SetupWindow")),
+                KeyBinding::new("cmd-[", PrevStep, Some("SetupWindow")),
+                KeyBinding::new("alt-left", PrevStep, Some("SetupWindow")),
+                KeyBinding::new("cmd-]", NextStep, Some("SetupWindow")),
+                KeyBinding::new("alt-right", NextStep, Some("SetupWindow")),
+                KeyBinding::new("escape", Dismiss, Some("SetupWindow")),
             ]);
             cx.on_action(|_: &Quit, cx| {
                 cx.quit();
@@ -125,19 +194,47 @@ fn main() {
                     name: "File".into(),
                     disabled: false,
                     items: vec![
+                        MenuItem::action("New Chat", NewChat),
+                        MenuItem::action("Add Project Folder…", AddProject),
                         MenuItem::action("Open Chat", OpenChatAction),
+                        MenuItem::separator(),
                         MenuItem::action("Close Window", CloseWindow),
+                    ],
+                },
+                Menu {
+                    name: "Chat".into(),
+                    disabled: false,
+                    items: vec![
+                        MenuItem::action("Focus Composer", FocusComposer),
+                        MenuItem::separator(),
+                        MenuItem::action("Previous Chat", PrevChat),
+                        MenuItem::action("Next Chat", NextChat),
+                        MenuItem::separator(),
+                        MenuItem::action("Switch Project", FocusProjectPicker),
+                        MenuItem::action("Switch Model", FocusModelPicker),
+                        MenuItem::action("Switch Reasoning", FocusReasoningPicker),
+                        MenuItem::separator(),
+                        MenuItem::action("Commit Changes…", ToggleGitCommit),
+                        MenuItem::action("Archive Chat", ArchiveActiveChat),
+                        MenuItem::action("Stop Generation", StopGeneration),
                     ],
                 },
                 Menu {
                     name: "Window".into(),
                     disabled: false,
-                    items: vec![MenuItem::action("Minimize", MinimizeWindow)],
+                    items: vec![
+                        MenuItem::action("Minimize", MinimizeWindow),
+                        MenuItem::separator(),
+                        MenuItem::action("Keyboard Shortcuts", ToggleShortcutsHelp),
+                    ],
                 },
             ]);
 
-            // Start as menu-bar accessory; opening a window flips to Regular.
-            cx.set_activation_policy(ActivationPolicy::Accessory);
+            // Only start as menu-bar accessory when launched with `--tray-only`;
+            // otherwise stay Regular from the start so the Dock tile isn't torn down and recreated.
+            if tray_only {
+                cx.set_activation_policy(ActivationPolicy::Accessory);
+            }
 
             let (tray, mut tray_rx) = match TrayController::new(&backend) {
                 Ok((tray, rx)) => (Some(tray), Some(rx)),

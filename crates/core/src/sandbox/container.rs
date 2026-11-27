@@ -17,6 +17,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -95,8 +96,11 @@ fn tool_missing() -> bool {
 pub struct LinuxVm;
 
 fn macos_major() -> Option<u32> {
-    let out = std::process::Command::new("/usr/bin/sw_vers").arg("-productVersion").output().ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().split('.').next()?.parse().ok()
+    static VERSION: OnceLock<Option<u32>> = OnceLock::new();
+    *VERSION.get_or_init(|| {
+        let out = std::process::Command::new("/usr/bin/sw_vers").arg("-productVersion").output().ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().split('.').next()?.parse().ok()
+    })
 }
 
 /// Why a project needs macOS's own tools, if it does: an Xcode project or workspace,
@@ -106,7 +110,6 @@ pub fn needs_macos_tools(project: &Path) -> Option<String> {
     while let Some((dir, depth)) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
-            let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.ends_with(".xcodeproj") || name.ends_with(".xcworkspace") {
                 return Some(format!("it has an Xcode project ({name})"));
@@ -115,13 +118,16 @@ pub fn needs_macos_tools(project: &Path) -> Option<String> {
                 return Some("it uses CocoaPods".into());
             }
             if name == "Package.swift"
-                && let Ok(manifest) = std::fs::read_to_string(&path)
+                && let Ok(manifest) = std::fs::read_to_string(entry.path())
                 && APPLE_PLATFORMS.iter().any(|p| manifest.contains(p))
             {
                 return Some("it's a Swift package for Apple platforms".into());
             }
-            if path.is_dir() && depth < 2 && !SKIPPED.contains(&name.as_str()) {
-                stack.push((path, depth + 1));
+            if depth < 2
+                && !SKIPPED.contains(&name.as_str())
+                && entry.file_type().is_ok_and(|t| t.is_dir())
+            {
+                stack.push((entry.path(), depth + 1));
             }
         }
     }

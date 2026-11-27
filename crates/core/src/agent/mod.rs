@@ -68,9 +68,13 @@ impl Chat {
         anyhow::ensure!(valid_id(&self.id), "bad chat id");
         self.updated = now();
         if self.title == "New chat"
-            && let Some(first) = self.messages.iter().find(|m| m["role"] == "user").and_then(|m| m["content"].as_str())
+            && let Some(first) = self
+                .messages
+                .iter()
+                .find(|m| m["role"] == "user")
+                .and_then(|m| user_message_title_source(&m["content"]))
         {
-            self.title = title(first);
+            self.title = title(&first);
         }
         let dir = folder(paths, &self.project)?;
         crate::paths::private_dir(&dir)?;
@@ -103,6 +107,41 @@ impl Chat {
         if let Ok(dir) = folder(paths, project) {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+}
+
+/// Extracts the human-readable title seed from a user message's `content` (string or multimodal array).
+fn user_message_title_source(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => (!s.trim().is_empty()).then(|| s.clone()),
+        Value::Array(parts) => {
+            let text: String = parts
+                .iter()
+                .filter(|p| {
+                    !p.get("superviser_meta").and_then(Value::as_bool).unwrap_or(false)
+                        && matches!(p.get("type").and_then(Value::as_str), Some("text" | "input_text"))
+                })
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text.is_empty() {
+                return Some(text);
+            }
+            let image_count = parts
+                .iter()
+                .filter(|p| matches!(p.get("type").and_then(Value::as_str), Some("image_url" | "input_image" | "image")))
+                .count();
+            if image_count == 1 {
+                Some("Image".into())
+            } else if image_count > 1 {
+                Some(format!("{image_count} images"))
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -193,5 +232,26 @@ mod tests {
         assert!(prompt.contains("`edit`") && !prompt.contains("`bash`"));
         assert!(prompt.contains("Run `make check` before finishing."));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn multimodal_messages_derive_chat_titles() {
+        let with_text = serde_json::json!([
+            {"type": "text", "text": "Why is this button misaligned?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        ]);
+        assert_eq!(
+            user_message_title_source(&with_text).as_deref(),
+            Some("Why is this button misaligned?")
+        );
+        let one_image = serde_json::json!([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        ]);
+        assert_eq!(user_message_title_source(&one_image).as_deref(), Some("Image"));
+        let two_images = serde_json::json!([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,BBBB"}}
+        ]);
+        assert_eq!(user_message_title_source(&two_images).as_deref(), Some("2 images"));
     }
 }

@@ -13,8 +13,8 @@ use gpui_kit::component::theme::{ActiveTheme, ThemeMode};
 use gpui_kit::component::{Disableable, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Context, InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement,
-    Styled, Window, div, px,
+    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use superviser_backend::{AppEvent, DownloadEvent, JUDGE_DOWNLOAD};
 use superviser_core::catalog::Role;
@@ -23,19 +23,32 @@ use superviser_core::installed;
 use crate::backend::Backend;
 use crate::theme::{gib, palette, whole_gib};
 use crate::windows::{AppGlobals, choose_project_folder, open_chat, open_settings};
+use crate::{Dismiss, NextStep, PrevStep, SelectStep1, SelectStep2, SelectStep3};
 
 const STEPS: [&str; 3] = ["Model", "Folder", "Start"];
 
 pub struct SetupWindow {
     backend: Arc<Backend>,
+    focus_handle: FocusHandle,
+    step_focus_handles: [FocusHandle; 3],
     step: usize,
     chosen_model: Option<String>,
     downloads: HashMap<String, (DownloadEvent, Instant)>,
     error: Option<String>,
 }
 
+impl Focusable for SetupWindow {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl SetupWindow {
-    pub fn new(backend: Arc<Backend>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(backend: Arc<Backend>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        let step_focus_handles = [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()];
+        focus_handle.focus(window, cx);
+
         let mut downloads = HashMap::new();
         for dl in backend.app.active_downloads() {
             downloads.insert(dl.id.clone(), (dl, Instant::now()));
@@ -79,10 +92,36 @@ impl SetupWindow {
 
         Self {
             backend,
+            focus_handle,
+            step_focus_handles,
             step: 0,
             chosen_model: None,
             downloads,
             error: None,
+        }
+    }
+
+    fn go_to_step(&mut self, step: usize, cx: &mut Context<Self>) {
+        self.step = step.min(STEPS.len() - 1);
+        cx.notify();
+    }
+
+    fn handle_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        if key == "enter" && (mods.platform || mods.control) {
+            cx.stop_propagation();
+            if self.step < 2 {
+                self.go_to_step(self.step + 1, cx);
+            } else {
+                let projects = self.backend.app.settings.lock().unwrap().projects.clone();
+                let proj_id = projects.first().map(|pr| pr.id.clone());
+                let model_id = self.resolved_model().map(|(id, _, _)| id);
+                let has_downloading = self.downloads.keys().any(|id| id != JUDGE_DOWNLOAD);
+                if proj_id.is_some() && (model_id.is_some() || has_downloading) {
+                    self.finish_setup("chat", proj_id, model_id, window, cx);
+                }
+            }
         }
     }
 
@@ -273,7 +312,7 @@ impl SetupWindow {
 }
 
 impl Render for SetupWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_dark = cx.theme().mode == ThemeMode::Dark;
         let p = palette(is_dark);
 
@@ -339,6 +378,31 @@ impl Render for SetupWindow {
             .size_full()
             .bg(p.bg)
             .text_color(p.text)
+            .track_focus(&self.focus_handle)
+            .key_context("SetupWindow")
+            .on_action(cx.listener(|this, _: &SelectStep1, _, cx| {
+                this.go_to_step(0, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectStep2, _, cx| {
+                this.go_to_step(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectStep3, _, cx| {
+                this.go_to_step(2, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevStep, _, cx| {
+                this.go_to_step(this.step.saturating_sub(1), cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextStep, _, cx| {
+                this.go_to_step((this.step + 1).min(STEPS.len() - 1), cx);
+            }))
+            .on_action(cx.listener(|this, _: &Dismiss, _, cx| {
+                if this.error.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                this.handle_key_down(ev, window, cx);
+            }))
             .child(
                 div().flex_1().min_h_0().w_full().child(
                     div()
@@ -382,8 +446,13 @@ impl Render for SetupWindow {
                                         .children(STEPS.iter().enumerate().map(|(i, label)| {
                                             let is_current = self.step == i;
                                             let (step_bg, step_fg) = step_colors[i];
+                                            let pill_focus = self.step_focus_handles[i].clone();
+                                            let is_focused = pill_focus.is_focused(window);
                                             h_flex()
                                                 .id(("step-pill", i))
+                                                .track_focus(&pill_focus)
+                                                .tab_stop(true)
+                                                .tab_index(0)
                                                 .flex_1()
                                                 .min_w_0()
                                                 .cursor_pointer()
@@ -392,14 +461,65 @@ impl Render for SetupWindow {
                                                 .gap_2()
                                                 .items_center()
                                                 .rounded(px(8.0))
-                                                .border_1()
+                                                .border_2()
                                                 .bg(if is_current { step_bg } else { p.panel })
-                                                .border_color(if is_current { step_bg } else { p.line })
+                                                .border_color(if is_focused {
+                                                    p.accent
+                                                } else if is_current {
+                                                    step_bg
+                                                } else {
+                                                    p.line
+                                                })
                                                 .text_color(if is_current { step_fg } else { p.muted })
                                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.step = i;
-                                                    cx.notify();
+                                                    this.go_to_step(i, cx);
                                                 }))
+                                                .on_key_down(cx.listener(
+                                                    move |this, ev: &KeyDownEvent, window, cx| {
+                                                        let mods = &ev.keystroke.modifiers;
+                                                        if mods.platform || mods.control || mods.alt {
+                                                            return;
+                                                        }
+                                                        match ev.keystroke.key.as_str() {
+                                                            "enter" | "space" => {
+                                                                cx.stop_propagation();
+                                                                this.go_to_step(i, cx);
+                                                            }
+                                                            "left" => {
+                                                                cx.stop_propagation();
+                                                                let prev = if i == 0 {
+                                                                    STEPS.len() - 1
+                                                                } else {
+                                                                    i - 1
+                                                                };
+                                                                this.step_focus_handles[prev]
+                                                                    .focus(window, cx);
+                                                                this.go_to_step(prev, cx);
+                                                            }
+                                                            "right" => {
+                                                                cx.stop_propagation();
+                                                                let next = (i + 1) % STEPS.len();
+                                                                this.step_focus_handles[next]
+                                                                    .focus(window, cx);
+                                                                this.go_to_step(next, cx);
+                                                            }
+                                                            "home" => {
+                                                                cx.stop_propagation();
+                                                                this.step_focus_handles[0]
+                                                                    .focus(window, cx);
+                                                                this.go_to_step(0, cx);
+                                                            }
+                                                            "end" => {
+                                                                cx.stop_propagation();
+                                                                let last = STEPS.len() - 1;
+                                                                this.step_focus_handles[last]
+                                                                    .focus(window, cx);
+                                                                this.go_to_step(last, cx);
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    },
+                                                ))
                                                 .child(
                                                     h_flex()
                                                         .size(px(22.0))

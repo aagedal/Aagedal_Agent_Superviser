@@ -118,6 +118,108 @@ impl Engines {
             .cloned()
     }
 
+    /// Every session currently busy across all running engines, mapped to when the turn started.
+    pub fn all_busy(&self) -> HashMap<String, Instant> {
+        let engines: Vec<Arc<Engine>> = self
+            .running
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|e| e.alive.load(Ordering::SeqCst))
+            .cloned()
+            .collect();
+        let mut out = HashMap::new();
+        for eng in engines {
+            for (sid, since) in eng.busy.lock().unwrap().iter() {
+                out.insert(sid.clone(), *since);
+            }
+        }
+        out
+    }
+
+    /// Lists saved OpenCode sessions across multiple projects without booting dormant Linux VMs
+    /// or spawning a separate macOS-sandbox ACP process for every inactive project.
+    pub async fn sessions_for_projects(
+        &self,
+        app: &App,
+        projects: &[Project],
+        active_project: Option<&str>,
+    ) -> Vec<(String, Result<Value, String>)> {
+        // Pick one macOS-sandbox engine to share `session/list` queries against OpenCode's DB.
+        let mut shared_macos: Option<Arc<Engine>> = {
+            let running = self.running.lock().unwrap();
+            projects
+                .iter()
+                .filter(|p| p.isolation == Isolation::MacosSandbox)
+                .find_map(|p| {
+                    running
+                        .get(&p.id)
+                        .filter(|e| e.alive.load(Ordering::SeqCst))
+                        .cloned()
+                })
+        };
+        if shared_macos.is_none() {
+            let host_proj = active_project
+                .and_then(|id| {
+                    projects
+                        .iter()
+                        .find(|p| p.id == id && p.isolation == Isolation::MacosSandbox)
+                })
+                .or_else(|| {
+                    projects
+                        .iter()
+                        .find(|p| p.isolation == Isolation::MacosSandbox)
+                });
+            if let Some(proj) = host_proj {
+                shared_macos = self.get(app, proj).await.ok();
+            }
+        }
+
+        let mut results = Vec::with_capacity(projects.len());
+        for proj in projects {
+            match proj.isolation {
+                Isolation::MacosSandbox => {
+                    let cwd = std::fs::canonicalize(proj.main())
+                        .unwrap_or_else(|_| proj.main().to_path_buf())
+                        .display()
+                        .to_string();
+                    let res = if let Some(eng) = &shared_macos {
+                        match eng.sessions_for_cwd(&cwd).await {
+                            Ok(val) => Ok(val),
+                            Err(_) => match self.get(app, proj).await {
+                                Ok(own) => own.sessions().await.map_err(|e| format!("{e:#}")),
+                                Err(e) => Err(format!("{e:#}")),
+                            },
+                        }
+                    } else {
+                        match self.get(app, proj).await {
+                            Ok(own) => {
+                                shared_macos = Some(own.clone());
+                                own.sessions().await.map_err(|e| format!("{e:#}"))
+                            }
+                            Err(e) => Err(format!("{e:#}")),
+                        }
+                    };
+                    results.push((proj.id.clone(), res));
+                }
+                Isolation::LinuxVm => {
+                    let is_active = active_project == Some(proj.id.as_str());
+                    if let Some(eng) = self.running(&proj.id).await {
+                        let res = eng.sessions().await.map_err(|e| format!("{e:#}"));
+                        results.push((proj.id.clone(), res));
+                    } else if is_active {
+                        let res = match self.get(app, proj).await {
+                            Ok(eng) => eng.sessions().await.map_err(|e| format!("{e:#}")),
+                            Err(e) => Err(format!("{e:#}")),
+                        };
+                        results.push((proj.id.clone(), res));
+                    }
+                }
+            }
+        }
+        results
+    }
+
     /// Stops one project's engine (e.g. when the project is deleted).
     pub fn stop(&self, project: &str) {
         if let Some(engine) = self.running.lock().unwrap().remove(project) {
@@ -452,7 +554,14 @@ impl Engine {
 
     /// The project's saved sessions, most recent first.
     pub async fn sessions(&self) -> anyhow::Result<Value> {
-        let result = self.request("session/list", json!({ "cwd": self.cwd }), Some(REQUEST_TIMEOUT)).await?;
+        self.sessions_for_cwd(&self.cwd).await
+    }
+
+    /// Saved sessions for `cwd`, most recent first.
+    pub async fn sessions_for_cwd(&self, cwd: &str) -> anyhow::Result<Value> {
+        let result = self
+            .request("session/list", json!({ "cwd": cwd }), Some(REQUEST_TIMEOUT))
+            .await?;
         Ok(result["sessions"].clone())
     }
 
@@ -501,9 +610,27 @@ impl Engine {
         self.busy.lock().unwrap().get(session).copied()
     }
 
-    /// Sends the user's message, to be answered by `model` (the running one's alias); the reply
-    /// arrives as events on `bus`, and the end as a `State` event.
-    pub fn prompt(self: &Arc<Self>, bus: EventBus, session: &str, text: &str, model: &str) -> anyhow::Result<()> {
+    /// Sends the user's message (with optional image attachments and optional local-path metadata
+    /// note), to be answered by `model` (the running one's alias); the reply arrives as events on
+    /// `bus`, and the end as a `State` event.
+    pub fn prompt(
+        self: &Arc<Self>,
+        bus: EventBus,
+        session: &str,
+        text: &str,
+        images: &[crate::attachments::ImageAttachment],
+        image_paths_note: Option<String>,
+        model: &str,
+    ) -> anyhow::Result<()> {
+        if images.len() > crate::attachments::MAX_IMAGES_PER_MESSAGE {
+            bail!("Too many images (max {}).", crate::attachments::MAX_IMAGES_PER_MESSAGE);
+        }
+        for img in images {
+            img.validate()?;
+        }
+        if text.trim().is_empty() && images.is_empty() {
+            bail!("Enter a message or attach an image.");
+        }
         {
             let mut busy = self.busy.lock().unwrap();
             if busy.contains_key(session) {
@@ -523,9 +650,10 @@ impl Engine {
             .lock()
             .unwrap()
             .insert(session.to_string(), model.to_string());
-        let (session, text, model) = (
+        let (session, text, images, model) = (
             session.to_string(),
             text.to_string(),
+            images.to_vec(),
             format!("{}/{model}", opencode::PROVIDER_ID),
         );
         tokio::spawn(async move {
@@ -538,7 +666,23 @@ impl Engine {
                 if let Err(e) = engine.request("session/set_config_option", choose, Some(REQUEST_TIMEOUT)).await {
                     tracing::warn!("choosing {model} for {session}: {e:#}");
                 }
-                let params = json!({ "sessionId": session, "prompt": [{ "type": "text", "text": text }] });
+                let mut prompt_blocks: Vec<Value> = images
+                    .iter()
+                    .map(|img| {
+                        json!({
+                            "type": "image",
+                            "data": img.data_base64,
+                            "mimeType": img.mime_type,
+                        })
+                    })
+                    .collect();
+                if let Some(note) = image_paths_note.filter(|s| !s.is_empty()) {
+                    prompt_blocks.push(json!({ "type": "text", "text": note }));
+                }
+                if !text.is_empty() || prompt_blocks.is_empty() {
+                    prompt_blocks.push(json!({ "type": "text", "text": text }));
+                }
+                let params = json!({ "sessionId": session, "prompt": prompt_blocks });
                 engine.request("session/prompt", params, None).await
             }
             .await;

@@ -6,9 +6,11 @@
 //! - Automatic model loading & room-check confirmation before sending, plus context-usage warning
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::popover::Popover;
@@ -20,11 +22,14 @@ use gpui_kit::component::theme::{ActiveTheme, ThemeMode};
 use gpui_kit::component::{Disableable, IndexPath, Selectable, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Anchor, AppContext, Context, Div, Entity, Hsla, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Render, ScrollHandle, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, Subscription, Window, div, px,
+    Anchor, App, AppContext, ClipboardEntry, ClipboardItem, Context, Div, Entity, ExternalPaths,
+    FocusHandle, Focusable, Hsla, Image, ImageFormat, InteractiveElement, IntoElement,
+    KeyDownEvent, ObjectFit, ParentElement, PathPromptOptions, Pixels, Render, ScrollHandle,
+    SharedString, Stateful, StatefulInteractiveElement, Styled, StyledImage, Subscription, Window,
+    div, img, point, px,
 };
 use serde_json::Value;
+use superviser_backend::attachments::{self, ImageAttachment, MAX_IMAGES_PER_MESSAGE};
 use superviser_backend::explain::{self, TokenKind};
 use superviser_backend::files;
 use superviser_backend::git::{self, GitStatus};
@@ -38,7 +43,12 @@ use superviser_core::sandbox::Isolation;
 
 use crate::backend::Backend;
 use crate::theme::palette;
-use crate::windows::{choose_project_folder, open_settings, open_setup};
+use crate::windows::{choose_project_folder, open_project_settings, open_settings, open_setup};
+use crate::{
+    AddProject, ArchiveActiveChat, AttachImage, Dismiss, FocusChatSearch, FocusComposer,
+    FocusModelPicker, FocusProjectPicker, FocusReasoningPicker, NewChat, NextChat, PrevChat,
+    StopGeneration, ToggleGitCommit, ToggleShortcutsHelp,
+};
 
 /// Share of context window from which we suggest archiving and starting a new chat.
 const LONG_CHAT_RATIO: f64 = 0.6;
@@ -70,7 +80,12 @@ impl SelectItem for PickerOption {
 #[derive(Clone)]
 struct SessionMeta {
     id: String,
+    project_id: String,
+    project_name: String,
+    isolation: Isolation,
     title: String,
+    updated_at: Option<u64>,
+    model_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -115,10 +130,42 @@ struct ToolCallBlock {
 }
 
 #[derive(Clone)]
+struct AttachedImage {
+    id: usize,
+    attachment: ImageAttachment,
+    preview: Option<Arc<Image>>,
+}
+
+impl AttachedImage {
+    fn from_attachment(id: usize, attachment: ImageAttachment) -> Self {
+        let preview = ImageFormat::from_mime_type(&attachment.mime_type).and_then(|format| {
+            let bytes = attachment.decode_bytes().ok()?;
+            Some(Arc::new(Image::from_bytes(format, bytes)))
+        });
+        Self {
+            id,
+            attachment,
+            preview,
+        }
+    }
+
+    fn from_gpui_image(id: usize, image: &Image, name: String) -> anyhow::Result<Self> {
+        let attachment =
+            ImageAttachment::from_bytes(name, image.format.mime_type(), &image.bytes)?;
+        Ok(Self {
+            id,
+            attachment,
+            preview: Some(Arc::new(image.clone())),
+        })
+    }
+}
+
+#[derive(Clone)]
 enum ChatBlock {
     User {
         key: Option<String>,
         text: String,
+        images: Vec<AttachedImage>,
     },
     Thinking {
         id: usize,
@@ -143,6 +190,7 @@ enum ChatBlock {
 struct PendingSend {
     display_text: String,
     prompt_text: String,
+    images: Vec<AttachedImage>,
     model_id: String,
     model_name: String,
     unload_ids: Vec<String>,
@@ -164,16 +212,25 @@ struct SkillEditor {
     desc_input: Entity<InputState>,
     body_input: Entity<TextareaState>,
     editing_original: Option<Skill>,
+    _subs: Vec<Subscription>,
+}
+
+enum SlashMenuItem {
+    Skill(Skill),
+    NewSkill,
+    ListSkills,
 }
 
 enum GitPanel {
     Commit {
         message_input: Entity<InputState>,
+        _sub: Subscription,
     },
     Pr {
         title_input: Entity<InputState>,
         body_input: Entity<TextareaState>,
         draft: bool,
+        _sub: Subscription,
     },
 }
 
@@ -256,25 +313,39 @@ const STARTERS: &[(&str, &str)] = &[
 
 pub struct ChatWindow {
     backend: Arc<Backend>,
+    focus_handle: FocusHandle,
+    session_focus_handles: HashMap<String, FocusHandle>,
     engine: ChatEngine,
     selected_project: Option<String>,
-    project_select: Entity<SelectState<SearchableVec<PickerOption>>>,
-    project_sub: Subscription,
+    filter_project: Option<String>,
+    show_projects_popout: bool,
+    projects_popout_search: Entity<InputState>,
+    _projects_popout_sub: Subscription,
+    projects_popout_selected: usize,
+    show_new_chat_modal: bool,
+    new_chat_search: Entity<InputState>,
+    _new_chat_sub: Subscription,
+    new_chat_selected: usize,
     model_select: Entity<SelectState<SearchableVec<PickerOption>>>,
     model_sub: Subscription,
     reasoning_select: Entity<SelectState<SearchableVec<PickerOption>>>,
     reasoning_sub: Subscription,
     selected_model: Option<String>,
     sessions: Vec<SessionMeta>,
-    archived: HashSet<String>,
+    archived: HashSet<(String, String)>,
     show_archived: bool,
+    sidebar_search: Entity<InputState>,
+    _sidebar_search_sub: Subscription,
     active_session: Option<String>,
     blocks: Vec<ChatBlock>,
     usage: Option<(u64, u64)>, // (used, size)
     starting_note: Option<String>,
     sessions_error: Option<String>,
     pending_send: Option<PendingSend>,
-    confirm_delete_chat: Option<(String, String)>, // (id, title)
+    pending_images: Vec<AttachedImage>,
+    attach_notice: Option<String>,
+    next_image_id: usize,
+    confirm_delete_chat: Option<(String, String, String)>, // (project_id, chat_id, title)
     composer: Entity<TextareaState>,
     scroll_handle: ScrollHandle,
     auto_scroll: bool,
@@ -284,6 +355,8 @@ pub struct ChatWindow {
     working_phase: WorkingPhase,
     working_since_by_session: HashMap<String, Instant>,
     working_phase_by_session: HashMap<String, WorkingPhase>,
+    approval_pending_sessions: HashSet<String>,
+    done_sessions: HashSet<String>,
     creating_session: bool,
     buffered_events: Vec<AppEvent>,
     chat_gen: u64,
@@ -294,6 +367,8 @@ pub struct ChatWindow {
     skills: Vec<Skill>,
     active_skill: Option<Skill>,
     show_slash_menu: bool,
+    slash_selected: usize,
+    slash_dismissed_query: Option<String>,
     show_skills_panel: bool,
     skill_editor: Option<SkillEditor>,
     skill_drafting: bool,
@@ -306,7 +381,14 @@ pub struct ChatWindow {
     git_notice: Option<GitNotice>,
     subagents: Vec<SubagentRecord>,
     inspected_subagent: Option<String>,
+    show_shortcuts_help: bool,
     _composer_sub: Subscription,
+}
+
+impl Focusable for ChatWindow {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 impl ChatWindow {
@@ -316,6 +398,7 @@ impl ChatWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let focus_handle = cx.focus_handle();
         let engine = if opencode::binary().is_some() {
             ChatEngine::OpenCode
         } else {
@@ -327,8 +410,39 @@ impl ChatWindow {
             .filter(|id| projects.iter().any(|p| &p.id == id))
             .or_else(|| projects.first().map(|p| p.id.clone()));
 
-        let (project_select, project_sub) =
-            Self::make_project_select(&backend, selected_project.as_deref(), window, cx);
+        let projects_popout_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search projects…"));
+        let projects_popout_sub = cx.subscribe_in(
+            &projects_popout_search,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    this.projects_popout_selected = 0;
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.confirm_projects_popout_selection(window, cx);
+                }
+                _ => {}
+            },
+        );
+
+        let new_chat_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search projects…"));
+        let new_chat_sub = cx.subscribe_in(
+            &new_chat_search,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    this.new_chat_selected = 0;
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.confirm_new_chat_selection(window, cx);
+                }
+                _ => {}
+            },
+        );
 
         let selected_model = Self::default_model(&backend);
         let (model_select, model_sub) =
@@ -336,14 +450,33 @@ impl ChatWindow {
         let (reasoning_select, reasoning_sub) =
             Self::make_reasoning_select(&backend, selected_model.as_deref(), window, cx);
 
+        let sidebar_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Search chats…")
+        });
+        let sidebar_search_sub = cx.subscribe_in(
+            &sidebar_search,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    let (active, archived) = this.filtered_sessions(cx);
+                    if let Some(first) = active.into_iter().chain(archived).next() {
+                        this.open_session(first.project_id, first.id, window, cx);
+                    }
+                }
+                _ => {}
+            },
+        );
+
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder(
-                    "Ask the agent to do something… Type / for skills (Enter to send, Shift+Enter for a new line)",
-                )
-                .rows(3)
+                .placeholder("Ask the agent… Drop/paste images or type / for skills")
+                .rows(2)
                 .auto_grow(2, 6)
         });
+        composer.update(cx, |s, cx| s.focus(window, cx));
 
         let composer_sub = cx.subscribe_in(
             &composer,
@@ -354,6 +487,14 @@ impl ChatWindow {
                 }
                 InputEvent::Change => {
                     this.show_slash_menu = false;
+                    this.slash_selected = 0;
+                    if let Some(sid) = this.active_session.as_deref() {
+                        this.done_sessions.remove(sid);
+                    }
+                    let val = this.composer.read(cx).value().trim_start().to_string();
+                    if this.slash_dismissed_query.as_deref() != Some(val.as_str()) {
+                        this.slash_dismissed_query = None;
+                    }
                     cx.notify();
                 }
                 _ => {}
@@ -379,7 +520,10 @@ impl ChatWindow {
                     .update(cx, |this, cx| {
                         let any_subagent_running =
                             this.subagents.iter().any(|s| s.state.is_active());
-                        if this.busy || any_subagent_running {
+                        if this.busy
+                            || !this.working_since_by_session.is_empty()
+                            || any_subagent_running
+                        {
                             cx.notify();
                         }
                     })
@@ -393,10 +537,19 @@ impl ChatWindow {
 
         let mut this = Self {
             backend,
+            focus_handle,
+            session_focus_handles: HashMap::new(),
             engine,
             selected_project: selected_project.clone(),
-            project_select,
-            project_sub,
+            filter_project: None,
+            show_projects_popout: false,
+            projects_popout_search,
+            _projects_popout_sub: projects_popout_sub,
+            projects_popout_selected: 0,
+            show_new_chat_modal: false,
+            new_chat_search,
+            _new_chat_sub: new_chat_sub,
+            new_chat_selected: 0,
             model_select,
             model_sub,
             reasoning_select,
@@ -405,12 +558,17 @@ impl ChatWindow {
             sessions: Vec::new(),
             archived: HashSet::new(),
             show_archived: false,
+            sidebar_search,
+            _sidebar_search_sub: sidebar_search_sub,
             active_session: None,
             blocks: Vec::new(),
             usage: None,
             starting_note: None,
             sessions_error: None,
             pending_send: None,
+            pending_images: Vec::new(),
+            attach_notice: None,
+            next_image_id: 1,
             confirm_delete_chat: None,
             composer,
             scroll_handle: ScrollHandle::new(),
@@ -421,6 +579,8 @@ impl ChatWindow {
             working_phase: WorkingPhase::ReadingPrompt,
             working_since_by_session: HashMap::new(),
             working_phase_by_session: HashMap::new(),
+            approval_pending_sessions: HashSet::new(),
+            done_sessions: HashSet::new(),
             creating_session: false,
             buffered_events: Vec::new(),
             chat_gen: 0,
@@ -431,6 +591,8 @@ impl ChatWindow {
             skills: Vec::new(),
             active_skill: None,
             show_slash_menu: false,
+            slash_selected: 0,
+            slash_dismissed_query: None,
             show_skills_panel: false,
             skill_editor: None,
             skill_drafting: false,
@@ -443,6 +605,7 @@ impl ChatWindow {
             git_notice: None,
             subagents: Vec::new(),
             inspected_subagent: None,
+            show_shortcuts_help: false,
             _composer_sub: composer_sub,
         };
 
@@ -454,44 +617,705 @@ impl ChatWindow {
         this
     }
 
-    fn make_project_select(
-        backend: &Backend,
-        selected_id: Option<&str>,
+    pub fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer.update(cx, |s, cx| s.focus(window, cx));
+    }
+
+    fn sync_session_focus_handles(&mut self, cx: &mut Context<Self>) {
+        let valid: HashSet<&str> = self.sessions.iter().map(|s| s.id.as_str()).collect();
+        self.session_focus_handles
+            .retain(|id, _| valid.contains(id.as_str()));
+        for s in &self.sessions {
+            self.session_focus_handles
+                .entry(s.id.clone())
+                .or_insert_with(|| cx.focus_handle());
+        }
+    }
+
+    fn is_archived(&self, project_id: &str, session_id: &str) -> bool {
+        self.archived
+            .contains(&(project_id.to_string(), session_id.to_string()))
+    }
+
+    fn filtered_sessions(&self, cx: &App) -> (Vec<SessionMeta>, Vec<SessionMeta>) {
+        let query = self
+            .sidebar_search
+            .read(cx)
+            .value()
+            .trim()
+            .to_ascii_lowercase();
+        let mut active = Vec::new();
+        let mut archived = Vec::new();
+        for s in &self.sessions {
+            if let Some(filter_pid) = self.filter_project.as_deref()
+                && s.project_id != filter_pid
+            {
+                continue;
+            }
+            if !query.is_empty() {
+                let matches = s.title.to_ascii_lowercase().contains(&query)
+                    || s.project_name.to_ascii_lowercase().contains(&query)
+                    || s.model_name
+                        .as_deref()
+                        .is_some_and(|m| m.to_ascii_lowercase().contains(&query));
+                if !matches {
+                    continue;
+                }
+            }
+            if self.is_archived(&s.project_id, &s.id) {
+                archived.push(s.clone());
+            } else {
+                active.push(s.clone());
+            }
+        }
+        (active, archived)
+    }
+
+    fn visible_sessions(&self, cx: &App) -> Vec<SessionMeta> {
+        let (mut active, archived) = self.filtered_sessions(cx);
+        let archived_expanded = self.show_archived
+            || archived
+                .iter()
+                .any(|s| self.active_session.as_deref() == Some(s.id.as_str()));
+        if archived_expanded {
+            active.extend(archived);
+        }
+        active
+    }
+
+    fn switch_adjacent_chat(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let visible = self.visible_sessions(cx);
+        if visible.is_empty() {
+            return;
+        }
+        let next_idx = match self
+            .active_session
+            .as_deref()
+            .and_then(|id| visible.iter().position(|x| x.id == id))
+        {
+            Some(cur) => {
+                let len = visible.len() as isize;
+                ((cur as isize + delta).rem_euclid(len)) as usize
+            }
+            None => {
+                if delta >= 0 {
+                    0
+                } else {
+                    visible.len() - 1
+                }
+            }
+        };
+        if let Some(target) = visible.get(next_idx).cloned() {
+            self.open_session(target.project_id, target.id, window, cx);
+        }
+    }
+
+    fn focus_adjacent_session_row(
+        &self,
+        current_id: &str,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let visible = self.visible_sessions(cx);
+        if visible.is_empty() {
+            return;
+        }
+        let Some(cur) = visible.iter().position(|s| s.id == current_id) else {
+            return;
+        };
+        let len = visible.len() as isize;
+        let next = ((cur as isize + delta).rem_euclid(len)) as usize;
+        if let Some(fh) = self.session_focus_handles.get(&visible[next].id) {
+            fh.focus(window, cx);
+        }
+    }
+
+    fn focus_edge_session_row(&self, first: bool, window: &mut Window, cx: &mut App) {
+        let visible = self.visible_sessions(cx);
+        let target = if first { visible.first() } else { visible.last() };
+        if let Some(s) = target
+            && let Some(fh) = self.session_focus_handles.get(&s.id)
+        {
+            fh.focus(window, cx);
+        }
+    }
+
+    fn active_slash_query(&self, cx: &App) -> Option<String> {
+        if self.skill_editor.is_some() || self.show_skills_panel {
+            return None;
+        }
+        let composer_text = self.composer.read(cx).value().to_string();
+        let trimmed = composer_text.trim_start();
+        if trimmed.starts_with('/') && !trimmed.contains(char::is_whitespace) {
+            if self.slash_dismissed_query.as_deref() == Some(trimmed) {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        } else if self.show_slash_menu {
+            Some("/".to_string())
+        } else {
+            None
+        }
+    }
+
+    fn slash_menu_items(&self, query: &str) -> Vec<SlashMenuItem> {
+        let q = query.trim_start_matches('/').to_ascii_lowercase();
+        let mut items: Vec<SlashMenuItem> = self
+            .skills
+            .iter()
+            .filter(|s| {
+                q.is_empty()
+                    || s.name.contains(&q)
+                    || s.description.to_ascii_lowercase().contains(&q)
+            })
+            .cloned()
+            .map(SlashMenuItem::Skill)
+            .collect();
+        if q.is_empty() || "new-skill".contains(&q) || "create-skill".contains(&q) {
+            items.push(SlashMenuItem::NewSkill);
+        }
+        if q.is_empty() || "skills".contains(&q) {
+            items.push(SlashMenuItem::ListSkills);
+        }
+        items
+    }
+
+    fn activate_slash_item(
+        &mut self,
+        item: SlashMenuItem,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> (
-        Entity<SelectState<SearchableVec<PickerOption>>>,
-        Subscription,
     ) {
-        let projects = backend.app.settings.lock().unwrap().projects.clone();
-        let options: Vec<PickerOption> = if projects.is_empty() {
-            vec![PickerOption {
-                id: String::new(),
-                label: "No projects yet".into(),
-            }]
+        if self.composer.read(cx).value().trim_start().starts_with('/') {
+            self.composer
+                .update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        self.show_slash_menu = false;
+        self.slash_selected = 0;
+        self.slash_dismissed_query = None;
+        match item {
+            SlashMenuItem::Skill(skill) => {
+                self.active_skill = Some(skill);
+                self.focus_composer(window, cx);
+                cx.notify();
+            }
+            SlashMenuItem::NewSkill => {
+                self.open_skill_editor(None, "", "", window, cx);
+            }
+            SlashMenuItem::ListSkills => {
+                self.refresh_skills();
+                self.show_skills_panel = true;
+                self.skill_editor = None;
+                cx.notify();
+            }
+        }
+    }
+
+    fn is_any_text_input_focused(&self, window: &Window, cx: &App) -> bool {
+        if self.composer.read(cx).focus_handle(cx).is_focused(window)
+            || self
+                .sidebar_search
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+            || self
+                .projects_popout_search
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+            || self
+                .new_chat_search
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            return true;
+        }
+        if let Some(ed) = &self.skill_editor
+            && (ed.name_input.read(cx).focus_handle(cx).is_focused(window)
+                || ed.desc_input.read(cx).focus_handle(cx).is_focused(window)
+                || ed.body_input.read(cx).focus_handle(cx).is_focused(window))
+        {
+            return true;
+        }
+        match &self.git_panel {
+            Some(GitPanel::Commit { message_input, .. }) => {
+                message_input.read(cx).focus_handle(cx).is_focused(window)
+            }
+            Some(GitPanel::Pr {
+                title_input,
+                body_input,
+                ..
+            }) => {
+                title_input.read(cx).focus_handle(cx).is_focused(window)
+                    || body_input.read(cx).focus_handle(cx).is_focused(window)
+            }
+            None => false,
+        }
+    }
+
+    fn scroll_messages_by_pages(&mut self, delta_pages: f32) {
+        let bounds = self.scroll_handle.bounds();
+        let step = (bounds.size.height * 0.8).max(px(160.0)) * delta_pages;
+        let cur = self.scroll_handle.offset();
+        let max = self.scroll_handle.max_offset();
+        let next_y = (cur.y - step).clamp(-max.y, px(0.0));
+        self.scroll_handle.set_offset(point(cur.x, next_y));
+        self.auto_scroll = (max.y + next_y) <= px(16.0);
+        self.last_offset_y = next_y;
+    }
+
+    fn scroll_messages_to_top(&mut self) {
+        let cur = self.scroll_handle.offset();
+        self.scroll_handle.set_offset(point(cur.x, px(0.0)));
+        self.auto_scroll = self.scroll_handle.max_offset().y <= px(0.0);
+        self.last_offset_y = px(0.0);
+    }
+
+    fn respond_pending_permission(&mut self, allow: bool, cx: &mut Context<Self>) -> bool {
+        let found = self.blocks.iter().find_map(|b| match b {
+            ChatBlock::ToolCall(tc) => {
+                let pending = tc.approval.as_ref()?;
+                let opt = if allow {
+                    pending
+                        .options
+                        .iter()
+                        .find(|o| o.kind == "allow_once")
+                        .or_else(|| pending.options.first())
+                } else {
+                    pending
+                        .options
+                        .iter()
+                        .find(|o| o.kind == "reject_once" || o.kind == "reject_always")
+                        .or_else(|| pending.options.last())
+                }?;
+                Some((tc.id, pending.request_id.clone(), opt.clone()))
+            }
+            _ => None,
+        });
+        if let Some((block_id, req_id, opt)) = found {
+            self.answer_permission(block_id, req_id, opt, cx);
+            true
         } else {
-            projects
-                .into_iter()
-                .map(|p| PickerOption {
-                    id: p.id,
-                    label: p.name.into(),
-                })
-                .collect()
-        };
-        let idx = selected_id
-            .and_then(|id| options.iter().position(|o| o.id == id))
-            .map(IndexPath::new);
-        let select = cx.new(|cx| SelectState::new(SearchableVec::new(options), idx, window, cx));
-        let sub = cx.subscribe_in(
-            &select,
-            window,
-            |this, _, event: &SelectEvent<SearchableVec<PickerOption>>, window, cx| {
-                if let SelectEvent::Confirm(Some(project_id)) = event {
-                    this.select_project(project_id.clone(), window, cx);
+            false
+        }
+    }
+
+    fn handle_capture_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+
+        // -2. New Chat project-picker modal navigation.
+        if self.show_new_chat_modal {
+            let query = self.new_chat_search.read(cx).value().to_string();
+            let projects = self.ordered_projects(&query);
+            let total = projects.len() + 1; // +1 for "+ Add new project…"
+            if (mods.platform || mods.control)
+                && !mods.shift
+                && !mods.alt
+                && let Some(digit) = key.chars().next().filter(|c| key.len() == 1 && ('1'..='9').contains(c))
+            {
+                let idx = (digit as usize) - ('1' as usize);
+                if let Some(proj) = projects.get(idx) {
+                    cx.stop_propagation();
+                    self.start_new_chat_in_project(proj.id.clone(), window, cx);
+                    return;
                 }
-            },
-        );
-        (select, sub)
+            }
+            if !mods.platform && !mods.control && !mods.alt {
+                match key {
+                    "down" if total > 0 => {
+                        self.new_chat_selected = (self.new_chat_selected + 1) % total;
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    "up" if total > 0 => {
+                        self.new_chat_selected = if self.new_chat_selected == 0 {
+                            total - 1
+                        } else {
+                            self.new_chat_selected - 1
+                        };
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    "enter" => {
+                        cx.stop_propagation();
+                        self.confirm_new_chat_selection(window, cx);
+                        return;
+                    }
+                    "escape" => {
+                        cx.stop_propagation();
+                        self.close_new_chat_modal(window, cx);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // -1. Projects filter popout navigation.
+        if self.show_projects_popout {
+            let query = self.projects_popout_search.read(cx).value().to_string();
+            let projects = self.ordered_projects(&query);
+            let total = projects.len() + 2; // 0: + Add project, 1: All projects, 2..: projects
+            if !mods.platform && !mods.control && !mods.alt {
+                match key {
+                    "down" if total > 0 => {
+                        self.projects_popout_selected =
+                            (self.projects_popout_selected + 1) % total;
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    "up" if total > 0 => {
+                        self.projects_popout_selected = if self.projects_popout_selected == 0 {
+                            total - 1
+                        } else {
+                            self.projects_popout_selected - 1
+                        };
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    "enter" => {
+                        cx.stop_propagation();
+                        self.confirm_projects_popout_selection(window, cx);
+                        return;
+                    }
+                    "escape" => {
+                        cx.stop_propagation();
+                        self.close_projects_popout(window, cx);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // 0. Arrow-down from sidebar search moves focus directly to the first matching chat card.
+        if key == "down"
+            && !mods.platform
+            && !mods.control
+            && !mods.alt
+            && self
+                .sidebar_search
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            self.focus_edge_session_row(true, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        // 1. Slash command autocomplete navigation while menu is open.
+        if let Some(query) = self.active_slash_query(cx) {
+            let items = self.slash_menu_items(&query);
+            if !mods.platform && !mods.control && !mods.alt {
+                match key {
+                    "down" if !items.is_empty() => {
+                        self.slash_selected = (self.slash_selected + 1) % items.len();
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    "up" if !items.is_empty() => {
+                        self.slash_selected = if self.slash_selected == 0 {
+                            items.len() - 1
+                        } else {
+                            self.slash_selected - 1
+                        };
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    "tab" | "enter" if !mods.shift && !items.is_empty() => {
+                        let idx = self.slash_selected.min(items.len() - 1);
+                        let chosen = items.into_iter().nth(idx).unwrap();
+                        cx.stop_propagation();
+                        self.activate_slash_item(chosen, window, cx);
+                        return;
+                    }
+                    "escape" => {
+                        self.show_slash_menu = false;
+                        self.slash_dismissed_query = Some(query);
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // 2. Cmd+Enter / Ctrl+Enter panel & confirmation submission shortcuts.
+        if (mods.platform || mods.control) && key == "enter" {
+            if self.skill_editor.is_some() {
+                cx.stop_propagation();
+                self.save_skill_editor(window, cx);
+                return;
+            }
+            if matches!(self.git_panel, Some(GitPanel::Commit { .. })) {
+                let can_push = self
+                    .git_status
+                    .as_ref()
+                    .is_some_and(|s| s.has_remote && !s.detached);
+                cx.stop_propagation();
+                self.submit_commit(can_push, cx);
+                return;
+            }
+            if matches!(self.git_panel, Some(GitPanel::Pr { .. })) {
+                cx.stop_propagation();
+                self.submit_pr(cx);
+                return;
+            }
+            if let Some(pending) = self.pending_send.take() {
+                cx.stop_propagation();
+                self.composer.update(cx, |s, cx| s.set_value("", window, cx));
+                self.pending_images.clear();
+                self.attach_notice = None;
+                self.dispatch_send(
+                    pending.display_text,
+                    pending.prompt_text,
+                    pending.images,
+                    pending.model_id,
+                    pending.unload_ids,
+                    window,
+                    cx,
+                );
+                return;
+            }
+            if self.skill_editor.is_none()
+                && self.git_panel.is_none()
+                && self.composer.read(cx).value().trim().is_empty()
+                && self.respond_pending_permission(true, cx)
+            {
+                cx.stop_propagation();
+                return;
+            }
+        }
+
+        // 3. Cmd+Backspace denies a pending permission prompt when composer is empty.
+        if (mods.platform || mods.control)
+            && key == "backspace"
+            && self.skill_editor.is_none()
+            && self.git_panel.is_none()
+            && self.composer.read(cx).value().trim().is_empty()
+            && self.respond_pending_permission(false, cx)
+        {
+            cx.stop_propagation();
+        }
+    }
+
+    fn handle_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_new_chat_modal {
+            self.close_new_chat_modal(window, cx);
+        } else if self.show_projects_popout {
+            self.close_projects_popout(window, cx);
+        } else if self.show_shortcuts_help {
+            self.show_shortcuts_help = false;
+            self.focus_composer(window, cx);
+            cx.notify();
+        } else if self
+            .sidebar_search
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+            || !self.sidebar_search.read(cx).value().trim().is_empty()
+        {
+            self.sidebar_search
+                .update(cx, |s, cx| s.set_value("", window, cx));
+            self.focus_composer(window, cx);
+            cx.notify();
+        } else if self.skill_editor.is_some() {
+            self.skill_editor = None;
+            self.skill_notice = None;
+            self.focus_composer(window, cx);
+            cx.notify();
+        } else if self.show_skills_panel {
+            self.show_skills_panel = false;
+            self.focus_composer(window, cx);
+            cx.notify();
+        } else if self.git_panel.is_some() {
+            self.git_panel = None;
+            self.focus_composer(window, cx);
+            cx.notify();
+        } else if self.inspected_subagent.is_some() {
+            self.inspected_subagent = None;
+            self.focus_composer(window, cx);
+            cx.notify();
+        } else if self.confirm_delete_chat.take().is_some() || self.pending_send.take().is_some() {
+            self.focus_composer(window, cx);
+            cx.notify();
+        } else if self.attach_notice.take().is_some() {
+            cx.notify();
+        } else if self.active_skill.is_some() && self.composer.read(cx).value().trim().is_empty() {
+            self.active_skill = None;
+            cx.notify();
+        } else if self.busy && self.composer.read(cx).value().trim().is_empty() {
+            self.stop_current(cx);
+        }
+    }
+
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+
+        // Scroll message stream via PageUp/PageDown (and Home/End when not editing text).
+        let text_focused = self.is_any_text_input_focused(window, cx);
+        if !text_focused
+            && (mods.platform || mods.control)
+            && !mods.alt
+            && key == "v"
+            && let Some(item) = cx.read_from_clipboard()
+            && self.attach_clipboard_item(&item, window, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
+        if !mods.platform && !mods.control {
+            match key {
+                "pageup" if !text_focused || mods.alt => {
+                    self.scroll_messages_by_pages(-1.0);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+                "pagedown" if !text_focused || mods.alt => {
+                    self.scroll_messages_by_pages(1.0);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+                "home" if !text_focused && !mods.alt => {
+                    self.scroll_messages_to_top();
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+                "end" if !text_focused && !mods.alt => {
+                    self.jump_to_bottom();
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn ordered_projects(&self, query: &str) -> Vec<superviser_core::project::Project> {
+        let mut projects = self.backend.app.settings.lock().unwrap().projects.clone();
+        if let Some(cur) = self.selected_project.as_deref()
+            && let Some(pos) = projects.iter().position(|p| p.id == cur)
+        {
+            let current = projects.remove(pos);
+            projects.insert(0, current);
+        }
+        let q = query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return projects;
+        }
+        projects
+            .into_iter()
+            .filter(|p| {
+                p.name.to_ascii_lowercase().contains(&q)
+                    || p.main().display().to_string().to_ascii_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
+    fn open_projects_popout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_new_chat_modal = false;
+        self.show_projects_popout = true;
+        self.projects_popout_selected = 1; // highlight "All projects" by default
+        self.projects_popout_search.update(cx, |s, cx| {
+            s.set_value("", window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn close_projects_popout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_projects_popout = false;
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+
+    fn confirm_projects_popout_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.projects_popout_search.read(cx).value().to_string();
+        let projects = self.ordered_projects(&query);
+        let idx = self.projects_popout_selected;
+        if idx == 0 {
+            self.show_projects_popout = false;
+            cx.notify();
+            choose_project_folder("Add a project folder", true, cx);
+        } else if idx == 1 {
+            self.filter_project = None;
+            self.close_projects_popout(window, cx);
+        } else if let Some(proj) = projects.get(idx - 2) {
+            self.filter_project = Some(proj.id.clone());
+            self.close_projects_popout(window, cx);
+        }
+    }
+
+    fn open_new_chat_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let has_projects = !self.backend.app.settings.lock().unwrap().projects.is_empty();
+        if !has_projects {
+            choose_project_folder("Add a project folder", true, cx);
+            return;
+        }
+        self.show_projects_popout = false;
+        self.show_new_chat_modal = true;
+        self.new_chat_selected = 0;
+        self.new_chat_search.update(cx, |s, cx| {
+            s.set_value("", window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn close_new_chat_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_new_chat_modal = false;
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+
+    fn confirm_new_chat_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.new_chat_search.read(cx).value().to_string();
+        let projects = self.ordered_projects(&query);
+        if let Some(proj) = projects.get(self.new_chat_selected) {
+            self.start_new_chat_in_project(proj.id.clone(), window, cx);
+        } else {
+            self.show_new_chat_modal = false;
+            cx.notify();
+            choose_project_folder("Add a project folder", true, cx);
+        }
+    }
+
+    fn start_new_chat_in_project(
+        &mut self,
+        project_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_new_chat_modal = false;
+        if self.selected_project.as_deref() != Some(project_id.as_str()) {
+            self.select_project(project_id, window, cx);
+        } else {
+            self.show_chat(None, window, cx);
+        }
+        self.focus_composer(window, cx);
     }
 
     fn make_model_select(
@@ -662,10 +1486,13 @@ impl ChatWindow {
         {
             self.selected_project = projects.first().map(|p| p.id.clone());
         }
-        let (select, sub) =
-            Self::make_project_select(&self.backend, self.selected_project.as_deref(), window, cx);
-        self.project_select = select;
-        self.project_sub = sub;
+        if self
+            .filter_project
+            .as_ref()
+            .is_some_and(|id| !projects.iter().any(|p| &p.id == id))
+        {
+            self.filter_project = None;
+        }
         if self.selected_project != prev {
             self.git_panel = None;
             self.git_notice = None;
@@ -727,10 +1554,6 @@ impl ChatWindow {
             return;
         }
         self.selected_project = Some(project_id);
-        let (select, sub) =
-            Self::make_project_select(&self.backend, self.selected_project.as_deref(), window, cx);
-        self.project_select = select;
-        self.project_sub = sub;
         self.git_panel = None;
         self.git_notice = None;
         self.git_status = None;
@@ -740,19 +1563,42 @@ impl ChatWindow {
         self.refresh_git(true, cx);
     }
 
+    fn open_session(
+        &mut self,
+        project_id: String,
+        session_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.done_sessions.remove(&session_id);
+        if self.selected_project.as_deref() != Some(project_id.as_str()) {
+            self.selected_project = Some(project_id);
+            self.git_panel = None;
+            self.git_notice = None;
+            self.git_status = None;
+            self.refresh_skills();
+            self.refresh_git(true, cx);
+        }
+        self.show_chat(Some(session_id), window, cx);
+    }
+
     fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
-        let Some(pid) = self.selected_project.clone() else {
+        let projects = self.backend.app.settings.lock().unwrap().projects.clone();
+        if projects.is_empty() {
             self.sessions.clear();
             self.archived.clear();
             self.starting_note = None;
             self.sessions_error = None;
             cx.notify();
             return;
-        };
+        }
         self.list_gen += 1;
         let mine = self.list_gen;
-        let project = self.backend.app.project(&pid);
-        if project.as_ref().is_some_and(|p| p.isolation == Isolation::LinuxVm)
+        let active_project = self.selected_project.clone();
+        if active_project
+            .as_deref()
+            .and_then(|pid| projects.iter().find(|p| p.id == pid))
+            .is_some_and(|p| p.isolation == Isolation::LinuxVm)
             && self.sessions.is_empty()
         {
             self.starting_note = Some("Starting the Linux VM…".into());
@@ -761,71 +1607,135 @@ impl ChatWindow {
 
         let app = self.backend.app.clone();
         let engine = self.engine;
-        let pid_task = pid.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.backend.tokio.spawn(async move {
-            let res: Result<(Vec<SessionMeta>, HashSet<String>), String> = async {
-                let archived: HashSet<String> = app.archived_chats(&pid_task).into_iter().collect();
-                let list = match engine {
-                    ChatEngine::OpenCode => {
-                        let proj = app
-                            .project(&pid_task)
-                            .ok_or_else(|| "that project no longer exists".to_string())?;
-                        let eng = app
-                            .engines
-                            .get(&app, &proj)
-                            .await
-                            .map_err(|e| format!("{e:#}"))?;
-                        let raw = eng.sessions().await.map_err(|e| format!("{e:#}"))?;
-                        raw.as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|s| {
-                                let id = s["sessionId"].as_str()?.to_string();
-                                let raw_title = s["title"].as_str().unwrap_or("");
-                                let title = if raw_title.starts_with("New session - ")
-                                    || raw_title.is_empty()
-                                {
-                                    "New chat".to_string()
-                                } else {
-                                    raw_title.to_string()
-                                };
-                                Some(SessionMeta { id, title })
-                            })
-                            .collect()
-                    }
-                    ChatEngine::Builtin => Chat::list(&app.paths, &pid_task)
-                        .into_iter()
-                        .map(|c| SessionMeta {
-                            id: c.id,
-                            title: c.title,
-                        })
-                        .collect(),
-                };
-                Ok((list, archived))
+            let mut archived: HashSet<(String, String)> = HashSet::new();
+            for proj in &projects {
+                for cid in app.archived_chats(&proj.id) {
+                    archived.insert((proj.id.clone(), cid));
+                }
             }
-            .await;
-            let _ = tx.send(res);
+            let installed_names: HashMap<String, String> = app
+                .installed()
+                .into_iter()
+                .map(|m| (m.id, m.model.name))
+                .collect();
+            let mut sessions: Vec<SessionMeta> = Vec::new();
+            let mut first_error: Option<String> = None;
+
+            match engine {
+                ChatEngine::OpenCode => {
+                    let per_proj = app
+                        .engines
+                        .sessions_for_projects(&app, &projects, active_project.as_deref())
+                        .await;
+                    for (pid, res) in per_proj {
+                        let Some(proj) = projects.iter().find(|p| p.id == pid) else {
+                            continue;
+                        };
+                        match res {
+                            Ok(raw) => {
+                                for s in raw.as_array().into_iter().flatten() {
+                                    let Some(id) = s["sessionId"].as_str().map(str::to_string)
+                                    else {
+                                        continue;
+                                    };
+                                    let raw_title = s["title"].as_str().unwrap_or("");
+                                    let title = if raw_title.starts_with("New session - ")
+                                        || raw_title.is_empty()
+                                    {
+                                        "New chat".to_string()
+                                    } else {
+                                        raw_title.to_string()
+                                    };
+                                    let updated_at = parse_session_timestamp(s);
+                                    let model_name = app.chat_model(&pid, &id).and_then(|mid| {
+                                        installed_names.get(&mid).cloned()
+                                    });
+                                    sessions.push(SessionMeta {
+                                        id,
+                                        project_id: pid.clone(),
+                                        project_name: proj.name.clone(),
+                                        isolation: proj.isolation,
+                                        title,
+                                        updated_at,
+                                        model_name,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                if active_project.as_deref() == Some(pid.as_str())
+                                    || first_error.is_none()
+                                {
+                                    first_error = Some(e);
+                                }
+                            }
+                        }
+                    }
+                }
+                ChatEngine::Builtin => {
+                    for proj in &projects {
+                        for c in Chat::list(&app.paths, &proj.id) {
+                            let model_name = app
+                                .chat_model(&proj.id, &c.id)
+                                .and_then(|mid| installed_names.get(&mid).cloned());
+                            sessions.push(SessionMeta {
+                                id: c.id,
+                                project_id: proj.id.clone(),
+                                project_name: proj.name.clone(),
+                                isolation: proj.isolation,
+                                title: c.title,
+                                updated_at: (c.updated > 0).then_some(c.updated),
+                                model_name,
+                            });
+                        }
+                    }
+                }
+            }
+
+            let busy_map = match engine {
+                ChatEngine::OpenCode => app.engines.all_busy(),
+                ChatEngine::Builtin => sessions
+                    .iter()
+                    .filter_map(|s| {
+                        app.chats
+                            .busy_since(&s.id)
+                            .map(|since| (s.id.clone(), since))
+                    })
+                    .collect(),
+            };
+
+            // Keep busy sessions near the top, then most recently updated across all projects.
+            sessions.sort_by(|a, b| {
+                let a_busy = busy_map.contains_key(&a.id);
+                let b_busy = busy_map.contains_key(&b.id);
+                b_busy
+                    .cmp(&a_busy)
+                    .then_with(|| b.updated_at.unwrap_or(0).cmp(&a.updated_at.unwrap_or(0)))
+            });
+
+            let err = if sessions.is_empty() {
+                first_error
+            } else {
+                None
+            };
+            let _ = tx.send((sessions, archived, busy_map, err));
         });
 
         cx.spawn(async move |this, cx| {
-            let Ok(result) = rx.await else {
+            let Ok((sessions, archived, busy_map, err)) = rx.await else {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
-                if this.list_gen != mine || this.selected_project.as_deref() != Some(pid.as_str()) {
+                if this.list_gen != mine {
                     return;
                 }
                 this.starting_note = None;
-                match result {
-                    Ok((sessions, archived)) => {
-                        this.sessions = sessions;
-                        this.archived = archived;
-                        this.sessions_error = None;
-                    }
-                    Err(e) => {
-                        this.sessions_error = Some(e);
-                    }
+                this.sessions = sessions;
+                this.archived = archived;
+                this.sessions_error = err;
+                for (sid, since) in busy_map {
+                    this.working_since_by_session.entry(sid).or_insert(since);
                 }
                 cx.notify();
             });
@@ -844,6 +1754,8 @@ impl ChatWindow {
         self.working_since = None;
         self.working_phase = WorkingPhase::ReadingPrompt;
         self.pending_send = None;
+        self.pending_images.clear();
+        self.attach_notice = None;
         self.confirm_delete_chat = None;
         self.inspected_subagent = None;
         self.subagents = match (&self.selected_project, &session_id) {
@@ -882,9 +1794,11 @@ impl ChatWindow {
         }
 
         let (Some(pid), Some(sid)) = (self.selected_project.clone(), session_id) else {
+            self.focus_composer(window, cx);
             cx.notify();
             return;
         };
+        self.focus_composer(window, cx);
 
         let app = self.backend.app.clone();
         let engine = self.engine;
@@ -969,11 +1883,19 @@ impl ChatWindow {
         .detach();
     }
 
-    fn archive_chat(&mut self, chat_id: String, archive: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pid) = self.selected_project.clone() else {
-            return;
-        };
-        if let Err(e) = self.backend.app.set_chat_archived(&pid, &chat_id, archive) {
+    fn archive_chat(
+        &mut self,
+        project_id: String,
+        chat_id: String,
+        archive: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = self
+            .backend
+            .app
+            .set_chat_archived(&project_id, &chat_id, archive)
+        {
             self.blocks.push(ChatBlock::StatusNote {
                 text: format!("{e:#}"),
                 is_error: true,
@@ -981,21 +1903,26 @@ impl ChatWindow {
             cx.notify();
             return;
         }
+        let key = (project_id, chat_id.clone());
         if archive {
-            self.archived.insert(chat_id.clone());
+            self.archived.insert(key);
             if self.active_session.as_deref() == Some(chat_id.as_str()) {
                 self.show_chat(None, window, cx);
             }
         } else {
-            self.archived.remove(&chat_id);
+            self.archived.remove(&key);
         }
         cx.notify();
     }
 
-    fn delete_chat(&mut self, chat_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pid) = self.selected_project.clone() else {
-            return;
-        };
+    fn delete_chat(
+        &mut self,
+        project_id: String,
+        chat_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pid = project_id;
         self.confirm_delete_chat = None;
         let was_active = self.active_session.as_deref() == Some(chat_id.as_str());
         if was_active {
@@ -1038,6 +1965,138 @@ impl ChatWindow {
             });
         })
         .detach();
+    }
+
+    fn alloc_image_id(&mut self) -> usize {
+        let id = self.next_image_id;
+        self.next_image_id += 1;
+        id
+    }
+
+    fn attach_image_paths(
+        &mut self,
+        paths: &[PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut added = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        for path in paths {
+            if self.pending_images.len() >= MAX_IMAGES_PER_MESSAGE {
+                errors.push(format!("Maximum {MAX_IMAGES_PER_MESSAGE} images per message."));
+                break;
+            }
+            match ImageAttachment::from_path(path) {
+                Ok(att) => {
+                    let id = self.alloc_image_id();
+                    self.pending_images
+                        .push(AttachedImage::from_attachment(id, att));
+                    added += 1;
+                }
+                Err(e) => errors.push(format!("{e:#}")),
+            }
+        }
+        self.attach_notice = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join(" · "))
+        };
+        if added > 0 {
+            self.focus_composer(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn attach_clipboard_item(
+        &mut self,
+        item: &ClipboardItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut attached_any = false;
+        let mut errors: Vec<String> = Vec::new();
+
+        // 1. Direct clipboard image (e.g. macOS screenshot via ⌘⌃⇧4 or Copy Image).
+        for entry in item.entries() {
+            if let ClipboardEntry::Image(gpui_img) = entry {
+                if self.pending_images.len() >= MAX_IMAGES_PER_MESSAGE {
+                    errors.push(format!("Maximum {MAX_IMAGES_PER_MESSAGE} images per message."));
+                    attached_any = true;
+                    break;
+                }
+                let id = self.alloc_image_id();
+                let name = format!("Screenshot {id}.{}", gpui_img.format.extension());
+                match AttachedImage::from_gpui_image(id, gpui_img, name) {
+                    Ok(attached) => {
+                        self.pending_images.push(attached);
+                        attached_any = true;
+                    }
+                    Err(e) => {
+                        errors.push(format!("{e:#}"));
+                        attached_any = true;
+                    }
+                }
+            }
+        }
+
+        // 2. Copied image files from Finder (⌘C on PNG/JPEG/etc., then ⌘V in chat).
+        if !attached_any {
+            let image_paths: Vec<PathBuf> = item
+                .entries()
+                .iter()
+                .filter_map(|e| match e {
+                    ClipboardEntry::ExternalPaths(paths) => Some(paths.paths()),
+                    _ => None,
+                })
+                .flatten()
+                .filter(|p| attachments::is_supported_image_path(p))
+                .cloned()
+                .collect();
+            if !image_paths.is_empty() {
+                self.attach_image_paths(&image_paths, window, cx);
+                return true;
+            }
+        }
+
+        if attached_any {
+            self.attach_notice = if errors.is_empty() {
+                None
+            } else {
+                Some(errors.join(" · "))
+            };
+            self.focus_composer(window, cx);
+            cx.notify();
+        }
+        attached_any
+    }
+
+    fn choose_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach images".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            if paths.is_empty() {
+                return;
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.attach_image_paths(&paths, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn remove_pending_image(&mut self, id: usize, cx: &mut Context<Self>) {
+        self.pending_images.retain(|img| img.id != id);
+        if self.pending_images.len() < MAX_IMAGES_PER_MESSAGE {
+            self.attach_notice = None;
+        }
+        cx.notify();
     }
 
     fn send_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1124,7 +2183,7 @@ impl ChatWindow {
             let prompt = skills::format_skill_prompt(&skill, &text);
             (display, prompt)
         } else {
-            if text.is_empty() {
+            if text.is_empty() && self.pending_images.is_empty() {
                 return;
             }
             (text.clone(), text)
@@ -1163,6 +2222,7 @@ impl ChatWindow {
                     self.pending_send = Some(PendingSend {
                         display_text,
                         prompt_text,
+                        images: self.pending_images.clone(),
                         model_id,
                         model_name,
                         unload_ids: room.unload,
@@ -1185,15 +2245,19 @@ impl ChatWindow {
 
         self.active_skill = None;
         self.show_slash_menu = false;
+        self.attach_notice = None;
+        let images = std::mem::take(&mut self.pending_images);
         self.composer
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.dispatch_send(display_text, prompt_text, model_id, Vec::new(), window, cx);
+        self.dispatch_send(display_text, prompt_text, images, model_id, Vec::new(), window, cx);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_send(
         &mut self,
         display_text: String,
         prompt_text: String,
+        images: Vec<AttachedImage>,
         model_id: String,
         unload_first: Vec<String>,
         window: &mut Window,
@@ -1215,12 +2279,16 @@ impl ChatWindow {
         self.blocks.push(ChatBlock::User {
             key: None,
             text: display_text.clone(),
+            images: images.clone(),
         });
+        let raw_images: Vec<ImageAttachment> = images.iter().map(|i| i.attachment.clone()).collect();
         let started_at = Instant::now();
         self.busy = true;
         self.working_since = Some(started_at);
         self.working_phase = WorkingPhase::StartingAgent;
         if let Some(sid) = &start_session {
+            self.done_sessions.remove(sid);
+            self.approval_pending_sessions.remove(sid);
             self.working_since_by_session.insert(sid.clone(), started_at);
             self.working_phase_by_session
                 .insert(sid.clone(), WorkingPhase::StartingAgent);
@@ -1293,8 +2361,19 @@ impl ChatWindow {
                             Some(s) => s,
                             None => eng.new_session().await.map_err(|e| format!("{e:#}"))?,
                         };
-                        eng.prompt(app.bus.clone(), &sid, &prompt_text, &installed_model.alias)
-                            .map_err(|e| format!("{e:#}"))?;
+                        let include_paths = app.settings.lock().unwrap().include_image_paths;
+                        let path_note = include_paths
+                            .then(|| attachments::format_image_paths_note(&raw_images, Some(&proj)))
+                            .flatten();
+                        eng.prompt(
+                            app.bus.clone(),
+                            &sid,
+                            &prompt_text,
+                            &raw_images,
+                            path_note,
+                            &installed_model.alias,
+                        )
+                        .map_err(|e| format!("{e:#}"))?;
                         sid
                     }
                     ChatEngine::Builtin => superviser_backend::agent::send(
@@ -1302,6 +2381,7 @@ impl ChatWindow {
                         &pid_task,
                         start_session.as_deref(),
                         &prompt_text,
+                        &raw_images,
                         &model_id,
                     )
                     .map_err(|e| format!("{e:#}"))?,
@@ -1339,7 +2419,7 @@ impl ChatWindow {
                             this.buffered_events.clear();
                             return;
                         }
-                        this.archived.remove(&target_session);
+                        this.archived.remove(&(pid.clone(), target_session.clone()));
                         this.active_session = Some(target_session.clone());
                         this.subagents = this
                             .backend
@@ -1367,10 +2447,13 @@ impl ChatWindow {
                         if user_block_idx < this.blocks.len() {
                             this.blocks.remove(user_block_idx);
                         }
-                        if this.composer.read(cx).value().trim().is_empty() {
+                        if this.composer.read(cx).value().trim().is_empty() && !display_text.is_empty() {
                             this.composer.update(cx, |s, cx| {
                                 s.set_value(display_text.clone(), window, cx)
                             });
+                        }
+                        if this.pending_images.is_empty() && !images.is_empty() {
+                            this.pending_images = images;
                         }
                         if let Some(sid) = &this.active_session {
                             this.working_since_by_session.remove(sid);
@@ -1447,6 +2530,15 @@ impl ChatWindow {
                 };
             }
         }
+        let still_waiting = self
+            .blocks
+            .iter()
+            .any(|b| matches!(b, ChatBlock::ToolCall(tc) if tc.approval.is_some()));
+        if !still_waiting
+            && let Some(sid) = self.active_session.as_deref()
+        {
+            self.approval_pending_sessions.remove(sid);
+        }
         cx.notify();
 
         let app = self.backend.app.clone();
@@ -1497,6 +2589,7 @@ impl ChatWindow {
             }
             AppEvent::Projects => {
                 self.rebuild_project_select(window, cx);
+                self.refresh_sessions(cx);
                 cx.notify();
             }
             AppEvent::Acp(ev) => self.handle_acp_event(ev, cx),
@@ -1545,9 +2638,11 @@ impl ChatWindow {
                 tool_call,
                 options,
             } => {
+                self.approval_pending_sessions.insert(session.clone());
                 if self.selected_project.as_deref() != Some(project.as_str())
                     || self.active_session.as_deref() != Some(session.as_str())
                 {
+                    cx.notify();
                     return;
                 }
                 self.upsert_tool_call(&tool_call);
@@ -1576,6 +2671,7 @@ impl ChatWindow {
                 error,
             } => {
                 if busy {
+                    self.done_sessions.remove(&session);
                     let since = *self
                         .working_since_by_session
                         .entry(session.clone())
@@ -1592,20 +2688,23 @@ impl ChatWindow {
                             self.working_since = Some(since);
                         }
                         self.working_phase = phase;
-                        cx.notify();
                     }
+                    cx.notify();
                 } else {
                     self.working_since_by_session.remove(&session);
                     self.working_phase_by_session.remove(&session);
-                    if self.selected_project.as_deref() != Some(project.as_str()) {
-                        return;
+                    self.approval_pending_sessions.remove(&session);
+                    if error.is_none() && stop_reason.as_deref() != Some("cancelled") {
+                        self.done_sessions.insert(session.clone());
                     }
-                    if self.active_session.as_deref() != Some(session.as_str()) {
+                    if self.selected_project.as_deref() == Some(project.as_str())
+                        && self.active_session.as_deref() == Some(session.as_str())
+                    {
+                        self.finish_turn(error, stop_reason, cx);
+                        cx.notify();
+                    } else {
                         self.refresh_sessions(cx);
-                        return;
                     }
-                    self.finish_turn(error, stop_reason, cx);
-                    cx.notify();
                 }
             }
         }
@@ -1667,7 +2766,9 @@ impl ChatWindow {
                 cx.notify();
             }
             ChatEvent::Approval { chat, call, .. } => {
+                self.approval_pending_sessions.insert(chat.clone());
                 if self.active_session.as_deref() != Some(chat.as_str()) {
+                    cx.notify();
                     return;
                 }
                 for block in &mut self.blocks {
@@ -1698,6 +2799,7 @@ impl ChatWindow {
             }
             ChatEvent::State { chat, busy, error } => {
                 if busy {
+                    self.done_sessions.remove(&chat);
                     let since = *self
                         .working_since_by_session
                         .entry(chat.clone())
@@ -1712,11 +2814,15 @@ impl ChatWindow {
                             self.working_since = Some(since);
                         }
                         self.working_phase = phase;
-                        cx.notify();
                     }
+                    cx.notify();
                 } else {
                     self.working_since_by_session.remove(&chat);
                     self.working_phase_by_session.remove(&chat);
+                    self.approval_pending_sessions.remove(&chat);
+                    if error.is_none() {
+                        self.done_sessions.insert(chat.clone());
+                    }
                     if self.active_session.as_deref() != Some(chat.as_str()) {
                         self.refresh_sessions(cx);
                         return;
@@ -1779,21 +2885,64 @@ impl ChatWindow {
         let kind = update["sessionUpdate"].as_str().unwrap_or("");
         match kind {
             "user_message_chunk" => {
-                let text = content_text(&update["content"]);
-                if text.is_empty() {
+                let raw_text = content_text(&update["content"]);
+                let text = if raw_text.trim_start().starts_with(attachments::IMAGE_PATHS_HEADER) {
+                    String::new()
+                } else {
+                    raw_text
+                };
+                let image = if update["content"]["type"].as_str() == Some("image") {
+                    let mime = update["content"]["mimeType"]
+                        .as_str()
+                        .unwrap_or("image/png");
+                    let data = update["content"]["data"].as_str().unwrap_or("");
+                    if !data.is_empty() {
+                        let id = self.alloc_image_id();
+                        let att = ImageAttachment {
+                            name: format!("Image {id}"),
+                            mime_type: attachments::normalize_mime(mime)
+                                .unwrap_or("image/png")
+                                .to_string(),
+                            data_base64: data.to_string(),
+                            size_bytes: (data.len() * 3) / 4,
+                            source_path: None,
+                        };
+                        Some(AttachedImage::from_attachment(id, att))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if text.is_empty() && image.is_none() {
                     return;
                 }
                 self.seal_live_blocks();
                 let msg_id = update["messageId"].as_str().map(str::to_string);
                 if let Some(ref mid) = msg_id
-                    && let Some(ChatBlock::User { text: existing, .. }) = self.blocks.iter_mut().find(
+                    && let Some(ChatBlock::User {
+                        text: existing,
+                        images: existing_images,
+                        ..
+                    }) = self.blocks.iter_mut().find(
                         |b| matches!(b, ChatBlock::User { key: Some(k), .. } if k == mid),
                     )
                 {
                     existing.push_str(&text);
+                    if let Some(img_att) = image {
+                        existing_images.push(img_att);
+                    }
                     return;
                 }
-                self.blocks.push(ChatBlock::User { key: msg_id, text });
+                let mut images = Vec::new();
+                if let Some(img_att) = image {
+                    images.push(img_att);
+                }
+                self.blocks.push(ChatBlock::User {
+                    key: msg_id,
+                    text,
+                    images,
+                });
             }
             "agent_message_chunk" => {
                 let text = content_text(&update["content"]);
@@ -1824,10 +2973,51 @@ impl ChatWindow {
         match role {
             "user" => {
                 if replay {
-                    let text = message["content"].as_str().unwrap_or("").to_string();
+                    let (text, images) = match &message["content"] {
+                        Value::String(s) => (s.clone(), Vec::new()),
+                        Value::Array(parts) => {
+                            let mut text_parts = Vec::new();
+                            let mut images = Vec::new();
+                            for part in parts {
+                                match part["type"].as_str() {
+                                    Some("text" | "input_text") => {
+                                        let is_meta = part
+                                            .get("superviser_meta")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false);
+                                        if !is_meta
+                                            && let Some(t) = part["text"].as_str()
+                                        {
+                                            text_parts.push(t);
+                                        }
+                                    }
+                                    Some("image_url") => {
+                                        let url = part["image_url"]["url"]
+                                            .as_str()
+                                            .or_else(|| part["image_url"].as_str());
+                                        if let Some(url) = url {
+                                            let id = self.alloc_image_id();
+                                            if let Some(att) = ImageAttachment::from_data_url(
+                                                format!("Image {id}"),
+                                                url,
+                                            ) {
+                                                images.push(AttachedImage::from_attachment(
+                                                    id, att,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            (text_parts.join("\n"), images)
+                        }
+                        _ => (String::new(), Vec::new()),
+                    };
                     self.blocks.push(ChatBlock::User {
                         key: replay_id,
                         text,
+                        images,
                     });
                 }
             }
@@ -2167,6 +3357,29 @@ impl ChatWindow {
             s
         });
 
+        let desc_for_name = desc_input.clone();
+        let name_sub = cx.subscribe_in(
+            &name_input,
+            window,
+            move |_this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    desc_for_name.update(cx, |s, cx| s.focus(window, cx));
+                }
+            },
+        );
+        let body_for_desc = body_input.clone();
+        let desc_sub = cx.subscribe_in(
+            &desc_input,
+            window,
+            move |_this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    body_for_desc.update(cx, |s, cx| s.focus(window, cx));
+                }
+            },
+        );
+
+        name_input.update(cx, |s, cx| s.focus(window, cx));
+
         self.show_skills_panel = false;
         self.show_slash_menu = false;
         self.skill_notice = None;
@@ -2176,11 +3389,12 @@ impl ChatWindow {
             desc_input,
             body_input,
             editing_original: existing,
+            _subs: vec![name_sub, desc_sub],
         });
         cx.notify();
     }
 
-    fn save_skill_editor(&mut self, cx: &mut Context<Self>) {
+    fn save_skill_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.skill_editor.as_ref() else {
             return;
         };
@@ -2218,6 +3432,7 @@ impl ChatWindow {
                     ),
                     is_error: false,
                 });
+                self.focus_composer(window, cx);
                 cx.notify();
             }
             Err(e) => {
@@ -2334,19 +3549,13 @@ impl ChatWindow {
         p: crate::theme::Palette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let q = query.trim_start_matches('/').to_ascii_lowercase();
-        let show_new = q.is_empty() || "new-skill".contains(&q) || "create-skill".contains(&q);
-        let show_list = q.is_empty() || "skills".contains(&q);
-        let matching_skills: Vec<Skill> = self
-            .skills
-            .iter()
-            .filter(|s| {
-                q.is_empty()
-                    || s.name.contains(&q)
-                    || s.description.to_ascii_lowercase().contains(&q)
-            })
-            .cloned()
-            .collect();
+        let items = self.slash_menu_items(query);
+        let selected_idx = if items.is_empty() {
+            0
+        } else {
+            self.slash_selected.min(items.len() - 1)
+        };
+        let query_owned = query.to_string();
 
         v_flex()
             .id("slash-menu-scroll")
@@ -2372,76 +3581,80 @@ impl ChatWindow {
                             .text_xs()
                             .font_weight(gpui_kit::FontWeight::MEDIUM)
                             .text_color(p.muted)
-                            .child("Slash commands & skills"),
+                            .child("Slash commands & skills  ·  ↑↓ navigate  ·  Enter/Tab select  ·  Esc close"),
                     )
                     .child(
                         Button::new("slash-menu-close")
                             .ghost()
                             .xsmall()
                             .label("×")
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 this.show_slash_menu = false;
+                                this.slash_dismissed_query = Some(query_owned.clone());
+                                this.focus_composer(window, cx);
                                 cx.notify();
                             })),
                     ),
             )
-            .children(matching_skills.into_iter().enumerate().map(|(i, skill)| {
-                let name = skill.name.clone();
-                let desc = skill.description.clone();
-                let scope_label = skill.scope.label();
-                h_flex()
-                    .id(("slash-skill", i))
-                    .cursor_pointer()
-                    .px_2()
-                    .py(px(5.0))
-                    .gap_2()
-                    .items_center()
-                    .rounded(px(6.0))
-                    .hover(move |d| d.bg(p.chip))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.active_skill = Some(skill.clone());
-                        this.show_slash_menu = false;
-                        if this.composer.read(cx).value().trim_start().starts_with('/') {
-                            this.composer
-                                .update(cx, |s, cx| s.set_value("", window, cx));
-                        }
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .text_color(p.accent)
-                            .child(format!("/{name}")),
-                    )
-                    .child(Tag::secondary().small().child(scope_label))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(p.muted)
-                            .truncate()
-                            .child(desc),
-                    )
-            }))
-            .when(show_new, |col| {
-                col.child(
-                    h_flex()
-                        .id("slash-new-skill")
+            .children(items.into_iter().enumerate().map(|(i, item)| {
+                let is_selected = i == selected_idx;
+                match item {
+                    SlashMenuItem::Skill(skill) => {
+                        let name = skill.name.clone();
+                        let desc = skill.description.clone();
+                        let scope_label = skill.scope.label();
+                        h_flex()
+                            .id(("slash-item", i))
+                            .cursor_pointer()
+                            .px_2()
+                            .py(px(5.0))
+                            .gap_2()
+                            .items_center()
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(if is_selected { p.accent } else { p.panel })
+                            .when(is_selected, move |d| d.bg(p.chip))
+                            .hover(move |d| d.bg(p.chip))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.activate_slash_item(
+                                    SlashMenuItem::Skill(skill.clone()),
+                                    window,
+                                    cx,
+                                );
+                            }))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_color(p.accent)
+                                    .child(format!("/{name}")),
+                            )
+                            .child(Tag::secondary().small().child(scope_label))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(p.muted)
+                                    .truncate()
+                                    .child(desc),
+                            )
+                            .into_any_element()
+                    }
+                    SlashMenuItem::NewSkill => h_flex()
+                        .id(("slash-item", i))
                         .cursor_pointer()
                         .px_2()
                         .py(px(5.0))
                         .gap_2()
                         .items_center()
                         .rounded(px(6.0))
+                        .border_1()
+                        .border_color(if is_selected { p.accent } else { p.panel })
+                        .when(is_selected, move |d| d.bg(p.chip))
                         .hover(move |d| d.bg(p.chip))
                         .on_click(cx.listener(|this, _, window, cx| {
-                            if this.composer.read(cx).value().trim_start().starts_with('/') {
-                                this.composer
-                                    .update(cx, |s, cx| s.set_value("", window, cx));
-                            }
-                            this.open_skill_editor(None, "", "", window, cx);
+                            this.activate_slash_item(SlashMenuItem::NewSkill, window, cx);
                         }))
                         .child(
                             div()
@@ -2455,30 +3668,22 @@ impl ChatWindow {
                                 .text_xs()
                                 .text_color(p.muted)
                                 .child("Create a new reusable project or global skill"),
-                        ),
-                )
-            })
-            .when(show_list, |col| {
-                col.child(
-                    h_flex()
-                        .id("slash-list-skills")
+                        )
+                        .into_any_element(),
+                    SlashMenuItem::ListSkills => h_flex()
+                        .id(("slash-item", i))
                         .cursor_pointer()
                         .px_2()
                         .py(px(5.0))
                         .gap_2()
                         .items_center()
                         .rounded(px(6.0))
+                        .border_1()
+                        .border_color(if is_selected { p.accent } else { p.panel })
+                        .when(is_selected, move |d| d.bg(p.chip))
                         .hover(move |d| d.bg(p.chip))
                         .on_click(cx.listener(|this, _, window, cx| {
-                            if this.composer.read(cx).value().trim_start().starts_with('/') {
-                                this.composer
-                                    .update(cx, |s, cx| s.set_value("", window, cx));
-                            }
-                            this.show_slash_menu = false;
-                            this.refresh_skills();
-                            this.show_skills_panel = true;
-                            this.skill_editor = None;
-                            cx.notify();
+                            this.activate_slash_item(SlashMenuItem::ListSkills, window, cx);
                         }))
                         .child(
                             div()
@@ -2491,10 +3696,14 @@ impl ChatWindow {
                             div()
                                 .text_xs()
                                 .text_color(p.muted)
-                                .child(format!("Browse & manage saved skills ({})", self.skills.len())),
-                        ),
-                )
-            })
+                                .child(format!(
+                                    "Browse & manage saved skills ({})",
+                                    self.skills.len()
+                                )),
+                        )
+                        .into_any_element(),
+                }
+            }))
     }
 
     fn render_skills_panel(
@@ -2543,8 +3752,9 @@ impl ChatWindow {
                                     .ghost()
                                     .xsmall()
                                     .label("Close")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(|this, _, window, cx| {
                                         this.show_skills_panel = false;
+                                        this.focus_composer(window, cx);
                                         cx.notify();
                                     })),
                             ),
@@ -2762,9 +3972,10 @@ impl ChatWindow {
                                 Button::new("skill-cancel")
                                     .small()
                                     .label("Cancel")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(|this, _, window, cx| {
                                         this.skill_editor = None;
                                         this.skill_notice = None;
+                                        this.focus_composer(window, cx);
                                         cx.notify();
                                     })),
                             )
@@ -2773,8 +3984,8 @@ impl ChatWindow {
                                     .primary()
                                     .small()
                                     .label("Save skill")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.save_skill_editor(cx);
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_skill_editor(window, cx);
                                     })),
                             ),
                     ),
@@ -3168,6 +4379,7 @@ impl ChatWindow {
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.composer.update(cx, |state, cx| {
                                         state.set_value(prompt.clone(), window, cx);
+                                        state.focus(window, cx);
                                     });
                                 }))
                         })),
@@ -3190,25 +4402,66 @@ impl ChatWindow {
             })
     }
 
-    fn render_block(&self, block: &ChatBlock, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_block(
+        &self,
+        block: &ChatBlock,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let is_dark = cx.theme().mode == ThemeMode::Dark;
         let p = palette(is_dark);
 
         match block {
-            ChatBlock::User { text, .. } => h_flex().w_full().flex_shrink_0().justify_end().child(
-                div()
+            ChatBlock::User { text, images, .. } => h_flex().w_full().flex_shrink_0().justify_end().child(
+                v_flex()
                     .max_w(px(560.0))
                     .px_3()
                     .py_2()
+                    .gap_2()
                     .rounded(px(10.0))
                     .bg(p.accent)
                     .text_color(p.accent_text)
                     .text_sm()
-                    .child(text.clone()),
+                    .when(!images.is_empty(), |bubble| {
+                        bubble.child(
+                            h_flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .children(images.iter().map(|attached| {
+                                    v_flex()
+                                        .gap_1()
+                                        .max_w(px(220.0))
+                                        .when_some(attached.preview.clone(), |card, preview| {
+                                            card.child(
+                                                img(preview)
+                                                    .max_w(px(220.0))
+                                                    .max_h(px(160.0))
+                                                    .object_fit(ObjectFit::Contain)
+                                                    .rounded(px(6.0))
+                                                    .border_1()
+                                                    .border_color(p.accent_text.opacity(0.25)),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .text_size(px(10.0))
+                                                .text_color(p.accent_text.opacity(0.85))
+                                                .truncate()
+                                                .child(attached.attachment.name.clone()),
+                                        )
+                                })),
+                        )
+                    })
+                    .when(!text.is_empty(), |bubble| bubble.child(text.clone())),
             ),
             ChatBlock::Thinking { id, text, open, .. } => {
                 let block_id = *id;
                 let arrow = if *open { "▾" } else { "▸" };
+                let focus_handle = window
+                    .use_keyed_state(("thinking-focus", block_id), cx, |_, cx| cx.focus_handle())
+                    .read(cx)
+                    .clone();
+                let is_focused = focus_handle.is_focused(window);
                 v_flex()
                     .w_full()
                     .flex_shrink_0()
@@ -3216,12 +4469,30 @@ impl ChatWindow {
                     .child(
                         div()
                             .id(("thinking-toggle", block_id))
+                            .track_focus(&focus_handle)
+                            .tab_stop(true)
+                            .tab_index(0)
                             .cursor_pointer()
+                            .px_1()
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(if is_focused { p.accent } else { p.bg })
                             .text_xs()
                             .text_color(p.muted)
                             .child(format!("{arrow} Thinking"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.toggle_block_open(block_id, cx);
+                            }))
+                            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
+                                let mods = &ev.keystroke.modifiers;
+                                if !mods.platform
+                                    && !mods.control
+                                    && !mods.alt
+                                    && matches!(ev.keystroke.key.as_str(), "enter" | "space")
+                                {
+                                    cx.stop_propagation();
+                                    this.toggle_block_open(block_id, cx);
+                                }
                             })),
                     )
                     .when(*open, |this| {
@@ -3312,6 +4583,11 @@ impl ChatWindow {
                 };
 
                 let is_execute = kind == "execute" && !subject.is_empty();
+                let tool_focus = window
+                    .use_keyed_state(("tool-focus", block_id), cx, |_, cx| cx.focus_handle())
+                    .read(cx)
+                    .clone();
+                let tool_focused = tool_focus.is_focused(window);
                 let header = if is_execute {
                     h_flex()
                         .px_3()
@@ -3321,12 +4597,30 @@ impl ChatWindow {
                         .child(
                             h_flex()
                                 .id(("tool-head-left", block_id))
+                                .track_focus(&tool_focus)
+                                .tab_stop(true)
+                                .tab_index(0)
                                 .flex_shrink_0()
                                 .cursor_pointer()
+                                .px_1()
+                                .rounded(px(4.0))
+                                .border_1()
+                                .border_color(if tool_focused { p.accent } else { p.panel })
                                 .gap_2()
                                 .items_center()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.toggle_block_open(block_id, cx);
+                                }))
+                                .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
+                                    let mods = &ev.keystroke.modifiers;
+                                    if !mods.platform
+                                        && !mods.control
+                                        && !mods.alt
+                                        && matches!(ev.keystroke.key.as_str(), "enter" | "space")
+                                    {
+                                        cx.stop_propagation();
+                                        this.toggle_block_open(block_id, cx);
+                                    }
                                 }))
                                 .child(div().text_xs().text_color(p.muted).child(arrow))
                                 .child(
@@ -3353,13 +4647,30 @@ impl ChatWindow {
                 } else {
                     h_flex()
                         .id(("tool-head", block_id))
+                        .track_focus(&tool_focus)
+                        .tab_stop(true)
+                        .tab_index(0)
                         .cursor_pointer()
                         .px_3()
                         .py_2()
                         .gap_2()
                         .items_center()
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(if tool_focused { p.accent } else { p.panel })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.toggle_block_open(block_id, cx);
+                        }))
+                        .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
+                            let mods = &ev.keystroke.modifiers;
+                            if !mods.platform
+                                && !mods.control
+                                && !mods.alt
+                                && matches!(ev.keystroke.key.as_str(), "enter" | "space")
+                            {
+                                cx.stop_propagation();
+                                this.toggle_block_open(block_id, cx);
+                            }
                         }))
                         .child(div().text_xs().text_color(p.muted).child(arrow))
                         .child(
@@ -3521,56 +4832,280 @@ impl ChatWindow {
         s: &SessionMeta,
         is_archived: bool,
         p: crate::theme::Palette,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let is_dark = cx.theme().mode == ThemeMode::Dark;
+        let pid_open = s.project_id.clone();
+        let pid_key = s.project_id.clone();
+        let pid_arch = s.project_id.clone();
+        let pid_del = s.project_id.clone();
         let sid_open = s.id.clone();
+        let sid_key = s.id.clone();
         let sid_arch = s.id.clone();
         let sid_del = s.id.clone();
         let title_del = s.title.clone();
-        let active = self.active_session.as_deref() == Some(s.id.as_str());
+        let active = self.active_session.as_deref() == Some(s.id.as_str())
+            && self.selected_project.as_deref() == Some(s.project_id.as_str());
+        let focus_handle = self
+            .session_focus_handles
+            .get(&s.id)
+            .cloned()
+            .unwrap_or_else(|| {
+                window
+                    .use_keyed_state(("session-focus", idx), cx, |_, cx| cx.focus_handle())
+                    .read(cx)
+                    .clone()
+            });
+        let is_focused = focus_handle.is_focused(window);
+        let awaiting_approval = self.approval_pending_sessions.contains(&s.id);
+        let working_elapsed = self
+            .working_since_by_session
+            .get(&s.id)
+            .map(|since| format_working_compact(since.elapsed().as_secs()));
+        let is_done = self.done_sessions.contains(&s.id);
+        let rel_time = s.updated_at.map(format_relative_time);
+        let monogram = project_monogram(&s.project_name);
+        let (badge_bg, badge_fg) = project_badge_colors(&s.project_id, is_dark);
+        let env_label = match s.isolation {
+            Isolation::MacosSandbox => "macOS sandbox",
+            Isolation::LinuxVm => "Linux VM",
+        };
+        let footer_meta = match &s.model_name {
+            Some(model) => format!("{env_label} · {model}"),
+            None => env_label.to_string(),
+        };
 
-        h_flex()
+        v_flex()
             .id(("session-row", idx))
+            .track_focus(&focus_handle)
+            .tab_stop(true)
+            .tab_index(0)
             .flex_shrink_0()
+            .w_full()
+            .cursor_pointer()
+            .px_2p5()
+            .py_2()
             .gap_1()
-            .px_2()
-            .py(px(4.0))
-            .items_center()
-            .rounded(px(6.0))
-            .when(active, |d| d.bg(p.chip))
-            .hover(|d| d.bg(p.chip))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(if is_focused {
+                p.accent
+            } else if active {
+                p.line
+            } else {
+                p.panel
+            })
+            .when(active || is_focused, |d| d.bg(p.chip))
+            .hover(|d| d.bg(p.chip.opacity(0.75)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_session(pid_open.clone(), sid_open.clone(), window, cx);
+            }))
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                let mods = &ev.keystroke.modifiers;
+                if mods.platform || mods.control || mods.alt {
+                    return;
+                }
+                match ev.keystroke.key.as_str() {
+                    "enter" | "space" => {
+                        cx.stop_propagation();
+                        this.open_session(pid_key.clone(), sid_key.clone(), window, cx);
+                    }
+                    "up" => {
+                        cx.stop_propagation();
+                        this.focus_adjacent_session_row(&sid_key, -1, window, cx);
+                    }
+                    "down" => {
+                        cx.stop_propagation();
+                        this.focus_adjacent_session_row(&sid_key, 1, window, cx);
+                    }
+                    "home" => {
+                        cx.stop_propagation();
+                        this.focus_edge_session_row(true, window, cx);
+                    }
+                    "end" => {
+                        cx.stop_propagation();
+                        this.focus_edge_session_row(false, window, cx);
+                    }
+                    _ => {}
+                }
+            }))
+            // Row 1: Project monogram + project name on left, live Working / relative time on right
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                h_flex()
+                                    .size(px(18.0))
+                                    .flex_shrink_0()
+                                    .rounded(px(4.0))
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(badge_bg)
+                                    .text_color(badge_fg)
+                                    .text_size(px(9.0))
+                                    .font_weight(gpui_kit::FontWeight::BOLD)
+                                    .child(monogram),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(p.muted)
+                                    .truncate()
+                                    .child(s.project_name.clone()),
+                            ),
+                    )
+                    .when(awaiting_approval, |row| {
+                        row.child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                        .text_color(p.warn)
+                                        .child("⚠ Approval"),
+                                ),
+                        )
+                    })
+                    .when(!awaiting_approval, |row| {
+                        row.when_some(working_elapsed, |row, elapsed| {
+                            row.child(
+                                h_flex()
+                                    .flex_shrink_0()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(div().size(px(6.0)).rounded_full().bg(p.accent))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                            .text_color(p.accent)
+                                            .child(format!("Working {elapsed}")),
+                                    ),
+                            )
+                        })
+                        .when(
+                            !self.working_since_by_session.contains_key(&s.id) && is_done,
+                            |row| {
+                                row.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_xs()
+                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                        .text_color(p.good)
+                                        .child("✓ Done"),
+                                )
+                            },
+                        )
+                        .when(
+                            !self.working_since_by_session.contains_key(&s.id) && !is_done,
+                            |row| {
+                                row.when_some(rel_time, |row, t| {
+                                    row.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_xs()
+                                            .text_color(p.muted)
+                                            .child(t),
+                                    )
+                                })
+                            },
+                        )
+                    }),
+            )
+            // Row 2: Multi-line auto-named chat title
             .child(
                 div()
-                    .id(("session-open", idx))
-                    .flex_1()
-                    .min_w_0()
-                    .cursor_pointer()
+                    .w_full()
                     .text_sm()
-                    .truncate()
-                    .when(active, |d| d.font_weight(gpui_kit::FontWeight::MEDIUM))
-                    .child(s.title.clone())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.show_chat(Some(sid_open.clone()), window, cx);
-                    })),
+                    .line_height(px(18.0))
+                    .max_h(px(38.0))
+                    .overflow_hidden()
+                    .text_color(if active { p.text } else { p.text.opacity(0.92) })
+                    .font_weight(if active {
+                        gpui_kit::FontWeight::SEMIBOLD
+                    } else {
+                        gpui_kit::FontWeight::MEDIUM
+                    })
+                    .child(s.title.clone()),
             )
+            // Row 3: Environment / model metadata + Archive / Delete actions
             .child(
-                Button::new(("session-arch", idx))
-                    .ghost()
-                    .xsmall()
-                    .label(if is_archived { "↩" } else { "⤓" })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.archive_chat(sid_arch.clone(), !is_archived, window, cx);
-                    })),
-            )
-            .child(
-                Button::new(("session-del", idx))
-                    .ghost()
-                    .xsmall()
-                    .label("×")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.confirm_delete_chat = Some((sid_del.clone(), title_del.clone()));
-                        cx.notify();
-                    })),
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(p.muted)
+                            .truncate()
+                            .child(footer_meta),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap_0p5()
+                            .items_center()
+                            .child(
+                                Button::new(("session-arch", idx))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(if is_archived {
+                                        IconName::ArchiveRestore
+                                    } else {
+                                        IconName::Archive
+                                    })
+                                    .tooltip(if is_archived {
+                                        "Restore chat to active list"
+                                    } else {
+                                        "Archive chat"
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.archive_chat(
+                                            pid_arch.clone(),
+                                            sid_arch.clone(),
+                                            !is_archived,
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .child(
+                                Button::new(("session-del", idx))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Trash)
+                                    .tooltip("Delete chat")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.confirm_delete_chat = Some((
+                                            pid_del.clone(),
+                                            sid_del.clone(),
+                                            title_del.clone(),
+                                        ));
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
             )
     }
     // --- First-class Sub-Agent tracking UI (T3 Code-style strip + inspector drawer) ---
@@ -3743,6 +5278,7 @@ impl ChatWindow {
     fn render_subagent_strip(
         &self,
         p: crate::theme::Palette,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let running = self.subagents.iter().filter(|s| s.state.is_active()).count();
@@ -3775,6 +5311,12 @@ impl ChatWindow {
                 let elapsed = Self::subagent_elapsed(rec);
                 let active = self.inspected_subagent.as_deref() == Some(rec.id.as_str());
                 let id_click = rec.id.clone();
+                let id_key = rec.id.clone();
+                let pill_focus = window
+                    .use_keyed_state(("subagent-pill-focus", i), cx, |_, cx| cx.focus_handle())
+                    .read(cx)
+                    .clone();
+                let is_focused = pill_focus.is_focused(window);
                 let steps_label = if rec.steps.is_empty() {
                     String::new()
                 } else {
@@ -3782,6 +5324,9 @@ impl ChatWindow {
                 };
                 h_flex()
                     .id(("subagent-pill", i))
+                    .track_focus(&pill_focus)
+                    .tab_stop(true)
+                    .tab_index(0)
                     .cursor_pointer()
                     .px_2()
                     .py(px(2.0))
@@ -3789,10 +5334,21 @@ impl ChatWindow {
                     .items_center()
                     .rounded(px(6.0))
                     .border_1()
-                    .border_color(if active { p.accent } else { p.line })
+                    .border_color(if active || is_focused { p.accent } else { p.line })
                     .bg(if active { p.accent.opacity(0.14) } else { p.chip })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_inspect_subagent(id_click.clone(), cx);
+                    }))
+                    .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
+                        let mods = &ev.keystroke.modifiers;
+                        if !mods.platform
+                            && !mods.control
+                            && !mods.alt
+                            && matches!(ev.keystroke.key.as_str(), "enter" | "space")
+                        {
+                            cx.stop_propagation();
+                            this.toggle_inspect_subagent(id_key.clone(), cx);
+                        }
                     }))
                     .child(div().text_xs().text_color(color).child(glyph))
                     .child(
@@ -3911,8 +5467,9 @@ impl ChatWindow {
                                     .xsmall()
                                     .ghost()
                                     .label("Close")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(|this, _, window, cx| {
                                         this.inspected_subagent = None;
+                                        this.focus_composer(window, cx);
                                         cx.notify();
                                     })),
                             ),
@@ -4124,6 +5681,7 @@ impl ChatWindow {
     fn toggle_commit_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.git_panel, Some(GitPanel::Commit { .. })) {
             self.git_panel = None;
+            self.focus_composer(window, cx);
             cx.notify();
             return;
         }
@@ -4131,13 +5689,27 @@ impl ChatWindow {
         let message_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Commit message (e.g. Fix login redirect)")
         });
-        self.git_panel = Some(GitPanel::Commit { message_input });
+        let sub = cx.subscribe_in(
+            &message_input,
+            window,
+            |this, _, event: &InputEvent, _window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.submit_commit(false, cx);
+                }
+            },
+        );
+        message_input.update(cx, |s, cx| s.focus(window, cx));
+        self.git_panel = Some(GitPanel::Commit {
+            message_input,
+            _sub: sub,
+        });
         cx.notify();
     }
 
     fn toggle_pr_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.git_panel, Some(GitPanel::Pr { .. })) {
             self.git_panel = None;
+            self.focus_composer(window, cx);
             cx.notify();
             return;
         }
@@ -4151,10 +5723,22 @@ impl ChatWindow {
                 .rows(3)
                 .auto_grow(2, 6)
         });
+        let body_for_title = body_input.clone();
+        let sub = cx.subscribe_in(
+            &title_input,
+            window,
+            move |_this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    body_for_title.update(cx, |s, cx| s.focus(window, cx));
+                }
+            },
+        );
+        title_input.update(cx, |s, cx| s.focus(window, cx));
         self.git_panel = Some(GitPanel::Pr {
             title_input,
             body_input,
             draft: false,
+            _sub: sub,
         });
         cx.notify();
         // Automatically pre-fill title & summary from branch commits (uses model if loaded).
@@ -4168,7 +5752,7 @@ impl ChatWindow {
         let Some(root) = self.project_root() else {
             return;
         };
-        let Some(GitPanel::Commit { message_input }) = &self.git_panel else {
+        let Some(GitPanel::Commit { message_input, .. }) = &self.git_panel else {
             return;
         };
         let message_input = message_input.clone();
@@ -4277,7 +5861,7 @@ impl ChatWindow {
             return;
         };
         let message = match &self.git_panel {
-            Some(GitPanel::Commit { message_input }) => {
+            Some(GitPanel::Commit { message_input, .. }) => {
                 message_input.read(cx).value().trim().to_string()
             }
             _ => return,
@@ -4405,6 +5989,7 @@ impl ChatWindow {
                 title_input,
                 body_input,
                 draft,
+                ..
             }) => (
                 title_input.read(cx).value().trim().to_string(),
                 body_input.read(cx).value().trim().to_string(),
@@ -4476,6 +6061,7 @@ impl ChatWindow {
         &self,
         st: &GitStatus,
         p: crate::theme::Palette,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let dirty = st.dirty_count();
@@ -4503,6 +6089,11 @@ impl ChatWindow {
         };
         let open_pr = st.open_pr.clone();
         let can_pr = st.has_remote && !st.detached && !git_busy;
+        let branch_focus = window
+            .use_keyed_state("git-branch-focus", cx, |_, cx| cx.focus_handle())
+            .read(cx)
+            .clone();
+        let branch_focused = branch_focus.is_focused(window);
 
         h_flex()
             .flex_shrink_0()
@@ -4522,10 +6113,15 @@ impl ChatWindow {
                     .child(
                         div()
                             .id("git-branch-pill")
+                            .track_focus(&branch_focus)
+                            .tab_stop(true)
+                            .tab_index(0)
                             .cursor_pointer()
                             .px_2()
                             .py(px(2.0))
                             .rounded(px(5.0))
+                            .border_1()
+                            .border_color(if branch_focused { p.accent } else { p.chip })
                             .bg(p.chip)
                             .text_xs()
                             .font_family("Menlo")
@@ -4533,6 +6129,17 @@ impl ChatWindow {
                             .child(format!("⎇ {branch_label}"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.refresh_git(true, cx);
+                            }))
+                            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                                let mods = &ev.keystroke.modifiers;
+                                if !mods.platform
+                                    && !mods.control
+                                    && !mods.alt
+                                    && matches!(ev.keystroke.key.as_str(), "enter" | "space")
+                                {
+                                    cx.stop_propagation();
+                                    this.refresh_git(true, cx);
+                                }
                             })),
                     )
                     .when(dirty > 0, |row| {
@@ -4635,7 +6242,7 @@ impl ChatWindow {
         let busy = self.git_busy.is_some();
 
         match panel {
-            GitPanel::Commit { message_input } => {
+            GitPanel::Commit { message_input, .. } => {
                 let files_list = st.map(|s| s.dirty_files.as_slice()).unwrap_or(&[]);
                 let shown: Vec<_> = files_list.iter().take(8).cloned().collect();
                 let extra = files_list.len().saturating_sub(shown.len());
@@ -4726,8 +6333,9 @@ impl ChatWindow {
                                     .small()
                                     .ghost()
                                     .label("Cancel")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(|this, _, window, cx| {
                                         this.git_panel = None;
+                                        this.focus_composer(window, cx);
                                         cx.notify();
                                     })),
                             )
@@ -4758,6 +6366,7 @@ impl ChatWindow {
                 title_input,
                 body_input,
                 draft,
+                ..
             } => {
                 let is_draft = *draft;
                 let will_push = st.is_some_and(|s| s.upstream.is_none() || s.ahead > 0);
@@ -4853,8 +6462,9 @@ impl ChatWindow {
                                             .small()
                                             .ghost()
                                             .label("Cancel")
-                                            .on_click(cx.listener(|this, _, _, cx| {
+                                            .on_click(cx.listener(|this, _, window, cx| {
                                                 this.git_panel = None;
+                                                this.focus_composer(window, cx);
                                                 cx.notify();
                                             })),
                                     )
@@ -4877,11 +6487,571 @@ impl ChatWindow {
             }
         }
     }
+
+    fn render_projects_popout(
+        &self,
+        p: crate::theme::Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_dark = cx.theme().mode == ThemeMode::Dark;
+        let query = self.projects_popout_search.read(cx).value().to_string();
+        let projects = self.ordered_projects(&query);
+        let selected = self.projects_popout_selected;
+        let all_active = self.filter_project.is_none();
+
+        div()
+            .id("projects-popout-backdrop")
+            .absolute()
+            .inset_0()
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.close_projects_popout(window, cx);
+            }))
+            .child(
+                v_flex()
+                    .id("projects-popout-card")
+                    .absolute()
+                    .top(px(76.0))
+                    .left(px(12.0))
+                    .w(px(264.0))
+                    .max_h(px(420.0))
+                    .p_2()
+                    .gap_1()
+                    .rounded(px(10.0))
+                    .bg(p.panel)
+                    .border_1()
+                    .border_color(p.line)
+                    .shadow_lg()
+                    .on_click(|_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(Input::new(&self.projects_popout_search).small())
+                    .child(
+                        div()
+                            .id("popout-add-project")
+                            .w_full()
+                            .px_2()
+                            .py_1p5()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .when(selected == 0, |d| d.bg(p.chip))
+                            .hover(|d| d.bg(p.chip))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_projects_popout = false;
+                                cx.notify();
+                                choose_project_folder("Add a project folder", true, cx);
+                            }))
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .size(px(20.0))
+                                            .rounded(px(4.0))
+                                            .items_center()
+                                            .justify_center()
+                                            .bg(p.chip)
+                                            .text_xs()
+                                            .font_weight(gpui_kit::FontWeight::BOLD)
+                                            .child("+"),
+                                    )
+                                    .child(div().text_sm().child("Add project")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("popout-all-projects")
+                            .w_full()
+                            .px_2()
+                            .py_1p5()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .when(selected == 1 || all_active, |d| d.bg(p.chip))
+                            .hover(|d| d.bg(p.chip))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.filter_project = None;
+                                this.close_projects_popout(window, cx);
+                            }))
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                h_flex()
+                                                    .size(px(20.0))
+                                                    .rounded(px(4.0))
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .bg(p.chip)
+                                                    .text_xs()
+                                                    .child("▤"),
+                                            )
+                                            .child(div().text_sm().child("All projects")),
+                                    )
+                                    .when(all_active, |row| {
+                                        row.child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(gpui_kit::FontWeight::BOLD)
+                                                .text_color(p.accent)
+                                                .child("✓"),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .child(div().w_full().h(px(1.0)).bg(p.line).my(px(2.0)))
+                    .child(
+                        div()
+                            .id("popout-projects-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .max_h(px(280.0))
+                            .overflow_y_scroll()
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .gap_0p5()
+                                    .when(projects.is_empty(), |col| {
+                                        col.child(
+                                            div()
+                                                .px_2()
+                                                .py_2()
+                                                .text_xs()
+                                                .text_color(p.muted)
+                                                .child("No matching projects"),
+                                        )
+                                    })
+                                    .children(projects.into_iter().enumerate().map(
+                                        |(i, proj)| {
+                                            let row_idx = i + 2;
+                                            let pid = proj.id.clone();
+                                            let is_filtered = self.filter_project.as_deref()
+                                                == Some(proj.id.as_str());
+                                            let (bg, fg) = project_badge_colors(&proj.id, is_dark);
+                                            let mono = project_monogram(&proj.name);
+                                            div()
+                                                .id(("popout-proj", i))
+                                                .w_full()
+                                                .px_2()
+                                                .py_1p5()
+                                                .rounded(px(6.0))
+                                                .cursor_pointer()
+                                                .when(selected == row_idx || is_filtered, |d| {
+                                                    d.bg(p.chip)
+                                                })
+                                                .hover(|d| d.bg(p.chip))
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.filter_project = Some(pid.clone());
+                                                        this.close_projects_popout(window, cx);
+                                                    },
+                                                ))
+                                                .child(
+                                                    h_flex()
+                                                        .w_full()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .gap_2()
+                                                        .child(
+                                                            h_flex()
+                                                                .flex_1()
+                                                                .min_w_0()
+                                                                .items_center()
+                                                                .gap_2()
+                                                                .child(
+                                                                    h_flex()
+                                                                        .size(px(20.0))
+                                                                        .flex_shrink_0()
+                                                                        .rounded(px(4.0))
+                                                                        .items_center()
+                                                                        .justify_center()
+                                                                        .bg(bg)
+                                                                        .text_color(fg)
+                                                                        .text_size(px(9.5))
+                                                                        .font_weight(
+                                                                            gpui_kit::FontWeight::BOLD,
+                                                                        )
+                                                                        .child(mono),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .flex_1()
+                                                                        .min_w_0()
+                                                                        .text_sm()
+                                                                        .truncate()
+                                                                        .child(proj.name),
+                                                                ),
+                                                        )
+                                                        .when(is_filtered, |row| {
+                                                            row.child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .font_weight(
+                                                                        gpui_kit::FontWeight::BOLD,
+                                                                    )
+                                                                    .text_color(p.accent)
+                                                                    .child("✓"),
+                                                            )
+                                                        }),
+                                                )
+                                        },
+                                    )),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_new_chat_modal(
+        &self,
+        p: crate::theme::Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_dark = cx.theme().mode == ThemeMode::Dark;
+        let query = self.new_chat_search.read(cx).value().to_string();
+        let projects = self.ordered_projects(&query);
+        let selected = self.new_chat_selected;
+        let add_idx = projects.len();
+
+        h_flex()
+            .id("new-chat-modal-backdrop")
+            .absolute()
+            .inset_0()
+            .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.5))
+            .items_start()
+            .justify_center()
+            .pt(px(72.0))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.close_new_chat_modal(window, cx);
+            }))
+            .child(
+                v_flex()
+                    .id("new-chat-modal-card")
+                    .w(px(520.0))
+                    .max_h(px(460.0))
+                    .rounded(px(12.0))
+                    .bg(p.panel)
+                    .border_1()
+                    .border_color(p.line)
+                    .shadow_lg()
+                    .overflow_hidden()
+                    .on_click(|_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    // Search header
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .px_3()
+                            .py_2p5()
+                            .gap_2()
+                            .items_center()
+                            .border_b_1()
+                            .border_color(p.line)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_color(p.muted)
+                                    .child("New chat"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Input::new(&self.new_chat_search).small()),
+                            ),
+                    )
+                    // Section label + project rows
+                    .child(
+                        div()
+                            .px_3()
+                            .pt_2()
+                            .pb_1()
+                            .text_xs()
+                            .text_color(p.muted)
+                            .child("Choose a project for this new chat"),
+                    )
+                    .child(
+                        div()
+                            .id("new-chat-modal-list")
+                            .flex_1()
+                            .min_h_0()
+                            .max_h(px(320.0))
+                            .overflow_y_scroll()
+                            .px_2()
+                            .pb_2()
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .gap_0p5()
+                                    .children(projects.into_iter().enumerate().map(|(i, proj)| {
+                                        let pid = proj.id.clone();
+                                        let is_current = self.selected_project.as_deref()
+                                            == Some(proj.id.as_str());
+                                        let (bg, fg) = project_badge_colors(&proj.id, is_dark);
+                                        let mono = project_monogram(&proj.name);
+                                        let env_label = match proj.isolation {
+                                            Isolation::MacosSandbox => "macOS sandbox",
+                                            Isolation::LinuxVm => "Linux VM",
+                                        };
+                                        let path_str = proj.main().display().to_string();
+                                        let subtitle = if is_current {
+                                            format!("Current · {env_label} · {path_str}")
+                                        } else {
+                                            format!("{env_label} · {path_str}")
+                                        };
+                                        let shortcut = (i < 9).then(|| format!("⌘{}", i + 1));
+
+                                        div()
+                                            .id(("new-chat-proj", i))
+                                            .w_full()
+                                            .px_2p5()
+                                            .py_2()
+                                            .rounded(px(8.0))
+                                            .cursor_pointer()
+                                            .when(selected == i, |d| d.bg(p.chip))
+                                            .hover(|d| d.bg(p.chip))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.start_new_chat_in_project(
+                                                    pid.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }))
+                                            .child(
+                                                h_flex()
+                                                    .w_full()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .gap_3()
+                                                    .child(
+                                                        h_flex()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .items_center()
+                                                            .gap_2p5()
+                                                            .child(
+                                                                h_flex()
+                                                                    .size(px(24.0))
+                                                                    .flex_shrink_0()
+                                                                    .rounded(px(5.0))
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .bg(bg)
+                                                                    .text_color(fg)
+                                                                    .text_size(px(10.5))
+                                                                    .font_weight(
+                                                                        gpui_kit::FontWeight::BOLD,
+                                                                    )
+                                                                    .child(mono),
+                                                            )
+                                                            .child(
+                                                                v_flex()
+                                                                    .flex_1()
+                                                                    .min_w_0()
+                                                                    .child(
+                                                                        div()
+                                                                            .text_sm()
+                                                                            .font_weight(
+                                                                                gpui_kit::FontWeight::MEDIUM,
+                                                                            )
+                                                                            .truncate()
+                                                                            .child(proj.name),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .text_xs()
+                                                                            .text_color(p.muted)
+                                                                            .truncate()
+                                                                            .child(subtitle),
+                                                                    ),
+                                                            ),
+                                                    )
+                                                    .when_some(shortcut, |row, sc| {
+                                                        row.child(
+                                                            div()
+                                                                .flex_shrink_0()
+                                                                .text_xs()
+                                                                .font_family("Menlo")
+                                                                .text_color(p.muted)
+                                                                .child(sc),
+                                                        )
+                                                    }),
+                                            )
+                                    }))
+                                    .child(
+                                        div()
+                                            .id("new-chat-add-project")
+                                            .w_full()
+                                            .px_2p5()
+                                            .py_2()
+                                            .mt_1()
+                                            .rounded(px(8.0))
+                                            .cursor_pointer()
+                                            .border_t_1()
+                                            .border_color(p.line)
+                                            .when(selected == add_idx, |d| d.bg(p.chip))
+                                            .hover(|d| d.bg(p.chip))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.show_new_chat_modal = false;
+                                                cx.notify();
+                                                choose_project_folder(
+                                                    "Add a project folder",
+                                                    true,
+                                                    cx,
+                                                );
+                                            }))
+                                            .child(
+                                                h_flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .child(
+                                                        h_flex()
+                                                            .items_center()
+                                                            .gap_2p5()
+                                                            .child(
+                                                                h_flex()
+                                                                    .size(px(24.0))
+                                                                    .rounded(px(5.0))
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .bg(p.chip)
+                                                                    .text_xs()
+                                                                    .font_weight(
+                                                                        gpui_kit::FontWeight::BOLD,
+                                                                    )
+                                                                    .child("+"),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_sm()
+                                                                    .child("Add new project…"),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .font_family("Menlo")
+                                                            .text_color(p.muted)
+                                                            .child("⌘⇧O"),
+                                                    ),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    // Keyboard hints footer
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .gap_4()
+                            .items_center()
+                            .bg(p.bg)
+                            .border_t_1()
+                            .border_color(p.line)
+                            .text_xs()
+                            .text_color(p.muted)
+                            .child("↑ ↓ Navigate")
+                            .child("Enter Select")
+                            .child("⌘1–9 Quick pick")
+                            .child("Esc Close"),
+                    ),
+            )
+    }
+
+    fn render_shortcuts_help(
+        &self,
+        p: crate::theme::Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let rows: &[(&str, &str)] = &[
+            ("⌘N", "New chat (choose project)"),
+            ("⌘⇧O", "Add project folder…"),
+            ("⌘V / Drop / ⌘⇧I", "Paste, drag & drop, or attach screenshots/images"),
+            ("⌘F", "Search chats"),
+            ("⌘L / ⌘K", "Focus composer"),
+            ("⌘[ / ⌘]  or  ⌘⌥↑ / ⌘⌥↓", "Previous / next chat"),
+            ("↑ / ↓  (in chat list)", "Move between chats (Enter opens)"),
+            ("↑ / ↓ / Tab / Enter", "Navigate & pick / slash commands"),
+            ("⌘⇧P / ⌘⇧M / ⌘⇧R", "Projects filter popout / model / reasoning picker"),
+            ("⌘⇧G", "Toggle Git commit panel"),
+            ("⌘⇧A", "Archive current chat"),
+            ("⌘↵  (in panels)", "Save skill / Commit & Push / Create PR"),
+            ("⌘↵ / ⌘⌫  (on prompt)", "Allow / Deny pending tool approval"),
+            ("⌘.  or  Esc", "Dismiss panel / stop generation"),
+            ("PgUp / PgDn / Home / End", "Scroll message history"),
+            ("Tab / ⇧Tab", "Move keyboard focus between controls"),
+            ("⌘,", "Open Settings"),
+        ];
+        v_flex()
+            .flex_shrink_0()
+            .mx_4()
+            .mb_2()
+            .p_3()
+            .gap_2()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(p.accent.opacity(0.7))
+            .bg(p.panel)
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child("Keyboard shortcuts (⌘/)"),
+                    )
+                    .child(
+                        Button::new("shortcuts-help-close")
+                            .ghost()
+                            .xsmall()
+                            .label("Close (Esc)")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_shortcuts_help = false;
+                                this.focus_composer(window, cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_x_4()
+                    .gap_y_1()
+                    .children(rows.iter().map(|(keys, desc)| {
+                        h_flex()
+                            .w(px(320.0))
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .px(px(5.0))
+                                    .py(px(1.0))
+                                    .rounded(px(4.0))
+                                    .bg(p.chip)
+                                    .text_xs()
+                                    .font_family("Menlo")
+                                    .text_color(p.text)
+                                    .child(*keys),
+                            )
+                            .child(div().text_xs().text_color(p.muted).child(*desc))
+                    })),
+            )
+    }
 }
 
 impl Render for ChatWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_scroll_state();
+        self.sync_session_focus_handles(cx);
 
         let is_dark = cx.theme().mode == ThemeMode::Dark;
         let p = palette(is_dark);
@@ -4890,10 +7060,13 @@ impl Render for ChatWindow {
             .selected_project
             .as_deref()
             .and_then(|id| self.backend.app.project(id));
-        let project_path = proj
-            .as_ref()
-            .map(|pr| format!("· {}", pr.main().display()))
-            .unwrap_or_default();
+        let header_project_settings = proj.as_ref().map(|pr| {
+            (
+                pr.id.clone(),
+                pr.name.clone(),
+                pr.main().display().to_string(),
+            )
+        });
 
         let active_title = self
             .active_session
@@ -4990,32 +7163,11 @@ impl Render for ChatWindow {
             }
         };
 
-        let composer_text = self.composer.read(cx).value().to_string();
-        let slash_query: Option<String> = if self.skill_editor.is_none() && !self.show_skills_panel {
-            let trimmed = composer_text.trim_start();
-            if trimmed.starts_with('/') && !trimmed.contains(char::is_whitespace) {
-                Some(trimmed.to_string())
-            } else if self.show_slash_menu {
-                Some("/".to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let slash_query = self.active_slash_query(cx);
 
-        let active_sessions: Vec<SessionMeta> = self
-            .sessions
-            .iter()
-            .filter(|s| !self.archived.contains(&s.id))
-            .cloned()
-            .collect();
-        let archived_sessions: Vec<SessionMeta> = self
-            .sessions
-            .iter()
-            .filter(|s| self.archived.contains(&s.id))
-            .cloned()
-            .collect();
+        let (active_sessions, archived_sessions) = self.filtered_sessions(cx);
+        let project_count = self.backend.app.settings.lock().unwrap().projects.len();
+        let search_empty = self.sidebar_search.read(cx).value().trim().is_empty();
         let archived_count = archived_sessions.len();
         let archived_expanded = self.show_archived
             || archived_sessions
@@ -5024,14 +7176,17 @@ impl Render for ChatWindow {
         let rendered_active_sessions: Vec<gpui_kit::AnyElement> = active_sessions
             .iter()
             .enumerate()
-            .map(|(i, s)| self.render_session_row(i, s, false, p, cx).into_any_element())
+            .map(|(i, s)| {
+                self.render_session_row(i, s, false, p, window, cx)
+                    .into_any_element()
+            })
             .collect();
         let rendered_archived_sessions: Vec<gpui_kit::AnyElement> = if archived_expanded {
             archived_sessions
                 .iter()
                 .enumerate()
                 .map(|(i, s)| {
-                    self.render_session_row(10_000 + i, s, true, p, cx)
+                    self.render_session_row(10_000 + i, s, true, p, window, cx)
                         .into_any_element()
                 })
                 .collect()
@@ -5043,22 +7198,147 @@ impl Render for ChatWindow {
         let rendered_blocks: Vec<gpui_kit::AnyElement> = self
             .blocks
             .iter()
-            .map(|block| self.render_block(block, cx).into_any_element())
+            .map(|block| self.render_block(block, window, cx).into_any_element())
             .collect();
 
         let active_sid_for_arch = self.active_session.clone();
-        let active_not_archived = active_sid_for_arch
-            .as_deref()
-            .is_some_and(|id| !self.archived.contains(id));
+        let active_pid_for_arch = self.selected_project.clone();
+        let active_not_archived = match (&active_pid_for_arch, &active_sid_for_arch) {
+            (Some(pid), Some(sid)) => !self.is_archived(pid, sid),
+            _ => false,
+        };
+        let archived_toggle_focus = window
+            .use_keyed_state("toggle-archived-focus", cx, |_, cx| cx.focus_handle())
+            .read(cx)
+            .clone();
+        let archived_toggle_focused = archived_toggle_focus.is_focused(window);
+        let active_proj_badge = proj.as_ref().map(|pr| {
+            let (bg, fg) = project_badge_colors(&pr.id, is_dark);
+            (project_monogram(&pr.name), pr.name.clone(), pr.isolation, bg, fg)
+        });
+
+        let drop_accent = p.accent;
+        let view_for_paste = cx.entity().downgrade();
+        let pending_images_snapshot = self.pending_images.clone();
+        let filter_proj_badge = self.filter_project.as_deref().and_then(|fid| {
+            let pr = self.backend.app.project(fid)?;
+            let (bg, fg) = project_badge_colors(&pr.id, is_dark);
+            Some((project_monogram(&pr.name), pr.name, bg, fg))
+        });
+        let _ = project_count;
 
         h_flex()
+            .id("chat-window-root")
+            .relative()
             .size_full()
             .bg(p.bg)
             .text_color(p.text)
-            // Sidebar
+            .track_focus(&self.focus_handle)
+            .key_context("ChatWindow")
+            .can_drop(|value, _, _| {
+                value.downcast_ref::<ExternalPaths>().is_some_and(|paths| {
+                    paths
+                        .paths()
+                        .iter()
+                        .any(|path| attachments::is_supported_image_path(path))
+                })
+            })
+            .drag_over::<ExternalPaths>(move |style, paths, _, _| {
+                if paths
+                    .paths()
+                    .iter()
+                    .any(|path| attachments::is_supported_image_path(path))
+                {
+                    style
+                        .border_2()
+                        .border_color(drop_accent)
+                        .bg(drop_accent.opacity(0.06))
+                } else {
+                    style
+                }
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.attach_image_paths(paths.paths(), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewChat, window, cx| {
+                this.open_new_chat_modal(window, cx);
+            }))
+            .on_action(cx.listener(|_this, _: &AddProject, _, cx| {
+                choose_project_folder("Add a project folder", true, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AttachImage, window, cx| {
+                this.choose_images(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusChatSearch, window, cx| {
+                this.sidebar_search.update(cx, |s, cx| s.focus(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
+                this.focus_composer(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevChat, window, cx| {
+                this.switch_adjacent_chat(-1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextChat, window, cx| {
+                this.switch_adjacent_chat(1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusProjectPicker, window, cx| {
+                if this.show_projects_popout {
+                    this.close_projects_popout(window, cx);
+                } else {
+                    this.open_projects_popout(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &FocusModelPicker, window, cx| {
+                this.model_select.update(cx, |s, cx| s.focus(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &FocusReasoningPicker, window, cx| {
+                if this.selected_model.is_some() {
+                    this.reasoning_select
+                        .update(cx, |s, cx| s.focus(window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ArchiveActiveChat, window, cx| {
+                if let (Some(pid), Some(sid)) =
+                    (this.selected_project.clone(), this.active_session.clone())
+                    && !this.is_archived(&pid, &sid)
+                {
+                    this.archive_chat(pid, sid, true, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleGitCommit, window, cx| {
+                if this
+                    .git_status
+                    .as_ref()
+                    .is_some_and(|s| s.is_repo && s.dirty_count() > 0)
+                    || matches!(this.git_panel, Some(GitPanel::Commit { .. }))
+                {
+                    this.toggle_commit_panel(window, cx);
+                } else {
+                    this.refresh_git(true, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &StopGeneration, _, cx| {
+                if this.busy {
+                    this.stop_current(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleShortcutsHelp, _, cx| {
+                this.show_shortcuts_help = !this.show_shortcuts_help;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
+                this.handle_dismiss(window, cx);
+            }))
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                this.handle_capture_key_down(ev, window, cx);
+            }))
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                this.handle_key_down(ev, window, cx);
+            }))
+            // Sidebar (T3 Code-style unified multi-project chat cards)
             .child(
                 v_flex()
-                    .w(px(244.0))
+                    .w(px(288.0))
                     .flex_shrink_0()
                     .h_full()
                     .p_3()
@@ -5066,61 +7346,224 @@ impl Render for ChatWindow {
                     .bg(p.panel)
                     .border_r_1()
                     .border_color(p.line)
+                    // Top toolbar: wide Search input + New Chat overlay trigger
                     .child(
-                        div()
+                        h_flex()
                             .w_full()
-                            .h(px(30.0))
                             .flex_shrink_0()
-                            .child(Select::new(&self.project_select).small()),
+                            .gap_1p5()
+                            .items_center()
+                            .child(div().flex_1().min_w_0().child(Input::new(&self.sidebar_search).small()))
+                            .child(
+                                Button::new("new-chat")
+                                    .primary()
+                                    .small()
+                                    .icon(IconName::SquarePen)
+                                    .tooltip("New chat — choose a project (⌘N)")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_new_chat_modal(window, cx);
+                                    })),
+                            ),
                     )
+                    // Second row: searchable project-filter dropdown + explicit "+ Project" button
                     .child(
-                        div().w_full().flex_shrink_0().child(
-                            Button::new("new-chat")
-                                .primary()
-                                .w_full()
-                                .label("New chat")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.show_chat(None, window, cx);
-                                })),
-                        ),
+                        h_flex()
+                            .w_full()
+                            .flex_shrink_0()
+                            .gap_1p5()
+                            .items_center()
+                            .child(match filter_proj_badge {
+                                Some((mono, pname, bg, fg)) => h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .id("project-filter-dropdown")
+                                            .flex_1()
+                                            .min_w_0()
+                                            .cursor_pointer()
+                                            .px_2()
+                                            .py(px(4.0))
+                                            .rounded(px(6.0))
+                                            .bg(p.bg)
+                                            .border_1()
+                                            .border_color(if self.show_projects_popout {
+                                                p.accent
+                                            } else {
+                                                p.accent.opacity(0.55)
+                                            })
+                                            .hover(|d| d.bg(p.chip))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                if this.show_projects_popout {
+                                                    this.close_projects_popout(window, cx);
+                                                } else {
+                                                    this.open_projects_popout(window, cx);
+                                                }
+                                            }))
+                                            .child(
+                                                h_flex()
+                                                    .w_full()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .gap_1p5()
+                                                    .child(
+                                                        h_flex()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .items_center()
+                                                            .gap_1p5()
+                                                            .child(
+                                                                h_flex()
+                                                                    .size(px(16.0))
+                                                                    .flex_shrink_0()
+                                                                    .rounded(px(3.0))
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .bg(bg)
+                                                                    .text_color(fg)
+                                                                    .text_size(px(8.5))
+                                                                    .font_weight(
+                                                                        gpui_kit::FontWeight::BOLD,
+                                                                    )
+                                                                    .child(mono),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .flex_1()
+                                                                    .min_w_0()
+                                                                    .text_xs()
+                                                                    .truncate()
+                                                                    .child(pname),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_shrink_0()
+                                                            .text_xs()
+                                                            .text_color(p.muted)
+                                                            .child("▾"),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("clear-project-filter")
+                                            .ghost()
+                                            .xsmall()
+                                            .label("×")
+                                            .tooltip("Show chats from all projects")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.filter_project = None;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .into_any_element(),
+                                None => div()
+                                    .id("project-filter-dropdown")
+                                    .flex_1()
+                                    .min_w_0()
+                                    .cursor_pointer()
+                                    .px_2()
+                                    .py(px(4.0))
+                                    .rounded(px(6.0))
+                                    .bg(p.bg)
+                                    .border_1()
+                                    .border_color(if self.show_projects_popout {
+                                        p.accent
+                                    } else {
+                                        p.line
+                                    })
+                                    .hover(|d| d.bg(p.chip))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if this.show_projects_popout {
+                                            this.close_projects_popout(window, cx);
+                                        } else {
+                                            this.open_projects_popout(window, cx);
+                                        }
+                                    }))
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_1p5()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .text_xs()
+                                                    .text_color(p.text.opacity(0.9))
+                                                    .truncate()
+                                                    .child("All projects"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_xs()
+                                                    .text_color(p.muted)
+                                                    .child("▾"),
+                                            ),
+                                    )
+                                    .into_any_element(),
+                            })
+                            .child(
+                                Button::new("add-project-btn")
+                                    .xsmall()
+                                    .label("+ Project")
+                                    .tooltip("Add a new project folder (⌘⇧O)")
+                                    .on_click(|_, _, cx| {
+                                        choose_project_folder("Add a project folder", true, cx);
+                                    }),
+                            ),
                     )
-                    .when_some(self.confirm_delete_chat.clone(), |col, (cid, ctitle)| {
-                        col.child(
-                            v_flex()
-                                .flex_shrink_0()
-                                .p_2()
-                                .gap_2()
-                                .rounded(px(6.0))
-                                .bg(p.bad.opacity(0.14))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .child(format!("Delete \"{ctitle}\"?")),
-                                )
-                                .child(
-                                    h_flex()
-                                        .gap_1()
-                                        .child(
-                                            Button::new("confirm-del-chat")
-                                                .danger()
-                                                .xsmall()
-                                                .label("Delete")
-                                                .on_click(cx.listener(move |this, _, window, cx| {
-                                                    this.delete_chat(cid.clone(), window, cx);
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("cancel-del-chat")
-                                                .xsmall()
-                                                .label("Cancel")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.confirm_delete_chat = None;
-                                                    cx.notify();
-                                                })),
-                                        ),
-                                ),
-                        )
-                    })
+                    .when_some(
+                        self.confirm_delete_chat.clone(),
+                        |col, (cpid, cid, ctitle)| {
+                            col.child(
+                                v_flex()
+                                    .flex_shrink_0()
+                                    .p_2()
+                                    .gap_2()
+                                    .rounded(px(6.0))
+                                    .bg(p.bad.opacity(0.14))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .child(format!("Delete \"{ctitle}\"?")),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Button::new("confirm-del-chat")
+                                                    .danger()
+                                                    .xsmall()
+                                                    .label("Delete")
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.delete_chat(
+                                                                cpid.clone(),
+                                                                cid.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new("cancel-del-chat")
+                                                    .xsmall()
+                                                    .label("Cancel")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.confirm_delete_chat = None;
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    ),
+                            )
+                        },
+                    )
                     .child(
                         div()
                             .id("chat-list")
@@ -5132,7 +7575,7 @@ impl Render for ChatWindow {
                             .child(
                                 v_flex()
                                     .w_full()
-                                    .gap_1()
+                                    .gap_1p5()
                                     .when_some(self.starting_note.clone(), |col, note| {
                                         col.child(
                                             div()
@@ -5153,7 +7596,103 @@ impl Render for ChatWindow {
                                                 .child(err),
                                         )
                                     })
-                                    .children(rendered_active_sessions),
+                                    // Highlighted draft card when composing a brand new chat
+                                    .when(self.active_session.is_none() && search_empty, |col| {
+                                        col.when_some(
+                                            active_proj_badge.clone(),
+                                            |col, (mono, pname, iso, bg, fg)| {
+                                                let env_label = match iso {
+                                                    Isolation::MacosSandbox => "macOS sandbox",
+                                                    Isolation::LinuxVm => "Linux VM",
+                                                };
+                                                col.child(
+                                                    v_flex()
+                                                        .flex_shrink_0()
+                                                        .w_full()
+                                                        .px_2p5()
+                                                        .py_2()
+                                                        .gap_1()
+                                                        .rounded(px(8.0))
+                                                        .border_1()
+                                                        .border_color(p.accent.opacity(0.6))
+                                                        .bg(p.chip)
+                                                        .child(
+                                                            h_flex()
+                                                                .w_full()
+                                                                .items_center()
+                                                                .justify_between()
+                                                                .gap_2()
+                                                                .child(
+                                                                    h_flex()
+                                                                        .flex_1()
+                                                                        .min_w_0()
+                                                                        .items_center()
+                                                                        .gap_1p5()
+                                                                        .child(
+                                                                            h_flex()
+                                                                                .size(px(18.0))
+                                                                                .flex_shrink_0()
+                                                                                .rounded(px(4.0))
+                                                                                .items_center()
+                                                                                .justify_center()
+                                                                                .bg(bg)
+                                                                                .text_color(fg)
+                                                                                .text_size(px(9.0))
+                                                                                .font_weight(
+                                                                                    gpui_kit::FontWeight::BOLD,
+                                                                                )
+                                                                                .child(mono),
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .flex_1()
+                                                                                .min_w_0()
+                                                                                .text_xs()
+                                                                                .text_color(p.muted)
+                                                                                .truncate()
+                                                                                .child(pname),
+                                                                        ),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .text_xs()
+                                                                        .text_color(p.accent)
+                                                                        .child("Draft"),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w_full()
+                                                                .text_sm()
+                                                                .font_weight(
+                                                                    gpui_kit::FontWeight::SEMIBOLD,
+                                                                )
+                                                                .child("New chat"),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(p.muted)
+                                                                .child(env_label),
+                                                        ),
+                                                )
+                                            },
+                                        )
+                                    })
+                                    .children(rendered_active_sessions)
+                                    .when(
+                                        active_sessions.is_empty() && !search_empty,
+                                        |col| {
+                                            col.child(
+                                                div()
+                                                    .px_2()
+                                                    .py_3()
+                                                    .text_xs()
+                                                    .text_color(p.muted)
+                                                    .child("No matching chats."),
+                                            )
+                                        },
+                                    ),
                             ),
                     )
                     .when(archived_count > 0, |col| {
@@ -5167,9 +7706,19 @@ impl Render for ChatWindow {
                                 .child(
                                     div()
                                         .id("toggle-archived")
+                                        .track_focus(&archived_toggle_focus)
+                                        .tab_stop(true)
+                                        .tab_index(0)
                                         .cursor_pointer()
                                         .px_2()
                                         .py_1()
+                                        .rounded(px(5.0))
+                                        .border_1()
+                                        .border_color(if archived_toggle_focused {
+                                            p.accent
+                                        } else {
+                                            p.panel
+                                        })
                                         .text_xs()
                                         .text_color(p.muted)
                                         .child(format!(
@@ -5179,7 +7728,24 @@ impl Render for ChatWindow {
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.show_archived = !this.show_archived;
                                             cx.notify();
-                                        })),
+                                        }))
+                                        .on_key_down(cx.listener(
+                                            |this, ev: &KeyDownEvent, _, cx| {
+                                                let mods = &ev.keystroke.modifiers;
+                                                if !mods.platform
+                                                    && !mods.control
+                                                    && !mods.alt
+                                                    && matches!(
+                                                        ev.keystroke.key.as_str(),
+                                                        "enter" | "space"
+                                                    )
+                                                {
+                                                    cx.stop_propagation();
+                                                    this.show_archived = !this.show_archived;
+                                                    cx.notify();
+                                                }
+                                            },
+                                        )),
                                 )
                                 .when(archived_expanded, |box_| {
                                     box_.child(
@@ -5199,25 +7765,46 @@ impl Render for ChatWindow {
                         )
                     })
                     .child(
-                        v_flex()
+                        h_flex()
+                            .w_full()
                             .flex_shrink_0()
                             .pt_2()
                             .gap_1()
+                            .items_center()
+                            .justify_between()
                             .border_t_1()
                             .border_color(p.line)
                             .child(
-                                Button::new("open-settings")
-                                    .link()
-                                    .small()
-                                    .label("Projects and settings…")
-                                    .on_click(|_, _, cx| open_settings(None, cx)),
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(
+                                        Button::new("open-settings")
+                                            .ghost()
+                                            .small()
+                                            .icon(IconName::Settings)
+                                            .tooltip("Projects & settings (⌘,)")
+                                            .on_click(|_, _, cx| open_settings(None, cx)),
+                                    )
+                                    .child(
+                                        Button::new("open-setup")
+                                            .ghost()
+                                            .small()
+                                            .icon(IconName::BookOpen)
+                                            .tooltip("Setup guide")
+                                            .on_click(|_, _, cx| open_setup(cx)),
+                                    ),
                             )
                             .child(
-                                Button::new("open-setup")
-                                    .link()
+                                Button::new("toggle-shortcuts-help")
+                                    .ghost()
                                     .small()
-                                    .label("Setup guide…")
-                                    .on_click(|_, _, cx| open_setup(cx)),
+                                    .icon(IconName::Keyboard)
+                                    .tooltip("Keyboard shortcuts (⌘/)")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_shortcuts_help = !this.show_shortcuts_help;
+                                        cx.notify();
+                                    })),
                             ),
                     ),
             )
@@ -5245,7 +7832,44 @@ impl Render for ChatWindow {
                                     .flex_1()
                                     .min_w_0()
                                     .gap_2()
-                                    .items_baseline()
+                                    .items_center()
+                                    .when_some(
+                                        active_proj_badge.clone(),
+                                        |row, (mono, pname, _, bg, fg)| {
+                                            row.child(
+                                                h_flex()
+                                                    .flex_shrink_0()
+                                                    .items_center()
+                                                    .gap_1p5()
+                                                    .child(
+                                                        h_flex()
+                                                            .size(px(20.0))
+                                                            .rounded(px(4.0))
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .bg(bg)
+                                                            .text_color(fg)
+                                                            .text_size(px(10.0))
+                                                            .font_weight(
+                                                                gpui_kit::FontWeight::BOLD,
+                                                            )
+                                                            .child(mono),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(p.muted)
+                                                            .child(pname),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(p.muted.opacity(0.6))
+                                                            .child("/"),
+                                                    ),
+                                            )
+                                        },
+                                    )
                                     .child(
                                         div()
                                             .text_sm()
@@ -5253,12 +7877,22 @@ impl Render for ChatWindow {
                                             .truncate()
                                             .child(active_title),
                                     )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(p.muted)
-                                            .truncate()
-                                            .child(project_path),
+                                    .when_some(
+                                        header_project_settings,
+                                        |row, (pid, pname, ppath)| {
+                                            row.child(
+                                                Button::new("header-project-settings")
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .icon(IconName::Settings2)
+                                                    .tooltip(format!(
+                                                        "Project settings for {pname} ({ppath})"
+                                                    ))
+                                                    .on_click(move |_, _, cx| {
+                                                        open_project_settings(pid.clone(), cx);
+                                                    }),
+                                            )
+                                        },
                                     ),
                             )
                             .child(
@@ -5267,14 +7901,22 @@ impl Render for ChatWindow {
                                     .gap_2()
                                     .items_center()
                                     .when(active_not_archived, |row| {
+                                        let pid = active_pid_for_arch.clone().unwrap();
                                         let sid = active_sid_for_arch.clone().unwrap();
                                         row.child(
                                             Button::new("header-archive")
                                                 .ghost()
                                                 .small()
                                                 .label("Archive")
+                                                .tooltip("Archive this chat (⌘⇧A)")
                                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                                    this.archive_chat(sid.clone(), true, window, cx);
+                                                    this.archive_chat(
+                                                        pid.clone(),
+                                                        sid.clone(),
+                                                        true,
+                                                        window,
+                                                        cx,
+                                                    );
                                                 })),
                                         )
                                     })
@@ -5306,6 +7948,7 @@ impl Render for ChatWindow {
                                             Button::new("header-unload")
                                                 .small()
                                                 .label("Unload")
+                                                .tooltip("Unload the running model to free memory")
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     if this.busy {
                                                         this.stop_current(cx);
@@ -5318,7 +7961,7 @@ impl Render for ChatWindow {
                     )
                     // Git bar (Commit, Push, PR) — runs on host outside the sandbox
                     .when_some(self.git_status.as_ref().filter(|s| s.is_repo), |col, st| {
-                        col.child(self.render_git_bar(st, p, cx))
+                        col.child(self.render_git_bar(st, p, window, cx))
                     })
                     .when_some(self.git_panel.as_ref(), |col, panel| {
                         col.child(self.render_git_panel(panel, self.git_status.as_ref(), p, cx))
@@ -5376,7 +8019,7 @@ impl Render for ChatWindow {
                     })
                     // Sub-agent tracking strip + inspector drawer (shown only when sub-agents exist)
                     .when(!self.subagents.is_empty(), |col| {
-                        col.child(self.render_subagent_strip(p, cx))
+                        col.child(self.render_subagent_strip(p, window, cx))
                     })
                     .when_some(
                         self.inspected_subagent
@@ -5523,6 +8166,7 @@ impl Render for ChatWindow {
                     .when_some(self.pending_send.as_ref(), |col, pending| {
                         let display_text = pending.display_text.clone();
                         let prompt_text = pending.prompt_text.clone();
+                        let images = pending.images.clone();
                         let mid = pending.model_id.clone();
                         let unload_ids = pending.unload_ids.clone();
                         let names = pending.unload_names.join(" and ");
@@ -5554,9 +8198,12 @@ impl Render for ChatWindow {
                                             this.composer.update(cx, |s, cx| {
                                                 s.set_value("", window, cx);
                                             });
+                                            this.pending_images.clear();
+                                            this.attach_notice = None;
                                             this.dispatch_send(
                                                 display_text.clone(),
                                                 prompt_text.clone(),
+                                                images.clone(),
                                                 mid.clone(),
                                                 unload_ids.clone(),
                                                 window,
@@ -5577,6 +8224,7 @@ impl Render for ChatWindow {
                     })
                     .when(is_long_chat, |col| {
                         let pct = (usage_ratio.unwrap_or(0.0) * 100.0).round() as u64;
+                        let pid = self.selected_project.clone().unwrap_or_default();
                         let sid = self.active_session.clone().unwrap();
                         col.child(
                             h_flex()
@@ -5596,7 +8244,13 @@ impl Render for ChatWindow {
                                         .small()
                                         .label("Archive and start a new chat")
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.archive_chat(sid.clone(), true, window, cx);
+                                            this.archive_chat(
+                                                pid.clone(),
+                                                sid.clone(),
+                                                true,
+                                                window,
+                                                cx,
+                                            );
                                         })),
                                 ),
                         )
@@ -5679,6 +8333,10 @@ impl Render for ChatWindow {
                                 }),
                         )
                     })
+                    // Keyboard shortcuts help panel (⌘/)
+                    .when(self.show_shortcuts_help, |col| {
+                        col.child(self.render_shortcuts_help(p, cx))
+                    })
                     // Slash autocomplete, Skills Manager, or Skill Creator drawer above composer
                     .when_some(slash_query, |col, q| {
                         col.child(self.render_slash_menu(&q, p, cx))
@@ -5727,49 +8385,261 @@ impl Render for ChatWindow {
                                 ),
                         )
                     })
-                    // Composer
-                    .child(
-                        h_flex()
+                    // Attached images preview strip & attachment warnings above composer
+                    .when(
+                        !pending_images_snapshot.is_empty() || self.attach_notice.is_some(),
+                        |col| {
+                            col.child(
+                                v_flex()
+                                    .flex_shrink_0()
+                                    .px_4()
+                                    .py_2()
+                                    .gap_2()
+                                    .bg(p.panel)
+                                    .border_t_1()
+                                    .border_color(p.line)
+                                    .when_some(self.attach_notice.clone(), |strip, notice| {
+                                        strip.child(
+                                            h_flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .text_xs()
+                                                        .text_color(p.warn)
+                                                        .child(notice),
+                                                )
+                                                .child(
+                                                    Button::new("dismiss-attach-notice")
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .label("×")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.attach_notice = None;
+                                                            cx.notify();
+                                                        })),
+                                                ),
+                                        )
+                                    })
+                                    .when(!pending_images_snapshot.is_empty(), |strip| {
+                                        let count = pending_images_snapshot.len();
+                                        let share_paths = self
+                                            .backend
+                                            .app
+                                            .settings
+                                            .lock()
+                                            .unwrap()
+                                            .include_image_paths;
+                                        strip.child(
+                                            h_flex()
+                                                .w_full()
+                                                .flex_wrap()
+                                                .gap_2()
+                                                .items_center()
+                                                .children(pending_images_snapshot.iter().map(
+                                                    |attached| {
+                                                        let img_id = attached.id;
+                                                        let mut size_label =
+                                                            attachments::format_bytes(
+                                                                attached.attachment.size_bytes,
+                                                            );
+                                                        if share_paths
+                                                            && attached
+                                                                .attachment
+                                                                .source_path
+                                                                .is_some()
+                                                        {
+                                                            size_label.push_str(" · path");
+                                                        }
+                                                        h_flex()
+                                                            .items_center()
+                                                            .gap_2()
+                                                            .p_1p5()
+                                                            .rounded(px(8.0))
+                                                            .bg(p.bg)
+                                                            .border_1()
+                                                            .border_color(p.line)
+                                                            .when_some(
+                                                                attached.preview.clone(),
+                                                                |card, preview| {
+                                                                    card.child(
+                                                                        img(preview)
+                                                                            .size(px(44.0))
+                                                                            .object_fit(
+                                                                                ObjectFit::Cover,
+                                                                            )
+                                                                            .rounded(px(5.0))
+                                                                            .flex_shrink_0(),
+                                                                    )
+                                                                },
+                                                            )
+                                                            .child(
+                                                                v_flex()
+                                                                    .max_w(px(140.0))
+                                                                    .min_w_0()
+                                                                    .child(
+                                                                        div()
+                                                                            .text_xs()
+                                                                            .font_weight(
+                                                                                gpui_kit::FontWeight::MEDIUM,
+                                                                            )
+                                                                            .truncate()
+                                                                            .child(
+                                                                                attached
+                                                                                    .attachment
+                                                                                    .name
+                                                                                    .clone(),
+                                                                            ),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .text_size(px(10.0))
+                                                                            .text_color(p.muted)
+                                                                            .child(size_label),
+                                                                    ),
+                                                            )
+                                                            .child(
+                                                                Button::new((
+                                                                    "remove-pending-img",
+                                                                    img_id,
+                                                                ))
+                                                                .ghost()
+                                                                .xsmall()
+                                                                .label("×")
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.remove_pending_image(
+                                                                            img_id, cx,
+                                                                        );
+                                                                    },
+                                                                )),
+                                                            )
+                                                    },
+                                                ))
+                                                .when(count > 1, |row| {
+                                                    row.child(
+                                                        Button::new("clear-pending-imgs")
+                                                            .ghost()
+                                                            .xsmall()
+                                                            .label("Clear all")
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    this.pending_images.clear();
+                                                                    this.attach_notice = None;
+                                                                    cx.notify();
+                                                                },
+                                                            )),
+                                                    )
+                                                }),
+                                        )
+                                    }),
+                            )
+                        },
+                    )
+                    // Composer (unified T3 Code-style card: full-width textarea + bottom paperclip & Send bar)
+                    .child({
+                        let composer_val = self.composer.read(cx).value();
+                        let line_count = composer_val.split('\n').count().clamp(2, 6) as f32;
+                        let composer_h = px(line_count * 20.0 + 10.0);
+                        let composer_focused = self
+                            .composer
+                            .read(cx)
+                            .focus_handle(cx)
+                            .is_focused(window);
+                        div()
+                            .w_full()
                             .flex_shrink_0()
                             .px_4()
                             .py_3()
-                            .gap_2()
-                            .items_end()
                             .bg(p.panel)
                             .border_t_1()
                             .border_color(p.line)
                             .child(
-                                Button::new("slash-trigger-btn")
-                                    .ghost()
-                                    .small()
-                                    .label("/")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.refresh_skills();
-                                        this.show_skills_panel = false;
-                                        this.skill_editor = None;
-                                        this.show_slash_menu = !this.show_slash_menu;
-                                        cx.notify();
-                                    })),
+                                v_flex()
+                                    .w_full()
+                                    .rounded(px(10.0))
+                                    .bg(p.bg)
+                                    .border_1()
+                                    .border_color(if composer_focused {
+                                        p.accent
+                                    } else {
+                                        p.line
+                                    })
+                                    .px_2p5()
+                                    .pt_2()
+                                    .pb_1p5()
+                                    .gap_1()
+                                    .child(
+                                        div().w_full().min_w_0().child(
+                                            Textarea::new(&self.composer)
+                                                .appearance(false)
+                                                .bordered(false)
+                                                .h(composer_h)
+                                                .on_paste(move |item, window, cx| {
+                                                    let Some(view) = view_for_paste.upgrade()
+                                                    else {
+                                                        return false;
+                                                    };
+                                                    view.update(cx, |this, cx| {
+                                                        this.attach_clipboard_item(
+                                                            item, window, cx,
+                                                        )
+                                                    })
+                                                }),
+                                        ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_2()
+                                            .child(
+                                                Button::new("attach-image-btn")
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .icon(IconName::Paperclip)
+                                                    .tooltip(
+                                                        "Attach image (⌘⇧I, or drag & drop / ⌘V)",
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.choose_images(window, cx);
+                                                        },
+                                                    )),
+                                            )
+                                            .child(if self.busy {
+                                                Button::new("stop-btn")
+                                                    .danger()
+                                                    .small()
+                                                    .label("Stop")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.stop_current(cx);
+                                                    }))
+                                            } else {
+                                                Button::new("send-btn")
+                                                    .primary()
+                                                    .small()
+                                                    .label("Send")
+                                                    .disabled(!can_send)
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.send_current(window, cx);
+                                                        },
+                                                    ))
+                                            }),
+                                    ),
                             )
-                            .child(div().flex_1().child(Textarea::new(&self.composer)))
-                            .child(if self.busy {
-                                Button::new("stop-btn")
-                                    .danger()
-                                    .label("Stop")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.stop_current(cx);
-                                    }))
-                            } else {
-                                Button::new("send-btn")
-                                    .primary()
-                                    .label("Send")
-                                    .disabled(!can_send)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.send_current(window, cx);
-                                    }))
-                            }),
-                    ),
+                    }),
             )
+            .when(self.show_projects_popout, |root| {
+                root.child(self.render_projects_popout(p, cx))
+            })
+            .when(self.show_new_chat_modal, |root| {
+                root.child(self.render_new_chat_modal(p, cx))
+            })
     }
 }
 
@@ -5971,5 +8841,122 @@ fn format_elapsed(secs: u64) -> String {
         format!("{secs}s")
     } else {
         format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
+fn format_working_compact(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+fn project_monogram(name: &str) -> String {
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let chars: String = if words.len() >= 2 {
+        let first = words[0].chars().next();
+        let second = words[1].chars().next();
+        first.into_iter().chain(second).collect()
+    } else {
+        name.chars().filter(|c| c.is_alphanumeric()).take(2).collect()
+    };
+    if chars.is_empty() {
+        "PR".into()
+    } else {
+        chars.to_uppercase()
+    }
+}
+
+fn project_badge_colors(id: &str, is_dark: bool) -> (Hsla, Hsla) {
+    let palette: &[(u32, u32)] = if is_dark {
+        &[
+            (0x2f3542, 0xcbd5e1), // slate
+            (0x3b2c5e, 0xd8b4fe), // purple
+            (0x164e63, 0x67e8f9), // cyan
+            (0x1e4633, 0x86efac), // emerald
+            (0x523718, 0xfcd34d), // amber
+            (0x522238, 0xfda4af), // rose
+            (0x1e3a5f, 0x93c5fd), // blue
+            (0x364420, 0xbef264), // lime
+        ]
+    } else {
+        &[
+            (0xe2e8f0, 0x334155), // slate
+            (0xf3e8ff, 0x6b21a8), // purple
+            (0xcffafe, 0x155e75), // cyan
+            (0xdcfce7, 0x166534), // emerald
+            (0xfef3c7, 0x92400e), // amber
+            (0xffe4e6, 0x9f1239), // rose
+            (0xdbeafe, 0x1e40af), // blue
+            (0xecfccb, 0x3f6212), // lime
+        ]
+    };
+    let mut hash: u64 = 14695981039346656037;
+    for b in id.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    let (bg, fg) = palette[(hash as usize) % palette.len()];
+    (gpui_kit::rgb(bg).into(), gpui_kit::rgb(fg).into())
+}
+
+fn parse_session_timestamp(val: &Value) -> Option<u64> {
+    for key in ["updatedAt", "updated_at", "updated", "createdAt", "created_at"] {
+        let v = &val[key];
+        if let Some(n) = v.as_u64() {
+            return Some(if n > 10_000_000_000 { n / 1000 } else { n });
+        }
+        if let Some(s) = v.as_str()
+            && let Some(ts) = parse_rfc3339_secs(s)
+        {
+            return Some(ts);
+        }
+    }
+    None
+}
+
+fn parse_rfc3339_secs(s: &str) -> Option<u64> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    let year: i64 = s[0..4].parse().ok()?;
+    let month: i64 = s[5..7].parse().ok()?;
+    let day: i64 = s[8..10].parse().ok()?;
+    let hour: i64 = s[11..13].parse().ok()?;
+    let min: i64 = s[14..16].parse().ok()?;
+    let sec: i64 = s[17..19].parse().ok()?;
+    // Howard Hinnant's civil-from-days inverse (UTC).
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hour * 3600 + min * 60 + sec;
+    u64::try_from(secs).ok()
+}
+
+fn format_relative_time(epoch_secs: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let diff = now.saturating_sub(epoch_secs);
+    if diff < 60 {
+        "now".into()
+    } else if diff < 3600 {
+        format!("{}m", diff / 60)
+    } else if diff < 86_400 {
+        format!("{}h", diff / 3600)
+    } else if diff < 86_400 * 30 {
+        format!("{}d", diff / 86_400)
+    } else {
+        format!("{}mo", diff / (86_400 * 30))
     }
 }

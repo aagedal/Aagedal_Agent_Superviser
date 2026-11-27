@@ -1,4 +1,7 @@
 // --- Tabs ---
+const TAB_ORDER = ["models", "projects", "safety", "connect"];
+let activeTab = "models";
+
 function showTab(name) {
   // The setup guide has a window of its own.
   if (name === "guide") return invoke("open_window", { name: "setup" });
@@ -7,7 +10,13 @@ function showTab(name) {
     modelFilter = "local";
     name = "models";
   }
-  for (const button of document.querySelectorAll("nav button[data-tab]")) button.classList.toggle("active", button.dataset.tab === name);
+  activeTab = name;
+  for (const button of document.querySelectorAll("nav button[data-tab]")) {
+    const selected = button.dataset.tab === name;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  }
   for (const section of document.querySelectorAll("main section")) section.hidden = section.id !== name;
   if (name === "models") renderModelsTab();
   if (name === "projects") renderProjects();
@@ -17,7 +26,24 @@ function showTab(name) {
     renderCalls();
   }
 }
-for (const button of document.querySelectorAll("nav button[data-tab]")) button.addEventListener("click", () => showTab(button.dataset.tab));
+const navTabs = [...document.querySelectorAll("nav button[data-tab]")];
+for (const button of navTabs) {
+  button.addEventListener("click", () => showTab(button.dataset.tab));
+  button.addEventListener("keydown", (event) => {
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    const idx = navTabs.indexOf(button);
+    let next = -1;
+    if (event.key === "ArrowRight") next = (idx + 1) % navTabs.length;
+    else if (event.key === "ArrowLeft") next = (idx - 1 + navTabs.length) % navTabs.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = navTabs.length - 1;
+    if (next >= 0) {
+      event.preventDefault();
+      showTab(navTabs[next].dataset.tab);
+      navTabs[next].focus();
+    }
+  });
+}
 $("open-setup").addEventListener("click", () => invoke("open_window", { name: "setup" }));
 
 let modelFilter = "suggested"; // or "local"
@@ -130,7 +156,12 @@ function renderModelsTab() {
 
 function setModelFilter(filter) {
   modelFilter = filter;
-  for (const button of document.querySelectorAll("#model-filter button")) button.classList.toggle("active", button.dataset.filter === filter);
+  for (const button of document.querySelectorAll("#model-filter button")) {
+    const selected = button.dataset.filter === filter;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  }
   $("models-suggested").hidden = filter !== "suggested";
   $("models-local").hidden = filter !== "local";
   if (filter === "local") {
@@ -139,7 +170,24 @@ function setModelFilter(filter) {
     invoke("saved_conversations").then(renderConversations);
   }
 }
-for (const button of document.querySelectorAll("#model-filter button")) button.addEventListener("click", () => setModelFilter(button.dataset.filter));
+const filterButtons = [...document.querySelectorAll("#model-filter button")];
+for (const button of filterButtons) {
+  button.addEventListener("click", () => setModelFilter(button.dataset.filter));
+  button.addEventListener("keydown", (event) => {
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    const idx = filterButtons.indexOf(button);
+    let next = -1;
+    if (event.key === "ArrowRight") next = (idx + 1) % filterButtons.length;
+    else if (event.key === "ArrowLeft") next = (idx - 1 + filterButtons.length) % filterButtons.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = filterButtons.length - 1;
+    if (next >= 0) {
+      event.preventDefault();
+      setModelFilter(filterButtons[next].dataset.filter);
+      filterButtons[next].focus();
+    }
+  });
+}
 
 function modelLine(m) {
   switch (m.state) {
@@ -561,7 +609,19 @@ function projectEditor(project) {
       ),
     );
   };
+  box.addEventListener("keydown", (event) => {
+    const mod = event.metaKey || event.ctrlKey;
+    if (mod && (event.key.toLowerCase() === "s" || event.key === "Enter")) {
+      event.preventDefault();
+      saveProject(draft);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      editingProject = null;
+      renderProjects();
+    }
+  });
   render();
+  queueMicrotask(() => box.querySelector('input[type="text"]')?.focus());
   return box;
 }
 
@@ -628,6 +688,9 @@ const JUDGE_STATUS = {
   failed: (s) => `Couldn't start: ${s.error}`,
 };
 async function renderJudge() {
+  if ($("include-image-paths") && overview) {
+    $("include-image-paths").checked = overview.include_image_paths !== false;
+  }
   const judge = await invoke("judge_settings");
   judgeDownload = judge.download;
   if (!judge.model) {
@@ -684,6 +747,14 @@ async function saveJudge() {
   const judge = await invoke("judge_settings");
   if (enabled && judge.enabled && !judge.installed && !downloads.has(judge.download)) await downloadJudge();
 }
+$("include-image-paths")?.addEventListener("change", async (event) => {
+  try {
+    const enabled = await invoke("set_include_image_paths", { enabled: event.target.checked });
+    if (overview) overview.include_image_paths = enabled;
+  } catch (e) {
+    alert(e);
+  }
+});
 // What fits changed, or the judge started or stopped.
 listen("judge", async () => {
   await refreshOverview();
@@ -718,6 +789,39 @@ listen("discovery", async () => {
   if (modelFilter === "local") {
     renderInstalled();
     invoke("other_apps").then(renderOtherApps);
+  }
+});
+
+// --- Keyboard shortcuts ---
+document.addEventListener("keydown", (event) => {
+  const mod = event.metaKey || event.ctrlKey;
+  if (mod && !event.shiftKey && !event.altKey) {
+    const num = Number(event.key);
+    if (num >= 1 && num <= TAB_ORDER.length) {
+      event.preventDefault();
+      showTab(TAB_ORDER[num - 1]);
+      return;
+    }
+    if (event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      showTab("models");
+      setModelFilter("suggested");
+      $("more-models").open = true;
+      $("search").focus();
+      return;
+    }
+  }
+  if ((mod && event.shiftKey && (event.key === "[" || event.key === "]")) || (event.ctrlKey && event.key === "Tab")) {
+    event.preventDefault();
+    const delta = event.key === "[" || (event.key === "Tab" && event.shiftKey) ? -1 : 1;
+    const idx = TAB_ORDER.indexOf(activeTab);
+    showTab(TAB_ORDER[(idx + delta + TAB_ORDER.length) % TAB_ORDER.length]);
+    return;
+  }
+  if (event.key === "Escape" && editingProject) {
+    event.preventDefault();
+    editingProject = null;
+    renderProjects();
   }
 });
 

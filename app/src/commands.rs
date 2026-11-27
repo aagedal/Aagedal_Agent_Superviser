@@ -37,6 +37,7 @@ pub struct Overview {
     opencode_version: Option<String>,
     llama_server: Option<String>,
     hf_token_set: bool,
+    include_image_paths: bool,
 }
 
 #[tauri::command]
@@ -50,6 +51,7 @@ pub fn overview(app: State<'_, Arc<App>>) -> Overview {
         opencode_version: opencode::version(),
         llama_server: superviser_core::runtime::find_llama_server().map(|p| p.display().to_string()),
         hf_token_set: secrets::hf_token().is_some(),
+        include_image_paths: app.settings().include_image_paths,
     }
 }
 
@@ -190,6 +192,12 @@ pub fn saved_conversations(app: State<'_, Arc<App>>) -> SavedConversations {
 pub fn set_save_conversations(app: State<'_, Arc<App>>, enabled: bool) -> Result<SavedConversations> {
     app.set_save_conversations(enabled).map_err(err)?;
     Ok(saved_conversations_info(&app))
+}
+
+#[tauri::command]
+pub fn set_include_image_paths(app: State<'_, Arc<App>>, enabled: bool) -> Result<bool> {
+    app.set_include_image_paths(enabled).map_err(err)?;
+    Ok(enabled)
 }
 
 #[tauri::command]
@@ -418,6 +426,37 @@ pub async fn acp_sessions(app: State<'_, Arc<App>>, project: String) -> Result<s
 }
 
 #[derive(Serialize)]
+pub struct ProjectSessions {
+    project: String,
+    sessions: serde_json::Value,
+    error: Option<String>,
+}
+
+/// Saved OpenCode sessions across all projects (without booting dormant Linux VMs).
+#[tauri::command]
+pub async fn acp_all_sessions(
+    app: State<'_, Arc<App>>,
+    active_project: Option<String>,
+) -> Vec<ProjectSessions> {
+    let projects = app.settings.lock().unwrap().projects.clone();
+    let results = app
+        .engines
+        .sessions_for_projects(&app, &projects, active_project.as_deref())
+        .await;
+    results
+        .into_iter()
+        .map(|(project, res)| match res {
+            Ok(sessions) => ProjectSessions { project, sessions, error: None },
+            Err(error) => ProjectSessions {
+                project,
+                sessions: serde_json::Value::Array(Vec::new()),
+                error: Some(error),
+            },
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
 pub struct Opened {
     session: String,
     busy: bool,
@@ -441,13 +480,30 @@ pub async fn acp_open(app: State<'_, Arc<App>>, project: String, session: Option
 }
 
 #[tauri::command]
-pub async fn acp_prompt(app: State<'_, Arc<App>>, project: String, session: String, text: String, model: String) -> Result<()> {
+pub async fn acp_prompt(
+    app: State<'_, Arc<App>>,
+    project: String,
+    session: String,
+    text: String,
+    model: String,
+    images: Option<Vec<superviser_backend::ImageAttachment>>,
+) -> Result<()> {
     let (model, _) = app.loaded(&model).ok_or("Load the chat's model first.")?;
     app.touch(&model.id);
     app.sync_upstreams().await;
     let project = self::project(&app, &project)?;
     let engine = app.engines.get(&app, &project).await.map_err(|e| format!("{e:#}"))?;
-    engine.prompt(app.bus.clone(), &session, &text, &model.alias).map_err(|e| format!("{e:#}"))
+    let imgs = images.as_deref().unwrap_or(&[]);
+    let path_note = app
+        .settings
+        .lock()
+        .unwrap()
+        .include_image_paths
+        .then(|| superviser_backend::attachments::format_image_paths_note(imgs, Some(&project)))
+        .flatten();
+    engine
+        .prompt(app.bus.clone(), &session, &text, imgs, path_note, &model.alias)
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
@@ -541,9 +597,23 @@ pub fn chat_load(app: State<'_, Arc<App>>, project: String, id: String) -> Resul
 
 /// Sends a message (in a new chat without `chat`) and returns the chat's id.
 #[tauri::command]
-pub async fn chat_send(app: State<'_, Arc<App>>, project: String, chat: Option<String>, text: String, model: String) -> Result<String> {
-    superviser_backend::agent::send(app.inner().clone(), &project, chat.as_deref(), &text, &model)
-        .map_err(|e| format!("{e:#}"))
+pub async fn chat_send(
+    app: State<'_, Arc<App>>,
+    project: String,
+    chat: Option<String>,
+    text: String,
+    model: String,
+    images: Option<Vec<superviser_backend::ImageAttachment>>,
+) -> Result<String> {
+    superviser_backend::agent::send(
+        app.inner().clone(),
+        &project,
+        chat.as_deref(),
+        &text,
+        images.as_deref().unwrap_or(&[]),
+        &model,
+    )
+    .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
