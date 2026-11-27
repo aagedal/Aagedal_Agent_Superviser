@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "agent-superviser"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "entropy",
@@ -132,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "agent-superviser-gpui"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2017,7 +2017,7 @@ checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 
 [[package]]
 name = "entropy"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "directories",
@@ -8675,7 +8675,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "superviser-backend"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8692,7 +8692,7 @@ dependencies = [
 
 [[package]]
 name = "superviser-core"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "directories",
@@ -8718,7 +8718,7 @@ dependencies = [
 
 [[package]]
 name = "superviser-guard"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "async-stream",
  "axum",
@@ -8735,7 +8735,7 @@ dependencies = [
 
 [[package]]
 name = "superviser-scan"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "fancy-regex",
  "ruff_python_ast",
