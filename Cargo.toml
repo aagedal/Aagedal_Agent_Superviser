@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/entropy", "crates/guard", "crates/scan", "crates/backend", "app", "app-gpui"]
+members = ["crates/core", "crates/guard", "crates/scan", "crates/backend", "app", "app-gpui"]
 
 [workspace.package]
 version = "0.1.0-alpha.1"
@@ -10,7 +10,7 @@ repository = "https://github.com/aagedal/Aagedal_Agent_Superviser"
 
 [workspace.dependencies]
 superviser-core = { path = "crates/core" }
-entropy = { path = "crates/entropy" }
+entropy = { git = "https://github.com/aagedal/entropy", tag = "v0.1.0" }
 superviser-guard = { path = "crates/guard" }
 superviser-scan = { path = "crates/scan" }
 superviser-backend = { path = "crates/backend" }

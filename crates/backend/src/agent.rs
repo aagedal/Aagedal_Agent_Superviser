@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use futures_util::StreamExt;
 use serde_json::{Value, json};
 use superviser_core::awake::Awake;
 use superviser_core::project::{Approvals, Folder, Project};
@@ -17,19 +16,15 @@ use superviser_core::sandbox::{Isolation, Network, seatbelt};
 use superviser_core::secrets;
 use entropy::{
     ApprovalPolicy, Chat, ChatStore, CommandOutput, CommandRunner, EventSink, HarnessEvent,
-    MAX_STEPS, ModelEndpoint, PathMapper, PromptConfig, SessionManager, StreamReply,
-    SubagentHandler, ToolCall, TurnConfig, Workspace, WorkspaceFolder, compact_chat, run_process,
-    run_turn,
+    MAX_STEPS, ModelEndpoint, PathMapper, PromptConfig, SessionManager, SubagentEvent,
+    SubagentHandler, SubagentObserver, SubagentRequest, ToolCall, TurnConfig, Workspace,
+    WorkspaceFolder, compact_chat, run_process, run_subagent_loop, run_turn,
 };
 use tokio::sync::watch;
 
 use crate::events::{AppEvent, ChatEvent, EventBus};
 use crate::state::App;
-use crate::subagents::{SubagentRecord, SubagentState, SubagentStep, now_ms, title_case_role};
-
-/// Maximum steps an isolated read-only sub-agent may take before summarizing.
-const MAX_SUBAGENT_STEPS: usize = 12;
-const NOT_RUN: &str = "Not run: the user stopped the agent.";
+use crate::subagents::{SubagentRecord, SubagentState, SubagentStep, now_ms};
 
 /// Active harness turns and tool-approval channels.
 #[derive(Default)]
@@ -366,7 +361,7 @@ async fn run_project_turn(
         Approvals::Never => ApprovalPolicy::Never,
     };
 
-    let sink = BusEventSink { bus: app.bus.clone() };
+    let sink = Arc::new(BusEventSink { bus: app.bus.clone() });
     let cfg = TurnConfig {
         store,
         endpoint,
@@ -374,9 +369,10 @@ async fn run_project_turn(
         workspace,
         approvals,
         subagents,
+        extra_tools: Vec::new(),
         max_steps: MAX_STEPS,
     };
-    run_turn(&app.chats.sessions, &sink, cfg, chat, stopped, steer_rx).await
+    run_turn(&app.chats.sessions, sink, cfg, chat, stopped, steer_rx).await
 }
 
 struct BusEventSink {
@@ -388,6 +384,7 @@ impl EventSink for BusEventSink {
         let mapped = match event {
             HarnessEvent::Message { chat, message } => ChatEvent::Message { chat, message },
             HarnessEvent::Delta { chat, content, reasoning } => ChatEvent::Delta { chat, content, reasoning },
+            HarnessEvent::ToolOutput { .. } => return,
             HarnessEvent::Approval { chat, call, name, arguments } => {
                 ChatEvent::Approval { chat, call, name, arguments }
             }
@@ -497,6 +494,97 @@ fn pick_subagent_model(app: &App, parent_alias: &str) -> (String, String) {
     (parent_alias.to_string(), name)
 }
 
+struct BackendSubagentObserver<'a> {
+    app: &'a App,
+    project_id: String,
+}
+
+impl SubagentObserver for BackendSubagentObserver<'_> {
+    fn on_event(&self, event: SubagentEvent) {
+        match event {
+            SubagentEvent::Started {
+                id,
+                parent_chat,
+                role,
+                title,
+                prompt,
+                model_label,
+            } => {
+                self.app.subagents.upsert(
+                    SubagentRecord {
+                        id,
+                        project: self.project_id.clone(),
+                        parent_session: parent_chat,
+                        child_session: None,
+                        role,
+                        title,
+                        prompt,
+                        model: Some(model_label),
+                        state: SubagentState::Running,
+                        started_ms: now_ms(),
+                        finished_ms: None,
+                        steps: Vec::new(),
+                        live_text: None,
+                        result: None,
+                        error: None,
+                        cancellable: true,
+                    },
+                    &self.app.bus,
+                );
+            }
+            SubagentEvent::StepStarted { id, step_id, verb, subject } => {
+                self.app.subagents.update_with(&id, &self.app.bus, |rec| {
+                    rec.steps.push(SubagentStep {
+                        id: step_id,
+                        verb,
+                        subject,
+                        status: "in_progress".into(),
+                        output: None,
+                    });
+                });
+            }
+            SubagentEvent::StepFinished { id, step_id, failed, preview } => {
+                self.app.subagents.update_with(&id, &self.app.bus, |rec| {
+                    if let Some(step) = rec.steps.iter_mut().find(|s| s.id == step_id) {
+                        step.status = if failed { "failed" } else { "completed" }.into();
+                        step.output = Some(preview);
+                    }
+                });
+            }
+            SubagentEvent::LiveText { id, text } => {
+                self.app.subagents.update_with(&id, &self.app.bus, |rec| {
+                    rec.live_text = Some(text);
+                });
+            }
+            SubagentEvent::Completed { id, result } => {
+                self.app.subagents.update_with(&id, &self.app.bus, |rec| {
+                    rec.state = SubagentState::Completed;
+                    rec.finished_ms = Some(now_ms());
+                    rec.cancellable = false;
+                    rec.live_text = None;
+                    rec.result = Some(result);
+                });
+            }
+            SubagentEvent::Cancelled { id, reason } => {
+                self.app.subagents.update_with(&id, &self.app.bus, |rec| {
+                    rec.state = SubagentState::Cancelled;
+                    rec.finished_ms = Some(now_ms());
+                    rec.cancellable = false;
+                    rec.error = Some(reason);
+                });
+            }
+            SubagentEvent::Failed { id, error } => {
+                self.app.subagents.update_with(&id, &self.app.bus, |rec| {
+                    rec.state = SubagentState::Failed;
+                    rec.finished_ms = Some(now_ms());
+                    rec.cancellable = false;
+                    rec.error = Some(error);
+                });
+            }
+        }
+    }
+}
+
 async fn run_subagent(
     app: &App,
     project: &Project,
@@ -504,251 +592,55 @@ async fn run_subagent(
     parent_model_alias: &str,
     folders: &[WorkspaceFolder],
     call: ToolCall,
-    mut parent_stopped: watch::Receiver<bool>,
+    parent_stopped: watch::Receiver<bool>,
 ) -> String {
-    let args: Value = serde_json::from_str(if call.arguments.trim().is_empty() {
-        "{}"
-    } else {
-        &call.arguments
-    })
-    .unwrap_or_else(|_| json!({}));
-    let role = title_case_role(args["role"].as_str().unwrap_or("Explore"));
-    let title = args["description"]
-        .as_str()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("Investigate codebase")
-        .trim()
-        .to_string();
-    let prompt = args["prompt"]
-        .as_str()
-        .or_else(|| args["task"].as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if prompt.is_empty() {
-        return "Error: subagent requires a non-empty `prompt`.".into();
-    }
+    let req = match SubagentRequest::from_call(&call) {
+        Ok(req) => req,
+        Err(msg) => return msg,
+    };
 
     let (model_alias, model_name) = pick_subagent_model(app, parent_model_alias);
-    let sub_id = call.id.clone();
-    let (cancel_tx, mut cancel_rx) = watch::channel(false);
-    app.subagents.register_cancel(&sub_id, cancel_tx);
-
-    app.subagents.upsert(
-        SubagentRecord {
-            id: sub_id.clone(),
-            project: project.id.clone(),
-            parent_session: parent_chat_id,
-            child_session: None,
-            role: role.clone(),
-            title,
-            prompt: prompt.clone(),
-            model: Some(model_name),
-            state: SubagentState::Running,
-            started_ms: now_ms(),
-            finished_ms: None,
-            steps: Vec::new(),
-            live_text: None,
-            result: None,
-            error: None,
-            cancellable: true,
-        },
-        &app.bus,
-    );
-
-    let outcome: anyhow::Result<(SubagentState, String)> = async {
-        let workspace = Workspace::new(folders, None, false)?;
-        let tools = workspace.definitions();
-        let guard = app.guard_url().context("the guard is not running")?;
-        let url = format!(
+    let guard = match app.guard_url() {
+        Some(g) => g,
+        None => return "Sub-agent error: the guard is not running.".into(),
+    };
+    let api_key = match secrets::local_api_key(&app.paths) {
+        Ok(k) => k,
+        Err(e) => return format!("Sub-agent error: {e:#}"),
+    };
+    let endpoint = ModelEndpoint {
+        completions_url: format!(
             "{}{}/v1/chat/completions",
             guard.trim_end_matches("/v1"),
             project.guard_path()
-        );
-        let key = secrets::local_api_key(&app.paths)?;
-        let client = reqwest::Client::new();
-        let system = json!({
-            "role": "system",
-            "content": format!(
-                "You are a focused read-only sub-agent ({role}) helping a parent coding agent on project \"{}\". \
-                 Use `read`, `glob`, and `grep` to gather exact facts, file paths, and line numbers, then return a concise, structured summary directly answering the task.",
-                project.name
-            )
-        });
-        let mut messages = vec![system, json!({ "role": "user", "content": prompt })];
+        ),
+        api_key,
+        model: model_alias,
+        context_window: 32_768,
+    };
 
-        for _ in 0..MAX_SUBAGENT_STEPS {
-            if *parent_stopped.borrow() || *cancel_rx.borrow() {
-                return Ok((SubagentState::Cancelled, NOT_RUN.to_string()));
-            }
-            let body = json!({
-                "model": model_alias,
-                "messages": messages,
-                "tools": tools,
-                "stream": true
-            });
-            let reply = tokio::select! {
-                r = stream_subagent_reply(app, &sub_id, &client, &url, &key, &body) => r?,
-                _ = parent_stopped.wait_for(|s| *s) => return Ok((SubagentState::Cancelled, NOT_RUN.to_string())),
-                _ = cancel_rx.wait_for(|s| *s) => return Ok((SubagentState::Cancelled, "Stopped by user.".to_string())),
-            };
-            let mut msg = json!({ "role": "assistant", "content": reply.content });
-            if !reply.calls.is_empty() {
-                msg["tool_calls"] = json!(
-                    reply
-                        .calls
-                        .iter()
-                        .map(|c| json!({
-                            "id": c.id,
-                            "type": "function",
-                            "function": { "name": c.name, "arguments": c.arguments }
-                        }))
-                        .collect::<Vec<_>>()
-                );
-            }
-            messages.push(msg);
-            if reply.calls.is_empty() {
-                return Ok((SubagentState::Completed, reply.content.trim().to_string()));
-            }
-            for sub_call in &reply.calls {
-                if *parent_stopped.borrow() || *cancel_rx.borrow() {
-                    return Ok((SubagentState::Cancelled, "Stopped by user.".to_string()));
-                }
-                let (verb, subject) = summarize_builtin_call(sub_call);
-                app.subagents.update_with(&sub_id, &app.bus, |rec| {
-                    rec.steps.push(SubagentStep {
-                        id: sub_call.id.clone(),
-                        verb,
-                        subject,
-                        status: "in_progress".into(),
-                        output: None,
-                    });
-                });
-                let tool_out = workspace
-                    .run(&sub_call.name, &sub_call.arguments, cancel_rx.clone())
-                    .await;
-                let failed = tool_out.starts_with("Error:");
-                app.subagents.update_with(&sub_id, &app.bus, |rec| {
-                    if let Some(step) = rec.steps.iter_mut().find(|s| s.id == sub_call.id) {
-                        step.status = if failed { "failed" } else { "completed" }.into();
-                        let preview: String = tool_out.chars().take(600).collect();
-                        step.output = Some(preview);
-                    }
-                });
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": sub_call.id,
-                    "content": tool_out
-                }));
-            }
-        }
-        Ok((
-            SubagentState::Completed,
-            "Sub-agent reached its step limit without a final summary.".to_string(),
-        ))
-    }
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    app.subagents.register_cancel(&req.id, cancel_tx);
+
+    let observer = BackendSubagentObserver {
+        app,
+        project_id: project.id.clone(),
+    };
+    let result = run_subagent_loop(
+        &project.name,
+        &parent_chat_id,
+        folders,
+        &endpoint,
+        &model_name,
+        &req,
+        parent_stopped,
+        cancel_rx,
+        Some(&observer),
+    )
     .await;
 
-    app.subagents.unregister_cancel(&sub_id);
-
-    match outcome {
-        Ok((SubagentState::Completed, text)) => {
-            app.subagents.update_with(&sub_id, &app.bus, |rec| {
-                rec.state = SubagentState::Completed;
-                rec.finished_ms = Some(now_ms());
-                rec.cancellable = false;
-                rec.live_text = None;
-                rec.result = Some(text.clone());
-            });
-            text
-        }
-        Ok((SubagentState::Cancelled, msg)) => {
-            app.subagents.update_with(&sub_id, &app.bus, |rec| {
-                rec.state = SubagentState::Cancelled;
-                rec.finished_ms = Some(now_ms());
-                rec.cancellable = false;
-                rec.error = Some(msg.clone());
-            });
-            msg
-        }
-        Ok((_, text)) => text,
-        Err(e) => {
-            let err = format!("Sub-agent error: {e:#}");
-            app.subagents.update_with(&sub_id, &app.bus, |rec| {
-                rec.state = SubagentState::Failed;
-                rec.finished_ms = Some(now_ms());
-                rec.cancellable = false;
-                rec.error = Some(err.clone());
-            });
-            err
-        }
-    }
-}
-
-fn summarize_builtin_call(call: &ToolCall) -> (String, String) {
-    let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
-    let verb = match call.name.as_str() {
-        "read" => "Read",
-        "glob" | "grep" => "Search",
-        other => other,
-    }
-    .to_string();
-    let subject = args["path"]
-        .as_str()
-        .or_else(|| args["pattern"].as_str())
-        .unwrap_or("")
-        .to_string();
-    (verb, subject)
-}
-
-async fn stream_subagent_reply(
-    app: &App,
-    sub_id: &str,
-    client: &reqwest::Client,
-    url: &str,
-    key: &str,
-    body: &Value,
-) -> anyhow::Result<StreamReply> {
-    let response = client
-        .post(url)
-        .bearer_auth(key)
-        .json(body)
-        .send()
-        .await
-        .context("couldn't reach the guard")?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        bail!("the model server said {status}: {text}");
-    }
-    let mut reply = StreamReply::default();
-    let mut calls: Vec<ToolCall> = Vec::new();
-    let mut buffer: Vec<u8> = Vec::new();
-    let mut last = Instant::now();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        buffer.extend_from_slice(&chunk.context("the sub-agent reply was cut off")?);
-        while let Some((start, end)) = entropy::engine::find_sse_event_end(&buffer) {
-            let event: Vec<u8> = buffer.drain(..end).collect();
-            entropy::engine::consume_sse_event(&event[..start], &mut reply, &mut calls)?;
-        }
-        if last.elapsed() >= Duration::from_millis(120) && !reply.content.is_empty() {
-            app.subagents.update_with(sub_id, &app.bus, |rec| {
-                rec.live_text = Some(reply.content.clone());
-            });
-            last = Instant::now();
-        }
-    }
-    if !buffer.is_empty() {
-        entropy::engine::consume_sse_event(&buffer, &mut reply, &mut calls)?;
-    }
-    for (i, call) in calls.iter_mut().enumerate() {
-        if call.id.is_empty() {
-            call.id = format!("subcall_{i}");
-        }
-    }
-    reply.calls = calls.into_iter().filter(|c| !c.name.is_empty()).collect();
-    Ok(reply)
+    app.subagents.unregister_cancel(&req.id);
+    result
 }
 
 #[cfg(test)]

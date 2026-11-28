@@ -5,3 +5,5 @@
 /app/gen
 # Bundled programs, fetched by app/build.rs from app/sidecars.json
 /app/binaries
+# Local Cargo patch overrides (e.g. developing against a local ../entropy checkout)
+/.cargo/config.toml

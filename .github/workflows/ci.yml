@@ -41,7 +41,7 @@ jobs:
         run: rustup update stable
 
       - name: Clippy
-        run: cargo clippy -p superviser-core -p entropy -p superviser-guard -p superviser-scan -p superviser-backend -p agent-superviser-gpui --all-targets -- -D warnings
+        run: cargo clippy -p superviser-core -p superviser-guard -p superviser-scan -p superviser-backend -p agent-superviser-gpui --all-targets -- -D warnings
 
       - name: Test crates
-        run: cargo test -p superviser-core -p entropy -p superviser-guard -p superviser-scan -p superviser-backend -p agent-superviser-gpui
+        run: cargo test -p superviser-core -p superviser-guard -p superviser-scan -p superviser-backend -p agent-superviser-gpui
