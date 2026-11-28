@@ -1,55 +1,72 @@
-# Builds, signs and notarizes the macOS app (Apple silicon only, for now) for a version tag (`v0.2.0`), and drafts a GitHub
-# release with the DMGs and the updater's files. Publishing the draft is what ships it: the
-# app's updater reads `latest.json` from the latest published release.
+# Optional GitHub Actions release workflow (manual dispatch) for building, signing, and
+# notarizing the native GPUI macOS app in CI when Apple Developer ID secrets are configured.
+# For local macOS signing/notarization (recommended when keeping your Developer ID cert in
+# your local Keychain), run `./scripts/release-gpui-macos.sh` instead.
 #
-# Secrets (see README → Releases): APPLE_CERTIFICATE (base64 .p12 of a Developer ID
+# Secrets (only needed for CI dispatch): APPLE_CERTIFICATE (base64 .p12 of a Developer ID
 # Application certificate), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY, APPLE_ID,
-# APPLE_PASSWORD (an app-specific password), APPLE_TEAM_ID, TAURI_SIGNING_PRIVATE_KEY and
-# TAURI_SIGNING_PRIVATE_KEY_PASSWORD.
+# APPLE_PASSWORD (an app-specific password), and APPLE_TEAM_ID.
 
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to build and release (e.g. v0.1.0-alpha.1)"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 env:
-  TAURI_CLI_VERSION: 2.12.6
   TARGET: aarch64-apple-darwin
+  RELEASE_TAG: ${{ inputs.tag }}
 
 jobs:
   build:
-    name: Build
+    name: Build macOS (Apple Silicon)
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ inputs.tag }}
           persist-credentials: false
 
-      - name: Check the tag and the updater key
+      - name: Check tag, versions, and signing secrets
         run: |
-          version=$(python3 -c 'import json; print(json.load(open("app/tauri.conf.json"))["version"])')
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::The tag $GITHUB_REF_NAME doesn't match version $version in app/tauri.conf.json"; exit 1
-          fi
-          cargo_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
-          if [ "$cargo_version" != "$version" ]; then
-            echo "::error::Cargo.toml workspace version $cargo_version doesn't match app/tauri.conf.json version $version"; exit 1
-          fi
-          pubkey=$(python3 -c 'import json; print(json.load(open("app/tauri.conf.json"))["plugins"]["updater"]["pubkey"])')
-          if [ -z "$pubkey" ]; then
-            echo "::error::app/tauri.conf.json has no updater public key (plugins.updater.pubkey); see README → Releases"; exit 1
-          fi
-          # A missing secret is an empty string, and Tauri then silently skips signing or notarizing.
-          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY; do
-            if [ -z "${!name}" ]; then echo "::error::The secret $name is not set"; exit 1; fi
+          python3 - "$RELEASE_TAG" <<'EOF'
+          import json, plistlib, sys, tomllib
+
+          tag = sys.argv[1]
+          expected = tag.removeprefix("v")
+          cargo = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
+          plist = plistlib.load(open("app-gpui/Info.plist", "rb"))["CFBundleShortVersionString"]
+          tauri = json.load(open("app/tauri.conf.json"))["version"]
+
+          errors = []
+          if cargo != expected:
+              errors.append(f"Cargo.toml workspace version ({cargo}) != tag ({tag})")
+          if plist != expected:
+              errors.append(f"app-gpui/Info.plist CFBundleShortVersionString ({plist}) != tag ({tag})")
+          if tauri != expected:
+              errors.append(f"app/tauri.conf.json version ({tauri}) != tag ({tag})")
+          if errors:
+              for err in errors:
+                  print(f"::error::{err}")
+              sys.exit(1)
+          EOF
+
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::The secret $name is not set"
+              exit 1
+            fi
           done
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -58,13 +75,11 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
 
-      - name: Install Rust and the Tauri CLI
+      - name: Install Rust
         run: |
           rustup update stable
-          rustup target add $TARGET
-          cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
+          rustup target add "$TARGET"
 
       - name: Import the signing certificate
         env:
@@ -81,59 +96,20 @@ jobs:
           rm "$RUNNER_TEMP/certificate.p12"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$keychain"
 
-      # Tauri signs the app bundle but not resources; llama.cpp's release is only ad-hoc signed,
-      # so it's signed here (build.rs keeps the fetched files, since their checksum marker still matches).
-      - name: Fetch the bundled programs and sign llama.cpp
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      - name: Run workspace lints and tests
         run: |
-          cargo check --release -p agent-superviser --target $TARGET
-          for file in app/binaries/llama.cpp/llama-server app/binaries/llama.cpp/*.dylib; do
-            codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$file"
-          done
+          cargo clippy -p superviser-core -p superviser-guard -p superviser-scan -p superviser-backend -p agent-superviser-gpui --all-targets -- -D warnings
+          cargo test -p superviser-core -p superviser-guard -p superviser-scan -p superviser-backend -p agent-superviser-gpui
 
-      - name: Run workspace tests
-        run: |
-          cargo clippy -p superviser-core -p entropy -p superviser-guard -p superviser-scan -p superviser-backend --all-targets -- -D warnings
-          cargo test --workspace
-
-      - name: Build, sign and notarize the app
-        working-directory: app
+      - name: Build, sign, notarize, and package DMG
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: cargo tauri build --ci --target $TARGET --config '{"bundle":{"createUpdaterArtifacts":true}}'
-
-      # Tauri notarizes the app but only signs the DMG, so the DMG is notarized and stapled here.
-      - name: Notarize the DMG and check both
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          bundle="target/$TARGET/release/bundle"
-          app="$bundle/macos/Agent Superviser.app"
-          dmg=$(ls "$bundle"/dmg/*.dmg)
-          xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait --timeout 1h
-          xcrun stapler staple "$dmg"
-          xcrun stapler validate "$dmg"
-          xcrun stapler validate "$app"
-          spctl --assess --type execute --verbose=2 "$app"
-          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
-
-      - name: Collect the release files
-        run: |
-          version=${GITHUB_REF_NAME#v}
-          bundle="target/$TARGET/release/bundle"
-          mkdir dist
-          cp "$(ls "$bundle"/dmg/*.dmg)" "dist/Agent-Superviser_${version}_aarch64.dmg"
-          cp "$bundle/macos/Agent Superviser.app.tar.gz" "dist/Agent-Superviser_aarch64.app.tar.gz"
-          cp "$bundle/macos/Agent Superviser.app.tar.gz.sig" "dist/Agent-Superviser_aarch64.app.tar.gz.sig"
+        run: ./scripts/release-gpui-macos.sh --target "$TARGET"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -153,27 +129,20 @@ jobs:
           name: release
           path: dist
 
-      - name: Write the updater manifest
-        run: |
-          python3 - <<'EOF'
-          import datetime, json, os, pathlib
-          tag = os.environ["GITHUB_REF_NAME"]
-          base = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{tag}"
-          platforms = {}
-          for arch in ("aarch64",):
-              name = f"Agent-Superviser_{arch}.app.tar.gz"
-              signature = pathlib.Path("dist", name + ".sig").read_text().strip()
-              platforms[f"darwin-{arch}"] = {"signature": signature, "url": f"{base}/{name}"}
-          manifest = {
-              "version": tag.removeprefix("v"),
-              "notes": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/tag/{tag}",
-              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "platforms": platforms,
-          }
-          pathlib.Path("dist/latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-          EOF
-
       - name: Draft the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "Agent Superviser ${GITHUB_REF_NAME#v}" --generate-notes
+        run: |
+          args=(
+            "$RELEASE_TAG"
+            dist/*
+            --repo "$GITHUB_REPOSITORY"
+            --draft
+            --verify-tag
+            --title "Agent Superviser ${RELEASE_TAG#v}"
+            --generate-notes
+          )
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${args[@]}"

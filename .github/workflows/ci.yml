@@ -24,10 +24,11 @@ jobs:
       - name: Check version consistency
         run: |
           python3 - <<'EOF'
-          import json, tomllib
-          tauri = json.load(open("app/tauri.conf.json"))["version"]
+          import json, plistlib, tomllib
           cargo = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
-          assert tauri == cargo, f"Version mismatch: app/tauri.conf.json={tauri}, Cargo.toml={cargo}"
+          plist = plistlib.load(open("app-gpui/Info.plist", "rb"))["CFBundleShortVersionString"]
+          tauri = json.load(open("app/tauri.conf.json"))["version"]
+          assert cargo == plist == tauri, f"Version mismatch: Cargo.toml={cargo}, app-gpui/Info.plist={plist}, app/tauri.conf.json={tauri}"
           EOF
 
       - name: Check UI JavaScript syntax
@@ -40,7 +41,7 @@ jobs:
         run: rustup update stable
 
       - name: Clippy
-        run: cargo clippy -p superviser-core -p entropy -p superviser-guard -p superviser-scan -p superviser-backend --all-targets -- -D warnings
+        run: cargo clippy -p superviser-core -p superviser-guard -p superviser-scan -p superviser-backend -p agent-superviser-gpui --all-targets -- -D warnings
 
       - name: Test crates
-        run: cargo test -p superviser-core -p entropy -p superviser-guard -p superviser-scan -p superviser-backend
+        run: cargo test -p superviser-core -p superviser-guard -p superviser-scan -p superviser-backend -p agent-superviser-gpui
